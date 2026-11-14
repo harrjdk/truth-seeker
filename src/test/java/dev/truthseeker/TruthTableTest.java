@@ -1,0 +1,91 @@
+package dev.truthseeker;
+
+import dev.truthseeker.archive.ClassRepository;
+import dev.truthseeker.symbolic.Cond;
+import dev.truthseeker.symbolic.Path;
+import dev.truthseeker.symbolic.PathExplorer;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.Test;
+import org.objectweb.asm.tree.ClassNode;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class TruthTableTest {
+
+    private static PathExplorer.Result explore(String cls, String method) throws Exception {
+        ClassRepository repo = TestSupport.repo();
+        ClassNode cn = repo.require(cls);
+        return PathExplorer.explore(repo, cn, ClassRepository.findMethods(cn, method, null).get(0), PathExplorer.Options.defaults());
+    }
+
+    @Test
+    void compoundBooleanConditionsBecomeColumns() throws Exception {
+        PathExplorer.Result r = explore("fixtures.rules.Eligibility", "isEligible");
+        List<String> keys = r.paths().stream().flatMap(p -> p.conds().stream()).map(Cond::key).distinct().toList();
+        assertEquals(List.of("vip", "age >= 18", "banned", "\"US\".equals(country)"), keys);
+        assertEquals(5, r.paths().size());
+        // exactly two paths return true: vip, or the full conjunction
+        long trues = r.paths().stream().filter(p -> p.outcome().describe().equals("return true")).count();
+        assertEquals(2, trues);
+    }
+
+    @Test
+    void elseIfLadderProducesOnePathPerReturn() throws Exception {
+        PathExplorer.Result r = explore("fixtures.rules.Eligibility", "discountPercent");
+        assertEquals(List.of("return 20", "return 15", "return 10", "return 5", "return 0"),
+                r.paths().stream().map(p -> p.outcome().describe()).toList());
+    }
+
+    @Test
+    void charSwitchGroupsSharedCases() throws Exception {
+        PathExplorer.Result r = explore("fixtures.rules.Eligibility", "grade");
+        List<String> labels = r.paths().stream().map(p -> p.conds().get(0).value()).toList();
+        assertEquals(List.of("'A' | 'B'", "'C'", "default"), labels);
+    }
+
+    @Test
+    void localsAreShownByNameAndQueriesAreNotSideEffects() throws Exception {
+        PathExplorer.Result r = explore("fixtures.order.OrderService", "pay");
+        List<String> keys = r.paths().stream().flatMap(p -> p.conds().stream()).map(Cond::key).distinct().toList();
+        assertEquals(List.of("found.isPresent()", "order.getStatus() != OrderStatus.NEW", "amount.compareTo(BigDecimal.ZERO) <= 0", "charged"), keys);
+        Path happy = r.paths().stream().filter(p -> p.cond("charged").map(Cond::isTrue).orElse(false)).findFirst().orElseThrow();
+        String effects = happy.effects().stream().map(e -> e.text()).collect(Collectors.joining("; "));
+        assertTrue(effects.contains("order.setStatus(OrderStatus.PAID)"), effects);
+        assertFalse(effects.contains("isPresent"), effects);
+    }
+
+    @Test
+    void enumSwitchViaSwitchMapIsDecoded() throws Exception {
+        PathExplorer.Result r = explore("fixtures.order.OrderService", "ship");
+        assertEquals(List.of("OrderStatus.PAID", "OrderStatus.NEW", "default"),
+                r.paths().stream().map(p -> p.conds().get(0).value()).toList());
+    }
+
+    @Test
+    void markdownContainsExpandedTableAndFormula() {
+        String md = TestSupport.run("truth_table", "className", "Eligibility", "method", "isEligible", "expand", true);
+        assertTrue(md.contains("**Expanded truth table** (all 2^4 combinations)"), md);
+        assertTrue(md.contains("|F|T|F|T|`return true`|P1|"), md);
+        assertTrue(md.contains("|| vip"), md);
+    }
+
+    @Test
+    void jsonFormat() {
+        String json = TestSupport.run("truth_table", "className", "Eligibility", "method", "fee", "format", "json");
+        assertTrue(json.contains("\"conditions\":[\"balance < 0L\",\"balance > 10000L\"]"), json);
+    }
+
+    @Test
+    void java21PatternSwitches() throws Exception {
+        Assumptions.assumeTrue(TestSupport.hasJava21Fixtures(), "Java 21 fixtures not compiled");
+        PathExplorer.Result kind = explore("fixtures.modern.Shapes", "kind");
+        assertEquals(List.of("instanceof Circle", "instanceof Square", "instanceof Rect"),
+                kind.paths().stream().map(p -> p.conds().get(0).value()).toList());
+        assertTrue(kind.notes().stream().anyMatch(n -> n.contains("exhaustive switch")));
+        PathExplorer.Result weight = explore("fixtures.modern.Shapes", "weight");
+        assertEquals(List.of("return 1", "return 10"), weight.paths().stream().map(p -> p.outcome().describe()).toList());
+    }
+}

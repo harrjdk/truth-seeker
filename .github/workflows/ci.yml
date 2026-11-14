@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build & test (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['21', '25']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+      - name: Build, run tests (incl. compiling + running generated tests), package
+        run: ./mvnw -B -ntp verify
+      - name: Upload server jar
+        if: matrix.java == '21'
+        uses: actions/upload-artifact@v7
+        with:
+          name: truth-seeker-jar
+          path: target/truth-seeker.jar
+
+  java17-runtime:
+    name: Runs on Java 17
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: truth-seeker-jar
+          path: target
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: CLI smoke test on Java 17
+        run: |
+          java -version
+          java -jar target/truth-seeker.jar --help
+          java -jar target/truth-seeker.jar --cli scan_archive path=target/truth-seeker.jar packagePrefix=dev.truthseeker | head -20
+      - name: MCP stdio handshake on Java 17
+        run: |
+          {
+            echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
+            sleep 2
+            echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+            echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+            sleep 3
+          } | java -jar target/truth-seeker.jar > out.jsonl
+          cat out.jsonl
+          grep -q '"serverInfo"' out.jsonl
+          grep -q '"generate_unit_tests"' out.jsonl
