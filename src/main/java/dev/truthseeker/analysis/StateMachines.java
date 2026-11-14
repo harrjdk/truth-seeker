@@ -300,7 +300,7 @@ public final class StateMachines {
 
     public static String render(Map<String, Machine> machines, String format) {
         StringBuilder sb = new StringBuilder();
-        if (machines.isEmpty()) {
+        if (machines.values().stream().allMatch(m -> m.transitions.isEmpty() && m.initial.isEmpty() && m.rejections.isEmpty())) {
             return "_No state machines inferred: no enum-valued state was compared and assigned in the analyzed code._\n"
                     + "Tip: pass `stateField` for String/int status fields, or widen `packagePrefix` / omit `className` to analyze the whole archive.\n";
         }

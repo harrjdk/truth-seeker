@@ -284,6 +284,7 @@ public final class TestGenerator {
         final boolean isStatic;
         final Map<Integer, String> paramValues = new HashMap<>();
         final Map<Integer, String> paramVars = new HashMap<>();
+        final Map<Integer, Type> paramTypes = new HashMap<>();
         final List<String> arrange = new ArrayList<>();
         final LinkedHashMap<String, String> stubs = new LinkedHashMap<>();
         final List<String> todos = new ArrayList<>();
@@ -330,6 +331,11 @@ public final class TestGenerator {
 
         void collect() {
             for (Cond c : p.conds()) {
+                if (c.left().text.contains(" [iteration ")) {
+                    // stubbing one value for a per-iteration decision (e.g. hasNext()) could loop forever
+                    todos.add("loop: arrange so that `" + c.describe() + "`");
+                    continue;
+                }
                 switch (c.kind()) {
                     case BOOL -> collectBool(c.left(), c.isTrue(), c);
                     case CMP -> {
@@ -341,6 +347,15 @@ public final class TestGenerator {
                             Number n = numericValue(l.args.get(0));
                             if (n != null) {
                                 constrain(l.target, op, l.args.get(0), n);
+                                break;
+                            }
+                        }
+                        // s.length() <op> n  →  pick a length, then a string of that length
+                        if (l.kind == Expr.Kind.CALL && "length".equals(l.name) && l.target != null && l.args.isEmpty()
+                                && "Ljava/lang/String;".equals(l.target.desc) && rgt.kind == Expr.Kind.CONST && rgt.value instanceof Number n) {
+                            String len = solveNumeric(Type.INT_TYPE, List.of(new Constraint(op, rgt, n)));
+                            if (len != null && Integer.parseInt(len) >= 0 && Integer.parseInt(len) <= 10_000) {
+                                constrain(l.target, "==", Expr.constant("a".repeat(Integer.parseInt(len)), "Ljava/lang/String;"));
                                 break;
                             }
                         }
@@ -386,6 +401,145 @@ public final class TestGenerator {
             }
         }
 
+        /**
+         * Well-known static helpers (Spring / commons-lang StringUtils, Objects, CollectionUtils) translated into
+         * constraints on their argument, e.g. {@code StringUtils.hasText(pet.getName())} → {@code pet.getName()} non-empty.
+         */
+        boolean collectStaticPredicate(Expr e, boolean v) {
+            String owner = Names.simple(e.owner);
+            Expr a = e.args.get(0);
+            if (owner.equals("StringUtils") || owner.equals("Strings") || owner.equals("CollectionUtils") || owner.equals("ObjectUtils")) {
+                switch (e.name) {
+                    case "hasText", "hasLength", "isNotBlank", "isNotEmpty" -> {
+                        constrain(a, "empty", null, v ? 0 : 1);
+                        return true;
+                    }
+                    case "isEmpty", "isBlank", "isNullOrEmpty" -> {
+                        constrain(a, "empty", null, v ? 1 : 0);
+                        return true;
+                    }
+                    default -> {
+                        return false;
+                    }
+                }
+            }
+            if (owner.equals("Objects")) {
+                switch (e.name) {
+                    case "isNull" -> {
+                        constrain(a, v ? "==" : "!=", Expr.nul());
+                        return true;
+                    }
+                    case "nonNull" -> {
+                        constrain(a, v ? "!=" : "==", Expr.nul());
+                        return true;
+                    }
+                    case "equals" -> {
+                        if (e.args.size() != 2) return false;
+                        Expr b = e.args.get(1);
+                        if (b.isConst() || isEnumConst(b)) { constrain(a, v ? "==" : "!=", b); return true; }
+                        if (a.isConst() || isEnumConst(a)) { constrain(b, v ? "==" : "!=", a); return true; }
+                        return sameOrDifferent(a, b, v);
+                    }
+                    default -> {
+                        return false;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /** {@code a.equals(b)} over two arrangeable values: bind both to one sample (true) or two distinct samples (false). */
+        boolean sameOrDifferent(Expr a, Expr b, boolean same) {
+            String desc = a.desc != null && !a.desc.equals("Ljava/lang/Object;") ? a.desc : b.desc;
+            if (desc == null || !arrangeable(a) || !arrangeable(b)) return false;
+            Expr first, second;
+            switch (desc) {
+                case "Ljava/lang/Integer;", "I", "Ljava/lang/Short;", "S" -> { first = Expr.constant(1, "I"); second = Expr.constant(2, "I"); }
+                case "Ljava/lang/Long;", "J" -> { first = Expr.constant(1L, "J"); second = Expr.constant(2L, "J"); }
+                case "Ljava/lang/String;" -> { first = Expr.constant("value", desc); second = Expr.constant("other", desc); }
+                default -> { return false; }
+            }
+            constrain(a, "==", first);
+            constrain(b, "==", same ? first : second);
+            return true;
+        }
+
+        /** Values a test can set: parameters, fields of the subject, and calls on mockable receivers. */
+        boolean arrangeable(Expr e) {
+            return switch (e.kind) {
+                case PARAM -> true;
+                case FIELD -> e.target != null && e.target.kind == Expr.Kind.THIS && !isStatic;
+                case CALL -> e.target != null && e.target.kind != Expr.Kind.THIS
+                        && (e.target.kind == Expr.Kind.PARAM || e.target.kind == Expr.Kind.CALL || e.target.kind == Expr.Kind.FIELD);
+                default -> false;
+            };
+        }
+
+        boolean isNow(Expr e) {
+            return e.kind == Expr.Kind.CALL && e.target == null && "now".equals(e.name) && e.owner.startsWith("java/time/");
+        }
+
+        boolean isTemporal(Expr e) {
+            return e.desc != null && e.desc.startsWith("Ljava/time/");
+        }
+
+        /** A date/time a day in the future or past, as source: {@code LocalDate.now().plusDays(1)}. */
+        String relativeToNow(String desc, boolean future) {
+            String type = imports.ref(Type.getType(desc));
+            if (desc.equals("Ljava/time/Instant;")) return type + ".now()." + (future ? "plusSeconds(86400)" : "minusSeconds(86400)");
+            return type + ".now()." + (future ? "plusDays(1)" : "minusDays(1)");
+        }
+
+        /**
+         * Preconditions implied by the path without an explicit branch: an {@code Optional} that is unwrapped with
+         * {@code get()}/{@code orElseThrow()} on a non-throwing path must be present, and the receiver of a chained
+         * call must be a mock rather than null.
+         */
+        void ensureImplicit() {
+            if (p.outcome().kind() == Path.OutcomeKind.THROW) return;
+            List<Expr> roots = new ArrayList<>();
+            for (Effect ef : p.effects()) {
+                if (ef.target() != null) roots.add(ef.target());
+                roots.addAll(ef.args());
+                if (ef.value() != null) roots.add(ef.value());
+            }
+            if (p.outcome().value() != null) roots.add(p.outcome().value());
+            for (Expr root : roots) {
+                root.mentions(x -> {
+                    if (x.kind != Expr.Kind.CALL || x.target == null) return false;
+                    Expr t = x.target;
+                    if (isOptional(t) && (x.name.equals("get") || x.name.equals("orElseThrow"))) {
+                        if (!boundLiteral.containsKey(t.text)) ensure(x);
+                    } else if (t.kind == Expr.Kind.CALL && !isOptional(t) && t.desc != null && t.desc.startsWith("L")
+                            && !ClassInspector.isValueType(t.desc) && !boundLiteral.containsKey(t.text)) {
+                        ensure(t);
+                    }
+                    return false;
+                });
+            }
+        }
+
+        /** First call on {@code this} that the path depends on (cannot be stubbed without a spy), or null. */
+        String selfCall() {
+            List<Expr> all = new ArrayList<>();
+            for (Cond c : p.conds()) { all.add(c.left()); if (c.right() != null) all.add(c.right()); }
+            for (Effect ef : p.effects()) { if (ef.target() != null) all.add(ef.target()); all.addAll(ef.args()); }
+            if (p.outcome().value() != null) all.add(p.outcome().value());
+            String[] found = new String[1];
+            for (Expr root : all) {
+                root.mentions(x -> {
+                    if (found[0] == null && x.kind == Expr.Kind.CALL && x.target != null && x.target.kind == Expr.Kind.THIS) {
+                        found[0] = x.expansion() != null ? x.expansion() : x.text;
+                    }
+                    return false;
+                });
+            }
+            for (Effect ef : p.effects()) {
+                if (found[0] == null && ef.kind() == Effect.Kind.CALL && ef.target() != null && ef.target().kind == Expr.Kind.THIS) found[0] = ef.text();
+            }
+            return found[0];
+        }
+
         final Map<String, Number> pins = new HashMap<>();
 
         Number pinnedValue(Expr e) {
@@ -423,6 +577,7 @@ public final class TestGenerator {
         }
 
         void collectBool(Expr e, boolean v, Cond c) {
+            if (e.kind == Expr.Kind.CALL && e.target == null && !e.args.isEmpty() && collectStaticPredicate(e, v)) return;
             if (e.kind == Expr.Kind.CALL && e.target != null) {
                 switch (e.name) {
                     case "equals", "equalsIgnoreCase" -> {
@@ -430,6 +585,14 @@ public final class TestGenerator {
                             Expr a = e.target, b = e.args.get(0);
                             if (b.isConst() || isEnumConst(b)) { constrain(a, v ? "==" : "!=", b); return; }
                             if (a.isConst() || isEnumConst(a)) { constrain(b, v ? "==" : "!=", a); return; }
+                            if (sameOrDifferent(a, b, v)) return;
+                        }
+                    }
+                    case "isAfter", "isBefore" -> {
+                        if (e.args.size() == 1 && isNow(e.args.get(0)) && isTemporal(e.target)) {
+                            boolean future = e.name.equals("isAfter") == v;
+                            constrain(e.target, "==", Expr.unknown(relativeToNow(e.target.desc, future), e.target.desc));
+                            return;
                         }
                     }
                     case "isEmpty" -> {
@@ -599,11 +762,11 @@ public final class TestGenerator {
         String emptyLiteral(Type type, boolean empty, Expr e) {
             String d = type.getDescriptor();
             if (d.equals("Ljava/lang/String;") || d.equals("Ljava/lang/CharSequence;")) return empty ? "\"\"" : "\"value\"";
-            String coll = collectionFactory(type);
+            String coll = mutableCollection(type);
             if (coll != null) {
-                if (empty) return coll + "()";
+                if (empty) return coll;
                 todos.add("`" + e.text + "` must be non-empty: put a realistic element into it");
-                return coll + "(new Object())";
+                return coll.replace("<>()", "<>(" + collectionFactory(type) + "(new Object()))");
             }
             todos.add("arrange so that `" + e.text + ".isEmpty()` is " + empty);
             return null;
@@ -617,6 +780,16 @@ public final class TestGenerator {
                 case "java/util/Set", "java/util/HashSet" -> { imports.add("java.util.Set"); yield "Set.of"; }
                 case "java/util/Map", "java/util/HashMap" -> { imports.add("java.util.Map"); yield "Map.of"; }
                 default -> null;
+            };
+        }
+
+        String mutableCollection(Type type) {
+            String f = collectionFactory(type);
+            if (f == null) return null;
+            return switch (f) {
+                case "List.of" -> { imports.add("java.util.ArrayList"); yield "new ArrayList<>()"; }
+                case "Set.of" -> { imports.add("java.util.HashSet"); yield "new HashSet<>()"; }
+                default -> { imports.add("java.util.HashMap"); yield "new HashMap<>()"; }
             };
         }
 
@@ -638,10 +811,12 @@ public final class TestGenerator {
                 case "Ljava/util/UUID;": imports.add("java.util.UUID"); return "UUID.fromString(\"00000000-0000-0000-0000-000000000001\")";
                 case "Ljava/util/Optional;": imports.add("java.util.Optional"); return "Optional.empty()";
                 case "Ljava/lang/Object;": return "new Object()";
+                case "Ljava/lang/Class;": return "Object.class";
                 default: break;
             }
-            String coll = collectionFactory(type);
-            if (coll != null) return coll + "()";
+            // mutable: code under test often adds to passed-in collections (errors, model attributes, results)
+            String coll = mutableCollection(type);
+            if (coll != null) return coll;
             if (type.getSort() == Type.ARRAY) return "new " + imports.ref(type.getElementType()) + "[0]";
             if (type.getSort() == Type.OBJECT && isEnum(type.getInternalName())) {
                 List<String> cs = ClassInspector.enumConstants(repo.node(type.getInternalName()));
@@ -707,6 +882,8 @@ public final class TestGenerator {
                     Type t = Type.getType(e.desc);
                     if (t.getSort() == Type.OBJECT && !ClassInspector.isValueType(e.desc)) {
                         paramValues.putIfAbsent((Integer) e.index, "mock(" + imports.ref(t) + ".class)");
+                        // the code casts a wider parameter (e.g. Object) to this type: declare the variable as it
+                        paramTypes.putIfAbsent(e.index, t);
                         v = paramVars.get(e.index);
                     }
                 }
@@ -722,6 +899,7 @@ public final class TestGenerator {
                 case CALL -> {
                     if (e.target != null && isOptional(e.target) && (e.name.equals("get") || e.name.equals("orElseThrow"))) {
                         String elem = ensureOptionalElement(e.target);
+                        imports.add("java.util.Optional");
                         bindLiteral(e.target, "Optional.of(" + elem + ")");
                         v = elem.equals("new Object()") ? null : elem;
                         break;
@@ -792,14 +970,9 @@ public final class TestGenerator {
 
         String matchers(Expr call) {
             Type[] ats = Type.getArgumentTypes(call.memberDesc);
+            boolean overloaded = isOverloaded(call.owner, call.name, ats.length);
             List<String> ms = new ArrayList<>();
-            for (Type t : ats) {
-                ms.add(switch (t.getSort()) {
-                    case Type.INT -> "anyInt()"; case Type.LONG -> "anyLong()"; case Type.BOOLEAN -> "anyBoolean()";
-                    case Type.DOUBLE -> "anyDouble()"; case Type.FLOAT -> "anyFloat()"; case Type.SHORT -> "anyShort()";
-                    case Type.BYTE -> "anyByte()"; case Type.CHAR -> "anyChar()"; default -> "any()";
-                });
-            }
+            for (Type t : ats) ms.add(anyMatcher(t, overloaded));
             return String.join(", ", ms);
         }
 
@@ -807,6 +980,8 @@ public final class TestGenerator {
         String render(String testName, String subjectType) {
             collect();
             solve();
+            ensureImplicit();
+            boolean unresolved = !todos.isEmpty(); // precondition TODOs only; assertion TODOs are inline comments
             MethodNode mn = r.method();
             Type[] ats = Type.getArgumentTypes(mn.desc);
             Type ret = Type.getReturnType(mn.desc);
@@ -841,18 +1016,29 @@ public final class TestGenerator {
             display = mn.name + ": " + display + " → " + o.describe();
             if (display.length() > 160) display = display.substring(0, 157) + "...";
             sb.append("    @Test\n    @DisplayName(\"").append(display.replace("\\", "\\\\").replace("\"", "\\\"")).append("\")\n");
-            sb.append("    void ").append(testName).append("() {\n");
+            if (unresolved) {
+                // a test that cannot reach its path would pass or fail for the wrong reason
+                imports.add("org.junit.jupiter.api.Disabled");
+                sb.append("    @Disabled(\"truth-seeker: arrange the TODO preconditions, then remove @Disabled\")\n");
+            }
+            // methods under test may declare checked exceptions (ParseException, SQLException, legacy RemoteException…)
+            sb.append("    void ").append(testName).append("() throws Exception {\n");
             if (o.kind() == Path.OutcomeKind.TRUNCATED) sb.append("        // NOTE: analysis of this path was cut short (").append(o.note()).append(")\n");
             sb.append("        // Arrange\n");
             for (int i = 0; i < r.params().size(); i++) {
                 Expr param = r.params().get(i);
                 String lit = paramValues.get(param.index);
                 if (lit == null) lit = defaultFor(ats[i]);
-                sb.append("        ").append(imports.ref(ats[i])).append(" ").append(paramVars.get(param.index)).append(" = ").append(lit).append(";\n");
+                Type declared = paramTypes.getOrDefault(param.index, ats[i]);
+                sb.append("        ").append(imports.ref(declared)).append(" ").append(paramVars.get(param.index)).append(" = ").append(lit).append(";\n");
             }
             for (String a : arrange) sb.append("        ").append(a).append("\n");
             for (String s : stubs.values()) sb.append("        ").append(s).append("\n");
             for (String t : todos) sb.append("        // TODO: ").append(t).append("\n");
+            String self = selfCall();
+            if (self != null && !isStatic) {
+                sb.append("        // NOTE: depends on the real behaviour of `").append(self).append("` (calls on the subject itself are not stubbed)\n");
+            }
             sb.append("\n        // Act").append(o.kind() == Path.OutcomeKind.THROW ? " + Assert" : "").append("\n");
             sb.append("        ").append(act).append("\n");
             if (!asserts.isEmpty()) {
@@ -897,6 +1083,22 @@ public final class TestGenerator {
                 String lit = boundLiteral.get(v.text);
                 if (ret.getSort() == Type.BOOLEAN) out.add(lit.equals("true") ? "assertTrue(result);" : "assertFalse(result);");
                 else out.add("assertEquals(" + lit + ", result);");
+            } else if (v.kind == Expr.Kind.FIELD && v.target != null && v.target.kind == Expr.Kind.THIS && !isStatic
+                    && !deps.containsKey(v.name) && (cn.access & Opcodes.ACC_ENUM) == 0 && v.desc != null) {
+                // getter-like: put a known value into the field and expect it back
+                Type t = Type.getType(v.desc);
+                boolean mockable = t.getSort() == Type.OBJECT && !ClassInspector.isValueType(v.desc) && !isEnum(t.getInternalName());
+                String lit = mockable ? newVar(t) : nonNullSample(t, v);
+                if (lit == null) {
+                    out.add("// TODO: assert result equals `" + v.text + "`");
+                } else {
+                    needsSetField = true;
+                    arrange.add("setField(subject, \"" + v.name + "\", " + lit + ");");
+                    if (mockable) out.add("assertSame(" + lit + ", result);");
+                    else if (ret.getSort() == Type.BOOLEAN) out.add(lit.equals("true") ? "assertTrue(result);" : "assertFalse(result);");
+                    else if (ret.getSort() == Type.DOUBLE || ret.getSort() == Type.FLOAT) out.add("assertEquals(" + lit + ", result, 1e-9);");
+                    else out.add("assertEquals(" + lit + ", result);");
+                }
             } else if (v.kind == Expr.Kind.BINARY && evaluate(v) != null && ret.getSort() >= Type.CHAR && ret.getSort() <= Type.LONG) {
                 Number n = evaluate(v);
                 out.add("assertEquals(" + (ret.getSort() == Type.LONG ? n.longValue() + "L" : String.valueOf(n.longValue())) + ", result);");
@@ -953,8 +1155,9 @@ public final class TestGenerator {
                 boolean isVoid = Type.getReturnType(e.desc()).getSort() == Type.VOID;
                 if (!isVoid && !MUTATOR.matcher(e.name()).matches()) continue;
                 Type[] ats = Type.getArgumentTypes(e.desc());
+                boolean overloaded = isOverloaded(e.owner(), e.name(), ats.length);
                 List<String> ms = new ArrayList<>();
-                for (int i = 0; i < e.args().size(); i++) ms.add(argMatcher(e.args().get(i), ats[i]));
+                for (int i = 0; i < e.args().size(); i++) ms.add(argMatcher(e.args().get(i), ats[i], overloaded));
                 verified.add("verify(" + mockVar + ", atLeastOnce())." + e.name() + "(" + String.join(", ", ms) + ");");
             }
             out.addAll(verified);
@@ -962,7 +1165,7 @@ public final class TestGenerator {
         }
 
         /** {@code eq(value)} when the argument's value is known in the test, otherwise a typed any-matcher. */
-        String argMatcher(Expr a, Type t) {
+        String argMatcher(Expr a, Type t, boolean overloaded) {
             String known = null;
             if (a.kind == Expr.Kind.CONST || a.kind == Expr.Kind.NULL || isEnumConst(a)) known = literalOf(a);
             else if (a.kind == Expr.Kind.PARAM) known = paramVars.get(a.index);
@@ -971,12 +1174,8 @@ public final class TestGenerator {
                 if (t.getSort() == Type.LONG && a.kind == Expr.Kind.CONST && !known.endsWith("L")) known += "L";
                 return "eq(" + known + ")";
             }
-            if (known != null) return "isNull()";
-            return switch (t.getSort()) {
-                case Type.INT -> "anyInt()"; case Type.LONG -> "anyLong()"; case Type.BOOLEAN -> "anyBoolean()";
-                case Type.DOUBLE -> "anyDouble()"; case Type.FLOAT -> "anyFloat()"; case Type.SHORT -> "anyShort()";
-                case Type.BYTE -> "anyByte()"; case Type.CHAR -> "anyChar()"; default -> "any()";
-            };
+            if (known != null) return overloaded && t.getSort() == Type.OBJECT ? "isNull(" + imports.ref(t) + ".class)" : "isNull()";
+            return anyMatcher(t, overloaded);
         }
 
         boolean isOptional(Expr e) {
@@ -985,6 +1184,47 @@ public final class TestGenerator {
     }
 
     // =============================================================================================
+
+    /**
+     * A typed any-matcher. For overloaded methods, reference types get an explicit type witness
+     * ({@code ArgumentMatchers.<Integer>any()}) so javac can pick the overload; unlike {@code any(Integer.class)}
+     * it still matches null.
+     */
+    private String anyMatcher(Type t, boolean overloaded) {
+        return switch (t.getSort()) {
+            case Type.INT -> "anyInt()"; case Type.LONG -> "anyLong()"; case Type.BOOLEAN -> "anyBoolean()";
+            case Type.DOUBLE -> "anyDouble()"; case Type.FLOAT -> "anyFloat()"; case Type.SHORT -> "anyShort()";
+            case Type.BYTE -> "anyByte()"; case Type.CHAR -> "anyChar()";
+            default -> {
+                if (!overloaded || t.getDescriptor().equals("Ljava/lang/Object;")) yield "any()";
+                imports.add("org.mockito.ArgumentMatchers");
+                yield "ArgumentMatchers.<" + imports.ref(t) + ">any()";
+            }
+        };
+    }
+
+    /** Does the owner (or a supertype in the archive) declare another method with this name and arity? Unknown owners count as overloaded. */
+    private boolean isOverloaded(String owner, String name, int arity) {
+        ClassNode start = repo.node(owner);
+        if (start == null) return true;
+        Set<String> descs = new HashSet<>();
+        Deque<String> todo = new ArrayDeque<>(List.of(owner));
+        Set<String> seen = new HashSet<>();
+        while (!todo.isEmpty()) {
+            String n = todo.poll();
+            if (!seen.add(n)) continue;
+            ClassNode c = repo.node(n);
+            if (c == null) continue;
+            for (MethodNode m : c.methods) {
+                if (m.name.equals(name) && Type.getArgumentTypes(m.desc).length == arity && (m.access & Opcodes.ACC_BRIDGE) == 0) {
+                    descs.add(m.desc.substring(0, m.desc.indexOf(')')));
+                }
+            }
+            if (c.superName != null) todo.add(c.superName);
+            todo.addAll(c.interfaces);
+        }
+        return descs.size() > 1;
+    }
 
     private boolean isEnumConst(Expr e) {
         return e.kind == Expr.Kind.STATIC && e.desc != null && e.desc.equals("L" + e.owner + ";");

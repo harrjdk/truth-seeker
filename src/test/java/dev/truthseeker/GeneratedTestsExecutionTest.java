@@ -37,7 +37,9 @@ class GeneratedTestsExecutionTest {
     void generatedTestsCompileAndPass(@TempDir Path tmp) throws Exception {
         ClassRepository repo = TestSupport.repo();
         List<String> classes = new ArrayList<>(List.of(
-                "fixtures.order.OrderService", "fixtures.rules.Eligibility", "fixtures.door.Door", "fixtures.door.TrafficLight"));
+                "fixtures.order.OrderService", "fixtures.rules.Eligibility", "fixtures.door.Door", "fixtures.door.TrafficLight",
+                // PetClinic-shaped regressions: Optional.orElseThrow, overloaded getPet(..), Object-typed param cast, loops
+                "fixtures.clinic.PetLookupService", "fixtures.clinic.PetValidator", "fixtures.clinic.Owner"));
         if (TestSupport.hasJava21Fixtures()) classes.add("fixtures.modern.Shapes");
 
         Path src = tmp.resolve("src");
@@ -80,7 +82,10 @@ class GeneratedTestsExecutionTest {
                 s.printFailuresTo(new PrintWriter(sw), 15);
                 assertTrue(s.getTestsFoundCount() >= 30, "expected generated tests to run, found " + s.getTestsFoundCount());
                 assertEquals(0, s.getTotalFailureCount(), () -> "Generated test failures:\n" + sw + "\n" + dump(files));
-                assertEquals(s.getTestsFoundCount(), s.getTestsSucceededCount());
+                // tests with unresolved preconditions are emitted @Disabled; keep that a small minority
+                assertEquals(s.getTestsFoundCount(), s.getTestsSucceededCount() + s.getTestsSkippedCount());
+                assertTrue(s.getTestsSkippedCount() * 5 <= s.getTestsFoundCount(),
+                        "too many disabled tests: " + s.getTestsSkippedCount() + " of " + s.getTestsFoundCount());
             } finally {
                 t.setContextClassLoader(previous);
             }

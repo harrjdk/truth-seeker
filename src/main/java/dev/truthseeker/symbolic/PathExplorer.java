@@ -89,9 +89,14 @@ public final class PathExplorer {
         ArrayList<Effect> effects;
         int[] visits;
         int steps;
+        /** Loop iterations re-entered on this path, and how many decisions were made before the latest one. */
+        int iteration;
+        int barrier;
 
         Frame copy() {
             Frame f = new Frame();
+            f.iteration = iteration;
+            f.barrier = barrier;
             f.pc = pc;
             f.stack = new ArrayList<>(stack);
             f.locals = locals.clone();
@@ -224,6 +229,10 @@ public final class PathExplorer {
                 if (++f.visits[f.pc] > opt.loopBound() + 1) {
                     notes.add("Loops are unrolled at most " + opt.loopBound() + " time(s).");
                     return; // drop: the loop exit was already explored on an earlier iteration
+                }
+                if (f.visits[f.pc] > 1) { // back-edge: a new loop iteration starts here
+                    f.iteration++;
+                    f.barrier = f.conds.size();
                 }
                 f.pc++;
                 continue;
@@ -533,6 +542,11 @@ public final class PathExplorer {
     // ---- branching ------------------------------------------------------------------------------
 
     private boolean branch(Frame f, JumpInsnNode j, Cond taken, Cond fall, Deque<Frame> work) {
+        if (repeatsInNewIteration(f, taken)) {
+            String suffix = " [iteration " + (f.iteration + 1) + "]";
+            taken = rekey(taken, suffix);
+            fall = rekey(fall, suffix);
+        }
         boolean canTake = feasible(f, taken);
         boolean canFall = feasible(f, fall);
         int target = insns.indexOf(j.label);
@@ -551,6 +565,31 @@ public final class PathExplorer {
             return false; // contradictory path
         }
         return true;
+    }
+
+    /**
+     * A decision over mutable state (a call, field, array element or local) that was already made
+     * before the current loop iteration is a new decision, not the same one: {@code it.hasNext()} is
+     * true on the first pass and may be false on the next. Decisions over parameters and constants
+     * stay pinned so contradictory combinations are still pruned.
+     */
+    private boolean repeatsInNewIteration(Frame f, Cond c) {
+        if (f.iteration == 0) return false;
+        boolean mutable = isMutable(c.left()) || (c.right() != null && isMutable(c.right()));
+        if (!mutable) return false;
+        for (int i = 0; i < f.barrier && i < f.conds.size(); i++) {
+            if (f.conds.get(i).key().equals(c.key())) return true;
+        }
+        return false;
+    }
+
+    private static boolean isMutable(Expr e) {
+        return e.mentions(x -> x.kind == Expr.Kind.CALL || x.kind == Expr.Kind.FIELD || x.kind == Expr.Kind.ARRAY_ELEM
+                || x.kind == Expr.Kind.LOCAL || x.kind == Expr.Kind.UNKNOWN);
+    }
+
+    private static Cond rekey(Cond c, String suffix) {
+        return new Cond(c.kind(), c.left().withText(c.left().text + suffix), c.op(), c.right(), c.value(), c.valueExpr(), c.otherCases());
     }
 
     private void add(Frame f, Cond c) {
@@ -909,7 +948,8 @@ public final class PathExplorer {
                 || name.startsWith("as") || name.startsWith("orElse") || name.equals("stream") || name.equals("iterator")
                 || name.equals("hasNext") || name.equals("next") || name.equals("length") || name.equals("charAt")
                 || name.equals("matches") || name.equals("startsWith") || name.equals("endsWith") || name.equals("map")
-                || name.equals("filter") || name.equals("collect") || name.equals("of") || name.equals("valueOf");
+                || name.equals("filter") || name.equals("collect") || name.equals("of") || name.equals("valueOf")
+                || name.equals("now") || name.equals("currentTimeMillis") || name.equals("nanoTime");
     }
 
     private static void replace(Frame f, Expr from, Expr to) {

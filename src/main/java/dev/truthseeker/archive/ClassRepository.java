@@ -158,6 +158,8 @@ public final class ClassRepository {
     /** WEB-INF/lib, BOOT-INF/lib, EAR lib/ and APP-INF/lib (WebLogic) hold third-party jars. */
     private static boolean isLibraryPath(String name) {
         String n = name.replace('\\', '/').toLowerCase(Locale.ROOT);
+        // the Spring Boot launcher lives at the root of every fat jar but is not application code
+        if (n.startsWith("org/springframework/boot/loader/")) return true;
         return n.startsWith("web-inf/lib/") || n.startsWith("boot-inf/lib/") || n.startsWith("lib/")
                 || n.startsWith("app-inf/lib/") || n.contains("/web-inf/lib/") || n.contains("/boot-inf/lib/");
     }

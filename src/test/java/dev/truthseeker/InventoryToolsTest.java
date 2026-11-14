@@ -92,6 +92,26 @@ class InventoryToolsTest {
         assertFalse(md.contains("commented-out"), md);
     }
 
+    @Test
+    void springBootLauncherClassesAreNotApplicationCode(@TempDir Path tmp) throws Exception {
+        byte[] app = Files.readAllBytes(TestSupport.fixtures().resolve("fixtures/rules/Eligibility.class"));
+        byte[] launcher = Files.readAllBytes(TestSupport.fixtures().resolve("fixtures/door/Door.class"));
+        Path jar = tmp.resolve("app.jar");
+        try (OutputStream out = Files.newOutputStream(jar); ZipOutputStream z = new ZipOutputStream(out)) {
+            put(z, "BOOT-INF/classes/fixtures/rules/Eligibility.class", app);
+            put(z, "org/springframework/boot/loader/launch/JarLauncher.class", launcher); // stand-in bytes
+        }
+        ClassRepository repo = ClassRepository.open(jar.toString());
+        assertFalse(repo.entry("fixtures/rules/Eligibility").orElseThrow().library());
+        assertTrue(repo.entry("fixtures/door/Door").orElseThrow().library());
+    }
+
+    @Test
+    void noStateMachinesMessage() {
+        String md = TestSupport.run("state_machine", "packagePrefix", "fixtures.clinic");
+        assertTrue(md.contains("No state machines inferred"), md);
+    }
+
     private static void put(ZipOutputStream z, String name, byte[] data) throws Exception {
         z.putNextEntry(new ZipEntry(name));
         z.write(data);

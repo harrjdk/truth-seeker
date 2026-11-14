@@ -65,6 +65,25 @@ class TruthTableTest {
     }
 
     @Test
+    void loopConditionsAreReevaluatedPerIteration() throws Exception {
+        PathExplorer.Result r = explore("fixtures.clinic.Owner", "getPet(String)");
+        // first pet does not match, loop runs again and ends: must still return null
+        boolean exitsAfterOneMiss = r.paths().stream().anyMatch(p -> p.outcome().describe().equals("return null")
+                && p.conds().stream().anyMatch(c -> c.key().contains("hasNext() [iteration 2]") && !c.isTrue())
+                && p.conds().stream().anyMatch(c -> c.key().contains("hasNext()") && !c.key().contains("iteration") && c.isTrue()));
+        assertTrue(exitsAfterOneMiss, () -> r.paths().stream().map(p -> p.conds() + " -> " + p.outcome().describe()).collect(Collectors.joining("\n")));
+        // parameters stay pinned across iterations: no re-decided "[iteration" column for them
+        PathExplorer.Result byId = explore("fixtures.clinic.Owner", "getPet(Integer)");
+        assertTrue(byId.paths().size() >= 4, "paths: " + byId.paths().size());
+    }
+
+    @Test
+    void gettersOnCastParameterAreNotSideEffects() throws Exception {
+        PathExplorer.Result r = explore("fixtures.clinic.PetValidator", "validate");
+        assertTrue(r.paths().stream().allMatch(p -> p.effects().stream().noneMatch(e -> e.text().contains("getName"))));
+    }
+
+    @Test
     void markdownContainsExpandedTableAndFormula() {
         String md = TestSupport.run("truth_table", "className", "Eligibility", "method", "isEligible", "expand", true);
         assertTrue(md.contains("**Expanded truth table** (all 2^4 combinations)"), md);
