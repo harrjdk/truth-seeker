@@ -41,7 +41,9 @@ class GeneratedTestsExecutionTest {
                 // PetClinic-shaped regressions: Optional.orElseThrow, overloaded getPet(..), Object-typed param cast, loops
                 "fixtures.clinic.PetLookupService", "fixtures.clinic.PetValidator", "fixtures.clinic.Owner",
                 // Cargo Tracker-shaped regressions: validated constructors, no no-arg ctor, JUL Logger collaborator
-                "fixtures.shipping.HandlingEvent", "fixtures.shipping.Delivery", "fixtures.shipping.HandlingService"));
+                "fixtures.shipping.HandlingEvent", "fixtures.shipping.Delivery", "fixtures.shipping.HandlingService",
+                // self-call inlining, for-each loops driven with real collections, precondition helpers
+                "fixtures.rules.ShippingFee"));
         if (TestSupport.hasJava21Fixtures()) classes.add("fixtures.modern.Shapes");
 
         Path src = tmp.resolve("src");
@@ -86,7 +88,7 @@ class GeneratedTestsExecutionTest {
                 assertEquals(0, s.getTotalFailureCount(), () -> "Generated test failures:\n" + sw + "\n" + dump(files));
                 // tests with unresolved preconditions are emitted @Disabled; keep that a small minority
                 assertEquals(s.getTestsFoundCount(), s.getTestsSucceededCount() + s.getTestsSkippedCount());
-                assertTrue(s.getTestsSkippedCount() * 5 <= s.getTestsFoundCount(),
+                assertTrue(s.getTestsSkippedCount() * 10 <= s.getTestsFoundCount(),
                         "too many disabled tests: " + s.getTestsSkippedCount() + " of " + s.getTestsFoundCount());
             } finally {
                 t.setContextClassLoader(previous);

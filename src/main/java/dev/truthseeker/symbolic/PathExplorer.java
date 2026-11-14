@@ -17,22 +17,30 @@ import static org.objectweb.asm.Opcodes.*;
  * decisions taken ({@link Cond}), the side effects ({@link Effect}) and how the method exits.
  *
  * <p>Deliberate simplifications (documented in tool output): catch handlers are not entered,
- * loops are unrolled at most {@code loopBound} times, and callee bodies are not inlined —
- * calls stay symbolic ({@code this.repo.findById(id)}).
+ * loops are unrolled at most {@code loopBound} times. Calls on the class's own methods
+ * ({@code this.helper(x)}, private/static helpers, getters) are inlined up to {@link #MAX_INLINE_DEPTH}
+ * levels so their decisions become part of the caller's paths; all other calls stay symbolic
+ * ({@code this.repo.findById(id)}).
  */
 public final class PathExplorer {
 
     /**
      * @param ignoreLogging treat {@code log.isDebugEnabled()}-style guards as false and drop logger calls
      *                      from side effects — they multiply paths without carrying business meaning
+     * @param inlineSelfCalls follow calls on the class's own methods (see {@link #MAX_INLINE_DEPTH})
      */
-    public record Options(int maxPaths, int loopBound, int maxStepsPerPath, int maxExprLength, boolean ignoreLogging) {
+    public record Options(int maxPaths, int loopBound, int maxStepsPerPath, int maxExprLength, boolean ignoreLogging,
+                          boolean inlineSelfCalls) {
         public static Options defaults() {
-            return new Options(256, 1, 20_000, 140, true);
+            return new Options(256, 1, 20_000, 140, true, true);
         }
 
         public Options withMaxPaths(int n) {
-            return new Options(n, loopBound, maxStepsPerPath, maxExprLength, ignoreLogging);
+            return new Options(n, loopBound, maxStepsPerPath, maxExprLength, ignoreLogging, inlineSelfCalls);
+        }
+
+        public Options withInlining(boolean on) {
+            return new Options(maxPaths, loopBound, maxStepsPerPath, maxExprLength, ignoreLogging, on);
         }
     }
 
@@ -53,10 +61,13 @@ public final class PathExplorer {
     private final ClassNode cn;
     private final MethodNode mn;
     private final Options opt;
-    private final InsnList insns;
+    /** Method whose instructions are currently executing: the analysed method or an inlined self-call. */
+    private MethodNode curMn;
+    private InsnList insns;
     private final boolean isStatic;
     private final Type[] argTypes;
-    private final Type returnType;
+    static final int MAX_INLINE_DEPTH = 2;
+    private static final int MAX_INLINE_INSNS = 1500;
     private final Set<String> notes = new LinkedHashSet<>();
     private final Map<String, String> canonicalOps = new HashMap<>();
     private final List<Path> paths = new ArrayList<>();
@@ -68,10 +79,10 @@ public final class PathExplorer {
         this.cn = cn;
         this.mn = mn;
         this.opt = opt;
+        this.curMn = mn;
         this.insns = mn.instructions;
         this.isStatic = (mn.access & ACC_STATIC) != 0;
         this.argTypes = Type.getArgumentTypes(mn.desc);
-        this.returnType = Type.getReturnType(mn.desc);
     }
 
     public static Result explore(ClassRepository repo, ClassNode cn, MethodNode mn, Options opt) {
@@ -80,11 +91,28 @@ public final class PathExplorer {
 
     // ---------------------------------------------------------------------------------------------
 
+    /** Caller state saved while an inlined self-call executes; immutable, shared between path copies. */
+    private record Caller(MethodNode method, int pc, List<Expr> stack, Expr[] locals, int[] visits, Caller parent) {
+        int depth() {
+            return parent == null ? 1 : parent.depth() + 1;
+        }
+
+        boolean contains(MethodNode m) {
+            return method == m || (parent != null && parent.contains(m));
+        }
+    }
+
     private final class Frame {
+        MethodNode method;
+        Caller caller;
         int pc;
         ArrayList<Expr> stack;
         Expr[] locals;
         HashMap<String, Expr> thisFields;
+        /** Values dereferenced on this path (call receivers, field targets, checked non-null): cannot be null afterwards. */
+        HashSet<String> nonNull;
+        /** Local-variable display names bound on this path: name → (method that bound it, full expression). */
+        HashMap<String, Binding> aliases;
         ArrayList<Cond> conds;
         ArrayList<Effect> effects;
         int[] visits;
@@ -95,12 +123,16 @@ public final class PathExplorer {
 
         Frame copy() {
             Frame f = new Frame();
+            f.method = method;
+            f.caller = caller;
             f.iteration = iteration;
             f.barrier = barrier;
             f.pc = pc;
             f.stack = new ArrayList<>(stack);
             f.locals = locals.clone();
             f.thisFields = new HashMap<>(thisFields);
+            f.nonNull = new HashSet<>(nonNull);
+            f.aliases = new HashMap<>(aliases);
             f.conds = new ArrayList<>(conds);
             f.effects = new ArrayList<>(effects);
             f.visits = visits.clone();
@@ -131,10 +163,13 @@ public final class PathExplorer {
             notes.add("Catch/finally handlers are not explored; exceptions thrown inside try blocks are reported as method exits.");
         }
         Frame init = new Frame();
+        init.method = mn;
         init.pc = 0;
         init.stack = new ArrayList<>();
         init.locals = new Expr[Math.max(mn.maxLocals, 1 + argTypes.length * 2)];
         init.thisFields = new HashMap<>();
+        init.nonNull = new HashSet<>();
+        init.aliases = new HashMap<>();
         init.conds = new ArrayList<>();
         init.effects = new ArrayList<>();
         init.visits = new int[insns.size()];
@@ -185,8 +220,8 @@ public final class PathExplorer {
     }
 
     private String localName(int slot, int pc) {
-        if (mn.localVariables != null) {
-            for (LocalVariableNode lv : mn.localVariables) {
+        if (curMn.localVariables != null) {
+            for (LocalVariableNode lv : curMn.localVariables) {
                 if (lv.index == slot && insns.indexOf(lv.start) <= pc && pc <= insns.indexOf(lv.end)) return lv.name;
             }
         }
@@ -199,8 +234,8 @@ public final class PathExplorer {
     }
 
     private String localDesc(int slot, int pc) {
-        if (mn.localVariables != null) {
-            for (LocalVariableNode lv : mn.localVariables) {
+        if (curMn.localVariables != null) {
+            for (LocalVariableNode lv : curMn.localVariables) {
                 if (lv.index == slot && insns.indexOf(lv.start) <= pc && pc <= insns.indexOf(lv.end)) return lv.desc;
             }
         }
@@ -215,6 +250,8 @@ public final class PathExplorer {
 
     private void execute(Frame f, Deque<Frame> work) {
         while (true) {
+            curMn = f.method;
+            insns = curMn.instructions;
             if (f.pc >= insns.size()) {
                 finish(f, new Path.Outcome(Path.OutcomeKind.TRUNCATED, null, null, "fell off end of method"));
                 return;
@@ -277,11 +314,11 @@ public final class PathExplorer {
                         || v.kind == Expr.Kind.THIS || v.kind == Expr.Kind.STATIC || v.kind == Expr.Kind.LOCAL;
                 if (v.kind == Expr.Kind.NEW && !v.isUninitialized() && lvName != null) {
                     // keep constructor arguments visible behind the name (needed to see what must be non-null)
-                    f.locals[slot] = v.aliased(lvName);
+                    f.locals[slot] = v.aliased(scopedName(f, lvName, v));
                 } else if (v.kind == Expr.Kind.NEW || v.kind == Expr.Kind.ARRAY_NEW || v.kind == Expr.Kind.LAMBDA) {
                     f.locals[slot] = Expr.local(slot, localName(slot, f.pc + 1), v.desc != null ? v.desc : lvDesc);
                 } else if (!trivial && lvName != null) {
-                    f.locals[slot] = v.aliased(lvName); // readable name, structure kept
+                    f.locals[slot] = v.aliased(scopedName(f, lvName, v)); // readable name, structure kept
                 } else if (v.text.length() <= opt.maxExprLength()) {
                     f.locals[slot] = v;
                 } else {
@@ -430,7 +467,9 @@ public final class PathExplorer {
                 return branch(f, (JumpInsnNode) in, cs[0], cs[1], work);
             }
             case GOTO -> {
-                f.pc = insns.indexOf(((JumpInsnNode) in).label);
+                int target = insns.indexOf(((JumpInsnNode) in).label);
+                if (target < f.pc) f.nonNull.clear(); // back-edge: loop variables will hold the next element
+                f.pc = target;
                 return true;
             }
             case JSR, RET -> {
@@ -451,11 +490,19 @@ public final class PathExplorer {
                 return doSwitch(f, f.pop(), cases, ls.dflt, work);
             }
             case IRETURN, LRETURN, FRETURN, DRETURN, ARETURN -> {
-                Expr v = coerce(f.pop(), returnType.getDescriptor());
+                Expr v = coerce(f.pop(), Type.getReturnType(curMn.desc).getDescriptor());
+                if (f.caller != null) {
+                    returnToCaller(f, v);
+                    return true;
+                }
                 finish(f, new Path.Outcome(Path.OutcomeKind.RETURN, v, null, null));
                 return false;
             }
             case RETURN -> {
+                if (f.caller != null) {
+                    returnToCaller(f, null);
+                    return true;
+                }
                 finish(f, new Path.Outcome(Path.OutcomeKind.RETURN_VOID, null, null, null));
                 return false;
             }
@@ -490,6 +537,7 @@ public final class PathExplorer {
             case GETFIELD -> {
                 FieldInsnNode fi = (FieldInsnNode) in;
                 Expr target = f.pop();
+                dereferenced(f, target);
                 if (target.kind == Expr.Kind.THIS && f.thisFields.containsKey(fi.name)) f.push(f.thisFields.get(fi.name));
                 else f.push(Expr.field(target, fi.owner, fi.name, fi.desc));
             }
@@ -497,10 +545,13 @@ public final class PathExplorer {
                 FieldInsnNode fi = (FieldInsnNode) in;
                 Expr v = coerce(f.pop(), fi.desc);
                 Expr target = f.pop();
+                dereferenced(f, target);
                 if (target.kind == Expr.Kind.THIS) f.thisFields.put(fi.name, v);
                 f.effects.add(new Effect(Effect.Kind.FIELD_WRITE, target, fi.owner, fi.name, fi.desc, List.of(), v));
             }
-            case INVOKEVIRTUAL, INVOKESPECIAL, INVOKESTATIC, INVOKEINTERFACE -> invoke(f, (MethodInsnNode) in);
+            case INVOKEVIRTUAL, INVOKESPECIAL, INVOKESTATIC, INVOKEINTERFACE -> {
+                if (!invoke(f, (MethodInsnNode) in, work)) return false;
+            }
             case INVOKEDYNAMIC -> invokeDynamic(f, (InvokeDynamicInsnNode) in);
             case NEW -> f.push(Expr.uninitialized(((TypeInsnNode) in).desc, f.pc));
             case NEWARRAY -> {
@@ -557,10 +608,12 @@ public final class PathExplorer {
             Frame g = f.copy();
             add(g, taken);
             g.pc = target;
+            if (target < f.pc) g.nonNull.clear();
             work.push(g);
             add(f, fall);
             f.pc++;
         } else if (canTake) {
+            if (target < f.pc) f.nonNull.clear();
             f.pc = target;
         } else if (canFall) {
             f.pc++;
@@ -609,18 +662,54 @@ public final class PathExplorer {
     }
 
     private void add(Frame f, Cond c) {
-        if (isConstant(c) != null) return; // statically decided, not interesting
+        if (known(f, c) != null) return; // statically decided, not interesting
         for (Cond e : f.conds) if (e.key().equals(c.key())) return;
         f.conds.add(c);
     }
 
     private boolean feasible(Frame f, Cond c) {
-        Boolean k = isConstant(c);
+        Boolean k = known(f, c);
         if (k != null) return k;
         for (Cond e : f.conds) {
             if (e.key().equals(c.key())) return e.value().equals(c.value());
         }
         return true;
+    }
+
+    private record Binding(MethodNode method, String expansion) {}
+
+    /**
+     * The display name for a local: its own name, or {@code method.name} when an inlined method's local of the
+     * same name already stands for a different value on this path (two {@code existingPet}s must not merge).
+     */
+    private String scopedName(Frame f, String name, Expr v) {
+        String exp = valueKey(v);
+        Binding prev = f.aliases.get(name);
+        if (prev == null || prev.method() == curMn || prev.expansion().equals(exp)) {
+            f.aliases.put(name, new Binding(curMn, exp));
+            return name;
+        }
+        String scoped = curMn.name + "." + name;
+        f.aliases.put(scoped, new Binding(curMn, exp));
+        return scoped;
+    }
+
+    private static String valueKey(Expr e) {
+        return e.expansion() != null ? e.expansion() : e.text;
+    }
+
+    private static void dereferenced(Frame f, Expr e) {
+        if (e.kind != Expr.Kind.THIS && e.kind != Expr.Kind.STATIC) f.nonNull.add(valueKey(e));
+    }
+
+    /** Statically known outcome, including null checks on values this path already dereferenced; else null. */
+    private Boolean known(Frame f, Cond c) {
+        Boolean k = isConstant(c);
+        if (k != null) return k;
+        if (c.kind() == Cond.Kind.CMP && c.right().kind == Expr.Kind.NULL && f.nonNull.contains(valueKey(c.left()))) {
+            return "!=".equals(c.op()) == c.isTrue();
+        }
+        return null;
     }
 
     /** Evaluates conditions whose outcome is known statically, or null. */
@@ -636,7 +725,7 @@ public final class PathExplorer {
         if (c.kind() != Cond.Kind.CMP) return null;
         Expr l = c.left(), r = c.right();
         if (r.kind == Expr.Kind.NULL) {
-            if (l.kind == Expr.Kind.NULL) return eval("==", 0, 0, c.op()) == want;
+            if (l.kind == Expr.Kind.NULL) return eval(c.op(), 0, 0, null) == want;
             if (l.kind == Expr.Kind.THIS || l.kind == Expr.Kind.NEW || l.kind == Expr.Kind.ARRAY_NEW
                     || l.kind == Expr.Kind.CONST || l.kind == Expr.Kind.LAMBDA) {
                 return ("!=".equals(c.op())) == want;
@@ -793,12 +882,14 @@ public final class PathExplorer {
 
     // ---- invocations ----------------------------------------------------------------------------
 
-    private void invoke(Frame f, MethodInsnNode m) {
+    /** Executes a call. Returns false when the path ended inside it (a precondition helper that always throws). */
+    private boolean invoke(Frame f, MethodInsnNode m, Deque<Frame> work) {
         Type[] ats = Type.getArgumentTypes(m.desc);
         Expr[] args = new Expr[ats.length];
         for (int i = ats.length - 1; i >= 0; i--) args[i] = coerce(f.pop(), ats[i].getDescriptor());
         List<Expr> argList = Arrays.asList(args);
         Expr recv = m.getOpcode() == INVOKESTATIC ? null : f.pop();
+        if (recv != null && !m.name.equals("<init>")) dereferenced(f, recv);
         Type ret = Type.getReturnType(m.desc);
 
         if (m.name.equals("<init>")) {
@@ -812,16 +903,16 @@ public final class PathExplorer {
             } else if (recv != null && recv.kind == Expr.Kind.THIS && !m.owner.equals("java/lang/Object")) {
                 f.effects.add(new Effect(Effect.Kind.CALL, recv, m.owner, m.owner.equals(cn.name) ? "this" : "super", m.desc, argList, null));
             }
-            return;
+            return true;
         }
         // transparent boxing / unboxing
         if (isBoxing(m) && args.length == 1) {
             f.push(args[0].withDesc(ret.getDescriptor()));
-            return;
+            return true;
         }
         if (isUnboxing(m) && recv != null) {
             f.push(recv.withDesc(ret.getDescriptor()));
-            return;
+            return true;
         }
         // legacy (pre Java 9) string concatenation via StringBuilder
         if (recv != null && isStringBuilder(m.owner) && "concat".equals(concatMarker(recv))) {
@@ -829,29 +920,193 @@ public final class PathExplorer {
                 List<Expr> parts = new ArrayList<>(concatParts(recv));
                 parts.add(args[0]);
                 f.push(markConcat(Expr.unknown(joinConcat(parts), "L" + m.owner + ";"), parts));
-                return;
+                return true;
             }
             if (m.name.equals("toString")) {
                 f.push(Expr.unknown(joinConcat(concatParts(recv)), "Ljava/lang/String;"));
-                return;
+                return true;
             }
         }
         if (m.name.startsWith("$SWITCH_TABLE$")) { // ECJ enum switch table
             f.push(Expr.call(null, m.owner, m.name, m.desc, argList));
-            return;
+            return true;
         }
         // javac wraps object operands of string concatenation in String.valueOf(..): keep the operand text
         if (m.getOpcode() == INVOKESTATIC && m.owner.equals("java/lang/String") && m.name.equals("valueOf")
                 && m.desc.equals("(Ljava/lang/Object;)Ljava/lang/String;")) {
             f.push(Expr.unknown(args[0].text, "Ljava/lang/String;"));
-            return;
+            return true;
         }
+        if (inline(f, m, recv, args)) return true;
+        Boolean guarded = guard(f, m, args, work);
+        if (guarded != null) return guarded;
         Expr call = Expr.call(recv, m.owner, m.name, m.desc, argList);
         boolean loggerCall = opt.ignoreLogging() && LOGGER_TYPES.contains(m.owner);
         if (!loggerCall && !isPureLibraryCall(m) && !(ret.getSort() != Type.VOID && isQuery(m.name))) {
             f.effects.add(new Effect(Effect.Kind.CALL, recv, m.owner, m.name, m.desc, argList, null));
         }
         if (ret.getSort() != Type.VOID) f.push(call);
+        return true;
+    }
+
+    /**
+     * Precondition helpers ({@code Objects.requireNonNull}, Spring {@code Assert}, Guava {@code Preconditions},
+     * commons-lang {@code Validate}) throw instead of returning: modelled as a branch to the exception they raise.
+     * Returns null when {@code m} is not one of them, otherwise whether the path continues.
+     */
+    private Boolean guard(Frame f, MethodInsnNode m, Expr[] args, Deque<Frame> work) {
+        if (m.getOpcode() != INVOKESTATIC || args.length == 0) return null;
+        String check = null, exception = null;
+        boolean returnsArg = false;
+        String owner = m.owner, first = Type.getArgumentTypes(m.desc)[0].getDescriptor();
+        boolean objectArg = first.startsWith("L") || first.startsWith("[");
+        switch (owner) {
+            case "java/util/Objects" -> {
+                if (m.name.equals("requireNonNull") && objectArg) { check = "null"; exception = "java/lang/NullPointerException"; returnsArg = true; }
+            }
+            case "org/springframework/util/Assert" -> {
+                switch (m.name) {
+                    case "notNull" -> { if (objectArg) { check = "null"; exception = "java/lang/IllegalArgumentException"; } }
+                    case "isTrue" -> { if (first.equals("Z")) { check = "true"; exception = "java/lang/IllegalArgumentException"; } }
+                    case "state" -> { if (first.equals("Z")) { check = "true"; exception = "java/lang/IllegalStateException"; } }
+                    case "hasText", "hasLength" -> { if (first.equals("Ljava/lang/String;")) { check = m.name; exception = "java/lang/IllegalArgumentException"; } }
+                    default -> {}
+                }
+            }
+            case "com/google/common/base/Preconditions" -> {
+                switch (m.name) {
+                    case "checkNotNull" -> { if (objectArg) { check = "null"; exception = "java/lang/NullPointerException"; returnsArg = true; } }
+                    case "checkArgument" -> { if (first.equals("Z")) { check = "true"; exception = "java/lang/IllegalArgumentException"; } }
+                    case "checkState" -> { if (first.equals("Z")) { check = "true"; exception = "java/lang/IllegalStateException"; } }
+                    default -> {}
+                }
+            }
+            case "org/apache/commons/lang3/Validate", "org/apache/commons/lang/Validate" -> {
+                boolean lang3 = owner.contains("lang3");
+                switch (m.name) {
+                    case "notNull" -> { if (objectArg) { check = "null"; exception = lang3 ? "java/lang/NullPointerException" : "java/lang/IllegalArgumentException"; returnsArg = lang3; } }
+                    case "isTrue" -> { if (first.equals("Z")) { check = "true"; exception = "java/lang/IllegalArgumentException"; } }
+                    case "validState" -> { if (first.equals("Z")) { check = "true"; exception = "java/lang/IllegalStateException"; } }
+                    default -> {}
+                }
+            }
+            default -> {}
+        }
+        if (check == null) return null;
+        Expr a = args[0];
+        if (check.equals("null") && args.length == 1 && isSyntheticNullCheck(f.pc)) {
+            // javac's own null checks (pattern switches, qualified new, method refs): DUP; requireNonNull; POP
+            dereferenced(f, a);
+            f.push(a);
+            return true;
+        }
+        Cond fail, pass;
+        switch (check) {
+            case "null" -> {
+                Cond[] cs = cmpConds(a, "==", Expr.nul());
+                fail = cs[0];
+                pass = cs[1];
+            }
+            case "true" -> {
+                if (a.isConst()) {
+                    boolean holds = a.value instanceof Number n ? n.intValue() != 0 : Boolean.TRUE.equals(a.value);
+                    fail = holds ? null : Cond.bool(Expr.constant(1, "Z"), true);
+                    pass = holds ? Cond.bool(Expr.constant(1, "Z"), true) : null;
+                } else {
+                    pass = Cond.bool(a, true);
+                    fail = Cond.bool(a, false);
+                }
+            }
+            default -> { // hasText / hasLength: same predicate as Spring's StringUtils, which the test generator understands
+                Expr p = Expr.call(null, "org/springframework/util/StringUtils", check, "(Ljava/lang/String;)Z", List.of(a));
+                pass = Cond.bool(p, true);
+                fail = Cond.bool(p, false);
+            }
+        }
+        boolean canFail = fail != null && feasible(f, fail);
+        boolean canPass = pass != null && feasible(f, pass);
+        Expr thrown = args.length >= 2 && "Ljava/lang/String;".equals(args[1].desc)
+                ? Expr.newObject(exception, "(Ljava/lang/String;)V", List.of(args[1]))
+                : Expr.newObject(exception, "()V", List.of());
+        if (canFail && !canPass) {
+            add(f, fail);
+            finish(f, new Path.Outcome(Path.OutcomeKind.THROW, thrown, exception, null));
+            return false;
+        }
+        if (canFail) {
+            Frame g = f.copy();
+            add(g, fail);
+            finish(g, new Path.Outcome(Path.OutcomeKind.THROW, thrown, exception, null));
+        }
+        if (!canPass) return false; // contradictory path
+        add(f, pass);
+        if (check.equals("null")) dereferenced(f, a);
+        if (Type.getReturnType(m.desc).getSort() != Type.VOID) f.push(returnsArg ? a : Expr.unknown("?", Type.getReturnType(m.desc).getDescriptor()));
+        return true;
+    }
+
+    private boolean isSyntheticNullCheck(int pc) {
+        AbstractInsnNode prev = insns.get(pc).getPrevious(), next = insns.get(pc).getNext();
+        while (prev != null && prev.getOpcode() < 0) prev = prev.getPrevious();
+        while (next != null && next.getOpcode() < 0) next = next.getNext();
+        return prev != null && prev.getOpcode() == DUP && next != null && next.getOpcode() == POP;
+    }
+
+    /**
+     * Inlines a call on the class's own code: {@code this.m(..)} (virtual calls resolve against the class
+     * under analysis, which is what a unit test instantiates), {@code super.m(..)} and static helpers.
+     * The callee's decisions and effects become part of the caller's path.
+     */
+    private boolean inline(Frame f, MethodInsnNode m, Expr recv, Expr[] args) {
+        boolean selfStatic = m.getOpcode() == INVOKESTATIC && m.owner.equals(cn.name);
+        boolean onThis = recv != null && recv.kind == Expr.Kind.THIS && m.getOpcode() != INVOKESTATIC;
+        if (!opt.inlineSelfCalls() || (!selfStatic && !onThis)) return false;
+        if (f.caller != null && f.caller.depth() >= MAX_INLINE_DEPTH) {
+            notes.add("Calls on the class's own methods are inlined up to " + MAX_INLINE_DEPTH + " levels deep; deeper ones stay symbolic.");
+            return false;
+        }
+        MethodNode target = resolveOwn(m.getOpcode() == INVOKESPECIAL || selfStatic ? m.owner : cn.name, m.name, m.desc);
+        if (target == null || target.instructions.size() == 0 || target.instructions.size() > MAX_INLINE_INSNS
+                || (target.access & (ACC_ABSTRACT | ACC_NATIVE)) != 0) return false;
+        if (target == f.method || (f.caller != null && f.caller.contains(target))) return false; // recursion
+        f.caller = new Caller(f.method, f.pc, List.copyOf(f.stack), f.locals, f.visits, f.caller);
+        Expr[] locals = new Expr[Math.max(target.maxLocals, 1 + args.length * 2)];
+        int slot = 0;
+        if ((target.access & ACC_STATIC) == 0) locals[slot++] = recv;
+        Type[] ats = Type.getArgumentTypes(target.desc);
+        for (int i = 0; i < args.length; i++) {
+            locals[slot] = args[i];
+            slot += ats[i].getSize();
+        }
+        f.method = target;
+        f.stack = new ArrayList<>();
+        f.locals = locals;
+        f.visits = new int[target.instructions.size()];
+        f.pc = -1; // step() advances to the callee's first instruction
+        notes.add("Calls on the class's own methods are inlined (up to " + MAX_INLINE_DEPTH + " levels); their decisions appear in these paths. Pass inlineSelfCalls=false for the method-local view.");
+        return true;
+    }
+
+    private void returnToCaller(Frame f, Expr value) {
+        Caller c = f.caller;
+        f.caller = c.parent();
+        f.method = c.method();
+        f.stack = new ArrayList<>(c.stack());
+        f.locals = c.locals().clone();
+        f.visits = c.visits().clone();
+        f.pc = c.pc() + 1;
+        if (value != null) f.push(value);
+    }
+
+    /** Method declared by {@code owner} or its application superclasses (library classes are never inlined). */
+    private MethodNode resolveOwn(String owner, String name, String desc) {
+        for (String c = owner; c != null; ) {
+            if (repo.entry(c).map(ClassRepository.ClassEntry::library).orElse(true)) return null;
+            ClassNode node = repo.node(c);
+            for (MethodNode m : node.methods) if (m.name.equals(name) && m.desc.equals(desc)) return m;
+            c = node.superName;
+        }
+        return null;
     }
 
     private void invokeDynamic(Frame f, InvokeDynamicInsnNode indy) {

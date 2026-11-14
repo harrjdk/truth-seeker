@@ -93,12 +93,12 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 
 | Application | Archive | Generated tests | Pass | Disabled (TODOs) | Fail |
 |---|---|---|---|---|---|
-| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 174 (12 classes) | 129 | 44 | 1 |
-| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 191 (18 classes) | 163 | 26 | 2 |
+| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 190 (12 classes) | 172 | 18 | 0 |
+| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 243 (18 classes) | 220 | 20 | 3 |
 
 The remaining failures are documented limitations:
-- a method that depends on an unstubbed call on `this` (the generated test carries a `NOTE`)
 - a mocked `String` getter returning `null` into string formatting
+- a constructor of *another* class rejecting the sample arguments (`new HandlingEvent(.., LOAD, ..)` requires a voyage); other classes' constructors are not explored
 
 ## Build
 
@@ -189,11 +189,19 @@ What it recognizes:
 - pre-Java 5 `class$` literals
 - `assert` statements
 - logging guards (assumed off by default; `includeLogging=true` keeps them)
+- calls on the class's own methods (`this.helper(..)`, private/static helpers, getters, `super.m(..)`), **inlined** up to 2 levels so their decisions join the caller's paths (`inlineSelfCalls=false` on `truth_table` for the method-local view)
+- precondition helpers as branches to the exception they throw: `Objects.requireNonNull`, Spring `Assert`, Guava `Preconditions`, commons-lang `Validate`
+- null checks on values the path already dereferenced (pruned as infeasible)
+
+What the test generator arranges:
+- `for`-each loops over parameters, subject fields and stubbed collaborator results: a real collection with one mock element per iteration taken, each stubbed for its own iteration's decisions; `contains(x)` decides membership
+- `equals`-style comparisons with another instance of the subject's class (`Objects.equals(this.voyage, o.voyage)`): a second real instance, with equal or distinct field values set on both
 
 These are deliberate approximations, and the tool output says so:
 - `catch`/`finally` handlers are not explored. A throw inside `try` is reported as a method exit.
 - Loops are unrolled `loopBound` times (default 1). Paths are capped by `maxPaths` (default 256).
-- Callee bodies are not inlined. A call stays symbolic, e.g. `this.repo.findById(id)`.
+- Bodies of *other* classes' methods and constructors are not explored. Those calls stay symbolic, e.g. `this.repo.findById(id)`.
+- State machines are inferred without inlining, so derived state (`calculateTransportStatus()`) stays distinct from transitions.
 - State machines match state by holder type and property name (`Order.status`), not by object identity.
 - Pre-Java 6 `JSR`/`RET` subroutines truncate the affected path.
 - Generated tests characterize **current** behaviour. Review the `TODO`s and the expected values before trusting them as a spec.

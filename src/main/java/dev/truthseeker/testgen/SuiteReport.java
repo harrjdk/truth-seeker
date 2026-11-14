@@ -30,7 +30,7 @@ public final class SuiteReport {
         }
         List<TestGenerator.Issue> notes = suites.stream().flatMap(s -> s.notes().stream()).toList();
         if (!notes.isEmpty()) {
-            sb.append("\n## Notes (paths depending on unstubbable calls on the subject itself)\n\n");
+            sb.append("\n## Notes (paths depending on calls on the subject that were not inlined)\n\n");
             appendGrouped(sb, notes, 5);
         }
         sb.append("\nNext: run `verify_tests` on the output directory to compile and execute these tests against the archive.\n");

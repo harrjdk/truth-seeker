@@ -68,7 +68,7 @@ public final class StateMachines {
                 if (mn.name.equals("<clinit>") || mn.name.equals("values") || mn.name.equals("valueOf")) continue;
                 if (!mentionsStateLikeConstant(repo, mn, opt)) continue;
                 PathExplorer.Result r = PathExplorer.explore(repo, cn, mn,
-                        PathExplorer.Options.defaults().withMaxPaths(opt.maxPathsPerMethod()));
+                        PathExplorer.Options.defaults().withMaxPaths(opt.maxPathsPerMethod()).withInlining(false));
                 for (Path p : r.paths()) analyzePath(repo, cn, mn, p, opt, machines);
             }
         }

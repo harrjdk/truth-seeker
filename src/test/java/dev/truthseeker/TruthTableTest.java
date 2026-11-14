@@ -107,4 +107,48 @@ class TruthTableTest {
         PathExplorer.Result weight = explore("fixtures.modern.Shapes", "weight");
         assertEquals(List.of("return 1", "return 10"), weight.paths().stream().map(p -> p.outcome().describe()).toList());
     }
+
+    @Test
+    void selfCallsAreInlined() throws Exception {
+        PathExplorer.Result r = explore("fixtures.rules.ShippingFee", "fee");
+        String all = r.paths().stream().map(p -> p.conds() + " -> " + p.outcome().describe()).collect(Collectors.joining(" ;; "));
+        // the private helper's guard, its ternary and the getter's field all become decisions of fee(..)
+        assertTrue(r.paths().stream().anyMatch(p -> p.outcome().kind() == Path.OutcomeKind.THROW
+                && p.conds().stream().anyMatch(c -> c.key().equals("weightKg <= 0"))), all);
+        assertTrue(r.paths().stream().anyMatch(p -> p.outcome().describe().equals("return 40")), all);
+        assertTrue(r.paths().stream().anyMatch(p -> p.outcome().describe().equals("return 5")), all);
+        assertTrue(r.paths().stream().anyMatch(p -> p.conds().stream().anyMatch(c -> c.key().equals("this.expressAvailable")
+                || c.key().contains("this.expressAvailable"))), all);
+        assertTrue(all.indexOf("baseFee") < 0 && all.indexOf("surcharge") < 0, all);
+        assertTrue(r.notes().stream().anyMatch(n -> n.contains("inlined")), r.notes().toString());
+
+        String local = TestSupport.run("truth_table", "className", "ShippingFee", "method", "fee", "inlineSelfCalls", false);
+        assertTrue(local.contains("this.baseFee(weightKg)"), local);
+    }
+
+    @Test
+    void selfCallLoopDecidesCallerOutcome() throws Exception {
+        PathExplorer.Result r = explore("fixtures.clinic.Owner", "addVisit");
+        String all = r.paths().stream().map(p -> p.conds() + " -> " + p.effects() + " -> " + p.outcome().describe()).collect(Collectors.joining(" ;; "));
+        // the matching pet is found inside getPet(Integer) and receives the visit
+        assertTrue(r.paths().stream().anyMatch(p -> p.outcome().kind() == Path.OutcomeKind.RETURN_VOID
+                && p.conds().stream().anyMatch(c -> c.key().contains("hasNext()") && c.isTrue())
+                && p.effects().stream().anyMatch(e -> e.text().contains("addVisit(description)"))), all);
+        assertFalse(all.contains("this.getPet("), all);
+        // Objects.requireNonNull(pet, ..) after the loop: no pet found → NPE, and no path dereferences null
+        assertTrue(r.paths().stream().anyMatch(p -> p.outcome().describe().contains("Invalid Pet identifier!")), all);
+        assertFalse(all.contains("null.addVisit"), all);
+    }
+
+    @Test
+    void preconditionHelpersBranchToTheirException() throws Exception {
+        PathExplorer.Result r = explore("fixtures.rules.ShippingFee", "quote");
+        List<String> outcomes = r.paths().stream().map(p -> p.outcome().describe()).toList();
+        assertTrue(outcomes.contains("throw new IllegalArgumentException(\"zone is required\")"), outcomes.toString());
+        assertTrue(outcomes.contains("throw new IllegalArgumentException(\"too heavy\")"), outcomes.toString());
+        assertTrue(outcomes.contains("throw new IllegalArgumentException(\"weight must be positive\")"), outcomes.toString());
+        assertTrue(outcomes.contains("return 5") && outcomes.contains("return 20"), outcomes.toString());
+        assertTrue(r.paths().stream().anyMatch(p -> p.conds().stream().anyMatch(c -> c.key().equals("StringUtils.hasText(zone)"))),
+                r.paths().stream().map(p -> p.conds().toString()).collect(Collectors.joining(" ;; ")));
+    }
 }

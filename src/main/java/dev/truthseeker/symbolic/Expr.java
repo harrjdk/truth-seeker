@@ -192,6 +192,22 @@ public final class Expr {
         return false;
     }
 
+    /**
+     * Copy of this expression with every matching sub-expression replaced; call and field chains above a
+     * replacement are rebuilt (so their text changes), anything else is kept as is.
+     */
+    public Expr substitute(java.util.function.Predicate<Expr> match, Expr replacement) {
+        if (match.test(this)) return replacement;
+        if (kind != Kind.CALL && kind != Kind.FIELD) return this;
+        Expr t = target == null ? null : target.substitute(match, replacement);
+        List<Expr> as = args.stream().map(a -> a.substitute(match, replacement)).toList();
+        boolean same = t == target;
+        for (int i = 0; same && i < as.size(); i++) same = as.get(i) == args.get(i);
+        if (same) return this;
+        Expr e = kind == Kind.CALL ? call(t, owner, name, memberDesc, as) : field(t, owner, name, desc);
+        return java.util.Objects.equals(e.desc, desc) ? e : e.withDesc(desc);
+    }
+
     /** The root receiver of a chain: {@code this.repo.find(x).isPresent()} → {@code this}. */
     public Expr root() {
         Expr e = this;

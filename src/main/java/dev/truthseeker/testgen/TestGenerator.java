@@ -277,6 +277,33 @@ public final class TestGenerator {
         return s != null ? s : "null /* TODO */";
     }
 
+    /**
+     * Source for a second, independent instance of the subject (the {@code other} in {@code equals(Object other)}),
+     * built like the subject itself; null when that is not possible.
+     */
+    private String peerInstance() {
+        if ((cn.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_INTERFACE | Opcodes.ACC_ENUM)) != 0) return null;
+        String type = imports.ref(Type.getObjectType(cn.name));
+        if (hasNoArgCtor()) return "new " + type + "()";
+        MethodNode ctor = null;
+        for (MethodNode m : cn.methods) {
+            if (!m.name.equals("<init>") || (m.access & Opcodes.ACC_PRIVATE) != 0 || (m.access & Opcodes.ACC_SYNTHETIC) != 0) continue;
+            if (ctor == null || Type.getArgumentTypes(m.desc).length > Type.getArgumentTypes(ctor.desc).length) ctor = m;
+        }
+        if (ctor == null) return null;
+        List<String> args = new ArrayList<>();
+        for (Type t : Type.getArgumentTypes(ctor.desc)) {
+            String a = ctorDefault(t);
+            if (a.startsWith("null")) return null;
+            if (a.startsWith("mock(") && a.endsWith(".class)")) {
+                needsEnumSafe = true;
+                a = a.substring(0, a.length() - 1) + ", ENUM_SAFE)";
+            }
+            args.add(a);
+        }
+        return "new " + type + "(" + String.join(", ", args) + ")";
+    }
+
     private boolean hasNoArgCtor() {
         return cn.methods.stream().anyMatch(m -> m.name.equals("<init>") && m.desc.equals("()V") && (m.access & Opcodes.ACC_PRIVATE) == 0);
     }
@@ -382,11 +409,256 @@ public final class TestGenerator {
         }
 
         void constrain(Expr e, String op, Expr other, Object number) {
-            targets.computeIfAbsent(e.text, k -> new Target(e)).cs.add(new Constraint(op, other, number));
+            targets.computeIfAbsent(canon(e), k -> new Target(e)).cs.add(new Constraint(op, other, number));
+        }
+
+        /** One key per value: a local's name and the expression it stands for constrain the same thing. */
+        static String canon(Expr e) {
+            return e.expansion() != null ? e.expansion() : e.text;
+        }
+
+        // ---- for-each loops over an arrangeable collection ----
+
+        /** A for-each loop this test drives with a real collection: one element per iteration taken. */
+        final class Loop {
+            final Expr iterator;      // coll.iterator()
+            final List<String> elements = new ArrayList<>();
+            int current; // element the path is at: hasNext() = true decisions seen so far
+
+            Loop(Expr iterator) {
+                this.iterator = iterator;
+            }
+
+            boolean isHasNext(Expr e) {
+                return e.kind == Expr.Kind.CALL && "hasNext".equals(e.name) && e.args.isEmpty() && e.target != null
+                        && e.target.text.equals(iterator.text);
+            }
+
+            boolean isElement(Expr e) {
+                return e.kind == Expr.Kind.CALL && "next".equals(e.name) && e.args.isEmpty() && e.target != null
+                        && e.target.text.equals(iterator.text);
+            }
+        }
+
+        final List<Loop> loops = new ArrayList<>();
+
+        // ---- another instance of the subject's class as an argument (equals(Object other), compareTo, sameValueAs) ----
+
+        /** Parameter index → true when the test passes a real second instance whose fields it sets. */
+        final Map<Integer, Boolean> peers = new HashMap<>();
+
+        boolean isPeerField(Expr e) {
+            return e.kind == Expr.Kind.FIELD && e.target != null && e.target.kind == Expr.Kind.PARAM && peers.containsKey(e.target.index);
+        }
+
+        boolean isGetClass(Expr e) {
+            return e.kind == Expr.Kind.CALL && "getClass".equals(e.name) && e.args.isEmpty() && e.target != null;
+        }
+
+        /**
+         * A parameter whose fields of the subject's own class are read is another instance of it: pass a real one
+         * (built like the subject) so field comparisons can be arranged with setField on both sides.
+         */
+        void arrangePeers() {
+            if (isStatic) return;
+            Set<Integer> candidates = new LinkedHashSet<>();
+            for (Cond c : p.conds()) {
+                for (Expr root : c.right() == null ? List.of(c.left()) : List.of(c.left(), c.right())) {
+                    root.mentions(x -> {
+                        if (x.kind == Expr.Kind.FIELD && x.target != null && x.target.kind == Expr.Kind.PARAM
+                                && (x.owner.equals(cn.name) || ("L" + cn.name + ";").equals(x.target.desc))) candidates.add(x.target.index);
+                        return false;
+                    });
+                }
+            }
+            if (candidates.isEmpty()) return;
+            // getClass() != o.getClass() on this path: the argument must be of another class altogether
+            for (Cond c : p.conds()) {
+                if (c.kind() == Cond.Kind.CMP && isGetClass(c.left()) && isGetClass(c.right())) {
+                    boolean same = c.isTrue() == c.op().equals("==");
+                    Expr other = c.left().target.kind == Expr.Kind.PARAM ? c.left().target : c.right().target;
+                    if (!same && other.kind == Expr.Kind.PARAM) {
+                        candidates.remove(other.index);
+                        paramValues.put(other.index, "new Object()");
+                    }
+                }
+            }
+            String peer = peerInstance();
+            if (peer == null) return;
+            for (int i : candidates) {
+                if ("subject".equals(paramValues.get(i))) continue;
+                paramValues.put(i, peer);
+                peers.put(i, true);
+            }
+        }
+
+        /** {@code this.f} vs {@code o.f} (and getClass() of both) on a peer: decided by values the test sets. */
+        boolean collectPeerComparison(Cond c) {
+            if (peers.isEmpty()) return false;
+            if (c.kind() == Cond.Kind.CMP && isGetClass(c.left()) && isGetClass(c.right())) return true; // same class by construction
+            if (c.kind() == Cond.Kind.CMP && (c.op().equals("==") || c.op().equals("!="))
+                    && (isPeerField(c.left()) || isPeerField(c.right())) && c.right().kind != Expr.Kind.NULL) {
+                boolean same = c.isTrue() == c.op().equals("==");
+                return sameOrDifferent(c.left(), c.right(), same);
+            }
+            return false;
+        }
+
+        static boolean isIteratorOf(Expr e) {
+            return e.kind == Expr.Kind.CALL && "iterator".equals(e.name) && e.args.isEmpty() && e.target != null
+                    && e.desc != null && e.desc.equals("Ljava/util/Iterator;");
+        }
+
+        /**
+         * Finds for-each loops over parameters, subject fields and stubbable collaborator results, and puts a
+         * collection with exactly as many elements as the path iterates into them. Elements are mocks, so the
+         * per-iteration decisions on them ({@code pet.isNew() [iteration 2]}) become stubs on the k-th element.
+         */
+        void arrangeLoops() {
+            Map<String, int[]> trues = new LinkedHashMap<>();   // collection text → [hasNext true count]
+            Map<String, Expr> iterators = new LinkedHashMap<>(); // collection text → coll.iterator()
+            Map<String, Expr> colls = new LinkedHashMap<>();
+            Map<String, List<Expr>> contained = new LinkedHashMap<>();
+            for (Cond c : p.conds()) {
+                Expr l = c.left();
+                if (c.kind() != Cond.Kind.BOOL || l.kind != Expr.Kind.CALL || l.target == null) continue;
+                if ("hasNext".equals(l.name) && l.args.isEmpty() && isIteratorOf(l.target)) {
+                    Expr coll = l.target.target;
+                    colls.putIfAbsent(coll.text, coll);
+                    iterators.putIfAbsent(coll.text, l.target);
+                    int[] n = trues.computeIfAbsent(coll.text, k -> new int[1]);
+                    if (c.isTrue()) n[0]++;
+                } else if ("contains".equals(l.name) && l.args.size() == 1 && "(Ljava/lang/Object;)Z".equals(l.memberDesc)
+                        && !l.text.contains(" [iteration ")) {
+                    colls.putIfAbsent(l.target.text, l.target);
+                    contained.computeIfAbsent(l.target.text, k -> new ArrayList<>());
+                    if (c.isTrue()) contained.get(l.target.text).add(l.args.get(0));
+                }
+            }
+            for (var e : colls.entrySet()) {
+                Expr coll = e.getValue();
+                if (coll.kind == Expr.Kind.FIELD && coll.target != null && coll.target.kind == Expr.Kind.THIS && deps.containsKey(coll.name)) continue;
+                if (!(coll.kind == Expr.Kind.PARAM || arrangeable(coll)) || coll.desc == null) continue;
+                Type collType = Type.getType(coll.desc);
+                Expr iterator = iterators.get(e.getKey());
+                Loop loop = iterator == null ? null : new Loop(iterator);
+                List<String> elems = new ArrayList<>();
+                String alias = null;
+                if (loop != null) {
+                    // element type: what the loop body casts next() to
+                    String[] elemDesc = new String[1];
+                    String[] aliasOf = new String[1];
+                    List<Expr> all = new ArrayList<>();
+                    for (Cond c : p.conds()) { all.add(c.left()); if (c.right() != null) all.add(c.right()); }
+                    for (Effect ef : p.effects()) { if (ef.target() != null) all.add(ef.target()); all.addAll(ef.args()); }
+                    if (p.outcome().value() != null) all.add(p.outcome().value());
+                    for (Expr root : all) root.mentions(x -> {
+                        if (loop.isElement(x)) {
+                            if (elemDesc[0] == null || "Ljava/lang/Object;".equals(elemDesc[0])) elemDesc[0] = x.desc;
+                            if (x.expansion() != null) aliasOf[0] = x.text;
+                        }
+                        return false;
+                    });
+                    alias = aliasOf[0];
+                    Type elemType = elemDesc[0] == null ? Type.getType(Object.class) : Type.getType(elemDesc[0]);
+                    if (alias != null) usedNames.add(alias);
+                    for (int k = 0; k < trues.get(e.getKey())[0]; k++) {
+                        String v;
+                        if (elemType.getSort() == Type.OBJECT && !elemType.getInternalName().equals("java/lang/Object")
+                                && !ClassInspector.isValueType(elemType.getDescriptor()) && !isEnum(elemType.getInternalName())) {
+                            v = newVar(elemType);
+                        } else {
+                            v = nonNullSample(elemType, null);
+                            if (v == null) v = "new Object()";
+                        }
+                        elems.add(v);
+                    }
+                }
+                // coll.contains(x) decided true: x must be in it (false: the fresh elements above are not x)
+                boolean unresolvedContains = false;
+                for (Expr x : contained.getOrDefault(e.getKey(), List.of())) {
+                    String v = ensure(x);
+                    if (v == null) unresolvedContains = true;
+                    else if (!elems.contains(v)) elems.add(v);
+                }
+                if (unresolvedContains) continue;
+                String literal = iterableLiteral(collType, elems);
+                if (literal == null) continue;
+                if (coll.kind == Expr.Kind.PARAM) paramValues.put(coll.index, literal);
+                else if (!bindLiteral(coll, literal)) continue;
+                arrangedCollections.add(e.getKey());
+                if (loop == null) continue;
+                int taken = trues.get(e.getKey())[0];
+                loop.elements.addAll(elems.subList(0, taken));
+                for (String v : loop.elements) if (v.matches("[a-z][A-Za-z0-9_$]*")) ensured.put(v, v);
+                // after the loop (or when it returns from inside), the loop variable is the last element taken
+                if (taken > 0 && alias != null && elems.get(taken - 1).matches("[a-z][A-Za-z0-9_$]*")) {
+                    ensured.put(alias, elems.get(taken - 1));
+                }
+                loops.add(loop);
+            }
+        }
+
+        /** Collections (by expression text) this test filled with real elements: their contains(..) is decided. */
+        final Set<String> arrangedCollections = new HashSet<>();
+
+        /** A mutable collection of the given elements in iteration order, or null for unsupported types. */
+        String iterableLiteral(Type t, List<String> elems) {
+            if (t.getSort() != Type.OBJECT) return null;
+            imports.add("java.util.List");
+            String of = "List.of(" + String.join(", ", elems) + ")";
+            return switch (t.getInternalName()) {
+                case "java/util/List", "java/util/Collection", "java/lang/Iterable", "java/util/ArrayList" -> {
+                    imports.add("java.util.ArrayList");
+                    yield "new ArrayList<>(" + of + ")";
+                }
+                case "java/util/Set", "java/util/LinkedHashSet", "java/util/HashSet" -> {
+                    imports.add("java.util.LinkedHashSet");
+                    yield "new LinkedHashSet<>(" + of + ")";
+                }
+                default -> null;
+            };
+        }
+
+        /**
+         * The decision rewritten onto the variable of the element the loop is at, or null when it does not involve a
+         * driven loop. Decisions come in path order, so the element is the count of {@code hasNext()} = true so far
+         * (a decision first evaluated in a later iteration carries no "[iteration k]" suffix, so the suffix cannot tell).
+         */
+        Cond onElement(Cond c) {
+            for (Loop loop : loops) {
+                if (loop.isHasNext(c.left())) {
+                    if (c.isTrue()) loop.current++;
+                    return c; // consumed: the collection's size decides it
+                }
+                boolean mentions = c.left().mentions(loop::isElement) || (c.right() != null && c.right().mentions(loop::isElement));
+                if (!mentions) continue;
+                int k = Math.max(loop.current, 1);
+                if (k > loop.elements.size()) return null;
+                String v = loop.elements.get(k - 1);
+                if (!ensured.containsKey(v)) return null; // value element: its decisions cannot be stubbed
+                Expr el = Expr.unknown(v, null);
+                Expr left = c.left().substitute(loop::isElement, el);
+                Expr right = c.right() == null ? null : c.right().substitute(loop::isElement, el);
+                if (left == c.left() && left.text.contains(" [iteration ")) return null;
+                return new Cond(c.kind(), left, c.op(), right, c.value(), c.valueExpr(), c.otherCases());
+            }
+            return null;
         }
 
         void collect() {
-            for (Cond c : p.conds()) {
+            arrangePeers();
+            arrangeLoops();
+            for (Cond c0 : p.conds()) {
+                Cond c = c0;
+                if (c0.kind() == Cond.Kind.BOOL && c0.left().kind == Expr.Kind.CALL && "contains".equals(c0.left().name)
+                        && c0.left().target != null && arrangedCollections.contains(c0.left().target.text)) continue;
+                if (!loops.isEmpty()) {
+                    Cond rewritten = onElement(c0);
+                    if (rewritten != null && loops.stream().anyMatch(l -> l.isHasNext(c0.left()))) continue;
+                    if (rewritten != null) c = rewritten;
+                }
+                if (collectPeerComparison(c)) continue;
                 if (c.left().text.contains(" [iteration ")) {
                     // stubbing one value for a per-iteration decision (e.g. hasNext()) could loop forever
                     todos.add("loop: arrange so that `" + c.describe() + "`");
@@ -516,25 +788,90 @@ public final class TestGenerator {
         boolean sameOrDifferent(Expr a, Expr b, boolean same) {
             String desc = a.desc != null && !a.desc.equals("Ljava/lang/Object;") ? a.desc : b.desc;
             if (desc == null || !arrangeable(a) || !arrangeable(b)) return false;
+            // one side already has a value (an earlier decision on it, or a @Mock field of the subject): relate the
+            // other side to it instead of picking both afresh (e.g. the same parameter compared on every loop iteration)
+            Expr pa = pinnedEquality(a), pb = pinnedEquality(b);
+            Expr pinned = null, free = null;
+            if (pb != null && pa == null) { pinned = pb; free = a; }
+            if (pa != null && pb == null) { pinned = pa; free = b; }
+            if (pinned != null && same) {
+                constrain(free, "==", pinned);
+                return true;
+            }
             Expr first, second;
             switch (desc) {
                 case "Ljava/lang/Integer;", "I", "Ljava/lang/Short;", "S" -> { first = Expr.constant(1, "I"); second = Expr.constant(2, "I"); }
                 case "Ljava/lang/Long;", "J" -> { first = Expr.constant(1L, "J"); second = Expr.constant(2L, "J"); }
                 case "Ljava/lang/String;" -> { first = Expr.constant("value", desc); second = Expr.constant("other", desc); }
-                default -> { return false; }
+                case "Z", "Ljava/lang/Boolean;" -> { first = Expr.constant(1, "Z"); second = Expr.constant(0, "Z"); }
+                default -> {
+                    Type t = Type.getType(desc);
+                    if (isMockable(t)) {
+                        // mocks are equal only to themselves: one fresh mock per distinct value needed
+                        first = Expr.unknown(newVar(t), desc);
+                        second = pinned != null || same ? first : Expr.unknown(newVar(t), desc);
+                    } else {
+                        String[] two = distinctSamples(t);
+                        if (two == null) return false;
+                        first = Expr.unknown(two[0], desc);
+                        second = Expr.unknown(two[1], desc);
+                    }
+                }
+            }
+            if (pinned != null) {
+                constrain(free, "==", pinned.text.equals(first.text) ? second : first);
+                return true;
             }
             constrain(a, "==", first);
             constrain(b, "==", same ? first : second);
             return true;
         }
 
+        boolean isMockable(Type t) {
+            return t.getSort() == Type.OBJECT && !isEnum(t.getInternalName()) && !ClassInspector.isValueType(t.getDescriptor())
+                    && !t.getInternalName().startsWith("java/");
+        }
+
+        /** Two unequal values of a type, as source: enum constants, shifted dates, or two mocks (identity equality). */
+        String[] distinctSamples(Type t) {
+            if (t.getSort() != Type.OBJECT) return null;
+            String d = t.getDescriptor();
+            if (isEnum(t.getInternalName())) {
+                List<String> cs = ClassInspector.enumConstants(repo.node(t.getInternalName()));
+                if (cs.size() < 2) return null;
+                return new String[]{imports.ref(t) + "." + cs.get(0), imports.ref(t) + "." + cs.get(1)};
+            }
+            String base = nonNullSample(t, null);
+            if (base == null) return null;
+            if (d.startsWith("Ljava/time/Local")) return new String[]{base, base + ".plusDays(1)"};
+            if (d.equals("Ljava/time/Instant;")) return new String[]{base, base + ".plusSeconds(86400)"};
+            if (d.equals("Ljava/math/BigDecimal;")) return new String[]{base, "BigDecimal.TEN"};
+            if (d.equals("Ljava/lang/Long;")) return new String[]{"1L", "2L"};
+            if (d.equals("Ljava/lang/Double;")) return new String[]{"1.0", "2.0"};
+            return null;
+        }
+
+        /** The constant an earlier decision pinned {@code e} to with {@code ==}, or null. */
+        Expr pinnedEquality(Expr e) {
+            if (e.kind == Expr.Kind.FIELD && e.target != null && e.target.kind == Expr.Kind.THIS && deps.containsKey(e.name)) {
+                return Expr.unknown(e.name, e.desc); // the subject's @Mock collaborator
+            }
+            Target t = targets.get(canon(e));
+            if (t == null) return null;
+            for (Constraint c : t.cs) {
+                if (c.op().equals("==") && c.other() != null && (c.other().isConst() || c.other().kind == Expr.Kind.UNKNOWN)) return c.other();
+            }
+            return null;
+        }
+
         /** Values a test can set: parameters, fields of the subject, and calls on mockable receivers. */
         boolean arrangeable(Expr e) {
             return switch (e.kind) {
                 case PARAM -> true;
-                case FIELD -> e.target != null && e.target.kind == Expr.Kind.THIS && !isStatic;
+                case FIELD -> e.target != null && ((e.target.kind == Expr.Kind.THIS && !isStatic) || isPeerField(e));
                 case CALL -> e.target != null && e.target.kind != Expr.Kind.THIS
-                        && (e.target.kind == Expr.Kind.PARAM || e.target.kind == Expr.Kind.CALL || e.target.kind == Expr.Kind.FIELD);
+                        && (e.target.kind == Expr.Kind.PARAM || e.target.kind == Expr.Kind.CALL || e.target.kind == Expr.Kind.FIELD
+                        || ensured.containsKey(e.target.text));
                 default -> false;
             };
         }
@@ -611,7 +948,8 @@ public final class TestGenerator {
             String[] found = new String[1];
             for (Expr root : all) {
                 root.mentions(x -> {
-                    if (found[0] == null && x.kind == Expr.Kind.CALL && x.target != null && x.target.kind == Expr.Kind.THIS) {
+                    if (found[0] == null && x.kind == Expr.Kind.CALL && x.target != null && x.target.kind == Expr.Kind.THIS
+                            && !(x.name.equals("getClass") && x.args.isEmpty())) {
                         found[0] = x.expansion() != null ? x.expansion() : x.text;
                     }
                     return false;
@@ -960,6 +1298,7 @@ public final class TestGenerator {
                     return true;
                 }
                 case PARAM -> {
+                    if (peers.containsKey(e.index) && !literal.equals("null")) return true; // the peer is non-null already
                     paramValues.put(e.index, literal);
                     return true;
                 }

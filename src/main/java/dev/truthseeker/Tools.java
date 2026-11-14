@@ -109,13 +109,14 @@ public final class Tools {
                         "loopBound": {"type": "integer", "description": "Max loop iterations explored per path (default 1)."},
                         "detail": {"type": "string", "enum": ["summary", "full"], "description": "summary (default): one row per outcome with path counts, side effects listed once, and the recovered logic. full: one decision-table row per path."},
                         "includeLogging": {"type": "boolean", "description": "Keep log.isDebugEnabled()-style guards as decisions (default false: assumed false and hidden)."},
+                        "inlineSelfCalls": {"type": "boolean", "description": "Follow calls on the class's own methods (this.helper(..), private/static helpers, getters) up to 2 levels so their decisions appear in the table (default true). false: keep them as symbolic calls."},
                         "format": {"type": "string", "enum": ["markdown", "json"], "description": "Output format (default markdown)."}""", "path", "className", "method"),
                 a -> {
                     ClassRepository repo = repo(a);
                     ClassNode cn = repo.require(str(a, "className"));
                     List<MethodNode> ms = ClassRepository.findMethods(cn, str(a, "method"), str(a, "descriptor"));
                     PathExplorer.Options o = new PathExplorer.Options(integer(a, "maxPaths", 256), integer(a, "loopBound", 1), 20_000, 140,
-                            !bool(a, "includeLogging", false));
+                            !bool(a, "includeLogging", false), bool(a, "inlineSelfCalls", true));
                     boolean json = "json".equalsIgnoreCase(str(a, "format"));
                     StringBuilder sb = new StringBuilder();
                     List<Object> structured = new ArrayList<>();
@@ -268,7 +269,7 @@ public final class Tools {
                 compile and run them and see what still needs arranging. Use call_graph to follow a request
                 through layers and disassemble when you need ground truth. Every tool takes `path` (jar/war/ear/classes dir); indexes are
                 cached per path, so repeated calls are fast. Analyses are static approximations: catch blocks are not explored, loops are
-                bounded and callee bodies are not inlined — state these limits when presenting results.
+                bounded, calls on the class's own methods are inlined 2 levels deep and other classes' code is not followed — state these limits when presenting results.
                 """;
     }
 

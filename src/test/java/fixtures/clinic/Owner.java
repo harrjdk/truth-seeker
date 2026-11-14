@@ -2,6 +2,7 @@ package fixtures.clinic;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 /** Mirrors PetClinic's Owner: overloaded getPet(..) lookups implemented with for-each loops. */
 public class Owner {
@@ -32,5 +33,13 @@ public class Owner {
             }
         }
         return null;
+    }
+
+    /** PetClinic's Owner.addVisit: the pet comes from a self-call, so the decisions live in getPet(Integer). */
+    public void addVisit(Integer petId, String description) {
+        Objects.requireNonNull(petId, "Pet identifier must not be null!");
+        Pet pet = getPet(petId);
+        Objects.requireNonNull(pet, "Invalid Pet identifier!");
+        pet.addVisit(description);
     }
 }
