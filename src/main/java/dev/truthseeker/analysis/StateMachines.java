@@ -33,6 +33,23 @@ public final class StateMachines {
         final List<Transition> transitions = new ArrayList<>();
         final List<Rejection> rejections = new ArrayList<>();
         final Set<String> computedWrites = new LinkedHashSet<>();
+        /** method -> paths that return a constant of this enum without testing this same enum */
+        final Map<String, List<Path>> derivations = new LinkedHashMap<>();
+
+        boolean hasContent() {
+            return !transitions.isEmpty() || !initial.isEmpty() || !rejections.isEmpty() || !derivationRules().isEmpty();
+        }
+
+        /** method -> (returned constant -> paths), only for methods that can return two or more different constants. */
+        Map<String, Map<String, List<Path>>> derivationRules() {
+            Map<String, Map<String, List<Path>>> out = new LinkedHashMap<>();
+            for (var e : derivations.entrySet()) {
+                Map<String, List<Path>> byValue = new LinkedHashMap<>();
+                for (Path p : e.getValue()) byValue.computeIfAbsent(p.outcome().value().name, k -> new ArrayList<>()).add(p);
+                if (byValue.size() >= 2) out.put(e.getKey(), byValue);
+            }
+            return out;
+        }
 
         Machine(String enumType) {
             this.enumType = enumType;
@@ -49,7 +66,7 @@ public final class StateMachines {
             for (MethodNode mn : cn.methods) {
                 if ((mn.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE | Opcodes.ACC_BRIDGE)) != 0) continue;
                 if (mn.name.equals("<clinit>") || mn.name.equals("values") || mn.name.equals("valueOf")) continue;
-                if (!mentionsStateLikeConstant(mn, opt)) continue;
+                if (!mentionsStateLikeConstant(repo, mn, opt)) continue;
                 PathExplorer.Result r = PathExplorer.explore(repo, cn, mn,
                         PathExplorer.Options.defaults().withMaxPaths(opt.maxPathsPerMethod()));
                 for (Path p : r.paths()) analyzePath(repo, cn, mn, p, opt, machines);
@@ -69,9 +86,13 @@ public final class StateMachines {
         return machines;
     }
 
-    /** Cheap pre-filter: only explore methods that touch an enum constant or a switch map. */
-    private static boolean mentionsStateLikeConstant(MethodNode mn, Options opt) {
+    /** Cheap pre-filter: only explore methods that touch an enum constant, a switch map, or write an enum-typed field. */
+    private static boolean mentionsStateLikeConstant(ClassRepository repo, MethodNode mn, Options opt) {
         for (AbstractInsnNode in : mn.instructions) {
+            if (in instanceof FieldInsnNode f && f.getOpcode() == Opcodes.PUTFIELD && f.desc.startsWith("L")) {
+                ClassNode t = repo.node(Type.getType(f.desc).getInternalName());
+                if (t != null && (t.access & Opcodes.ACC_ENUM) != 0) return true; // e.g. this.status = calculateStatus()
+            }
             if (in instanceof FieldInsnNode f && f.getOpcode() == Opcodes.GETSTATIC
                     && (f.desc.equals("L" + f.owner + ";") || f.name.startsWith("$SwitchMap$"))) return true;
             if (in instanceof MethodInsnNode m && m.name.startsWith("$SWITCH_TABLE$")) return true;
@@ -143,6 +164,15 @@ public final class StateMachines {
             else if (value != null && isEnumTyped(value) && accepts(Type.getType(value.desc).getInternalName(), opt)) {
                 Machine m = machines.computeIfAbsent(Type.getType(value.desc).getInternalName(), Machine::new);
                 m.computedWrites.add(Names.simple(cn.name) + "." + mn.name + "(): " + slot + " = " + value.text);
+            }
+        }
+        // derived state: an enum constant returned from conditions that do not test that same enum
+        if (writes.isEmpty() && p.outcome().kind() == Path.OutcomeKind.RETURN) {
+            StateRef derived = stateConst(repo, p.outcome().value(), opt, null);
+            if (derived != null && accepts(derived.enumType, opt) && !slotEnum.containsValue(derived.enumType)) {
+                Machine dm = machines.computeIfAbsent(derived.enumType, Machine::new);
+                dm.states.add(derived.name);
+                dm.derivations.computeIfAbsent(Names.simple(cn.name) + "." + mn.name + "()", k -> new ArrayList<>()).add(p);
             }
         }
         // transition functions: return a state constant
@@ -300,62 +330,64 @@ public final class StateMachines {
 
     public static String render(Map<String, Machine> machines, String format) {
         StringBuilder sb = new StringBuilder();
-        if (machines.values().stream().allMatch(m -> m.transitions.isEmpty() && m.initial.isEmpty() && m.rejections.isEmpty())) {
-            return "_No state machines inferred: no enum-valued state was compared and assigned in the analyzed code._\n"
+        List<Machine> shown = machines.values().stream().filter(Machine::hasContent).toList();
+        if (shown.isEmpty()) {
+            return "_No state machines inferred: no enum-valued state was compared and assigned (or derived) in the analyzed code._\n"
                     + "Tip: pass `stateField` for String/int status fields, or widen `packagePrefix` / omit `className` to analyze the whole archive.\n";
         }
         boolean mermaid = !"plantuml".equalsIgnoreCase(format);
         boolean plant = "plantuml".equalsIgnoreCase(format) || "both".equalsIgnoreCase(format);
-        for (Machine m : machines.values()) {
-            if (m.transitions.isEmpty() && m.initial.isEmpty() && m.rejections.isEmpty()) continue;
-            sb.append("## State machine: `").append(Names.simple(m.enumType)).append("`\n\n");
+        for (Machine m : shown) {
+            boolean hasTransitions = !m.transitions.isEmpty() || !m.initial.isEmpty();
+            sb.append(hasTransitions ? "## State machine: `" : "## Enum state: `").append(Names.simple(m.enumType)).append("`\n\n");
             sb.append("- Enum: `").append(Names.dotted(m.enumType)).append("`\n");
-            sb.append("- State held in: ").append(m.slots.stream().map(s -> "`" + s + "`").collect(Collectors.joining(", "))).append("\n");
+            if (!m.slots.isEmpty()) sb.append("- State held in: ").append(m.slots.stream().map(s -> "`" + s + "`").collect(Collectors.joining(", "))).append("\n");
             sb.append("- States: ").append(String.join(", ", m.states)).append("\n");
             if (!m.initial.isEmpty()) sb.append("- Initial (set in constructor): ").append(String.join(", ", m.initial)).append("\n");
 
-            Set<String> hasIn = m.transitions.stream().map(Transition::to).collect(Collectors.toSet());
-            hasIn.addAll(m.initial);
-            Set<String> hasOut = m.transitions.stream().map(Transition::from).collect(Collectors.toSet());
-            List<String> unreachable = m.states.stream().filter(s -> !hasIn.contains(s)).toList();
-            List<String> terminal = m.states.stream().filter(s -> hasIn.contains(s) && !hasOut.contains(s)).toList();
-            if (!terminal.isEmpty()) sb.append("- Terminal states (no outgoing transition): ").append(String.join(", ", terminal)).append("\n");
-            if (!unreachable.isEmpty() && !m.initial.isEmpty()) {
-                sb.append("- ⚠ Never entered by analyzed code: ").append(String.join(", ", unreachable)).append("\n");
-            } else if (!unreachable.isEmpty()) {
-                sb.append("- States with no incoming transition (initial state set elsewhere?): ").append(String.join(", ", unreachable)).append("\n");
-            }
-            long unguarded = m.transitions.stream().filter(Transition::unguarded).map(Transition::trigger).distinct().count();
-            if (unguarded > 0) {
-                sb.append("- ⚠ Unguarded transitions (no state check before the write — allowed from every state): ")
-                        .append(m.transitions.stream().filter(Transition::unguarded).map(Transition::trigger).distinct().collect(Collectors.joining(", "))).append("\n");
-            }
-
-            if (mermaid) {
-                sb.append("\n```mermaid\nstateDiagram-v2\n");
-                for (String i : m.initial) sb.append("    [*] --> ").append(id(i)).append("\n");
-                for (Transition t : m.transitions) {
-                    sb.append("    ").append(id(t.from())).append(" --> ").append(id(t.to())).append(" : ").append(label(t, m)).append("\n");
+            if (hasTransitions) {
+                Set<String> hasIn = m.transitions.stream().map(Transition::to).collect(Collectors.toSet());
+                hasIn.addAll(m.initial);
+                Set<String> hasOut = m.transitions.stream().map(Transition::from).collect(Collectors.toSet());
+                List<String> unreachable = m.states.stream().filter(s -> !hasIn.contains(s)).toList();
+                List<String> terminal = m.states.stream().filter(s -> hasIn.contains(s) && !hasOut.contains(s)).toList();
+                if (!terminal.isEmpty()) sb.append("- Terminal states (no outgoing transition): ").append(String.join(", ", terminal)).append("\n");
+                if (!unreachable.isEmpty() && !m.initial.isEmpty()) {
+                    sb.append("- ⚠ Never entered by analyzed code: ").append(String.join(", ", unreachable)).append("\n");
+                } else if (!unreachable.isEmpty()) {
+                    sb.append("- States with no incoming transition (initial state set elsewhere?): ").append(String.join(", ", unreachable)).append("\n");
                 }
-                for (String s : terminal) sb.append("    ").append(id(s)).append(" --> [*]\n");
-                sb.append("```\n");
-            }
-            if (plant) {
-                sb.append("\n```plantuml\n@startuml\nhide empty description\n");
-                for (String i : m.initial) sb.append("[*] --> ").append(id(i)).append("\n");
-                for (Transition t : m.transitions) {
-                    sb.append(id(t.from())).append(" --> ").append(id(t.to())).append(" : ").append(label(t, m)).append("\n");
+                long unguarded = m.transitions.stream().filter(Transition::unguarded).map(Transition::trigger).distinct().count();
+                if (unguarded > 0) {
+                    sb.append("- ⚠ Unguarded transitions (no state check before the write — allowed from every state): ")
+                            .append(m.transitions.stream().filter(Transition::unguarded).map(Transition::trigger).distinct().collect(Collectors.joining(", "))).append("\n");
                 }
-                for (String s : terminal) sb.append(id(s)).append(" --> [*]\n");
-                sb.append("@enduml\n```\n");
+                if (mermaid) {
+                    sb.append("\n```mermaid\nstateDiagram-v2\n");
+                    for (String i : m.initial) sb.append("    [*] --> ").append(id(i)).append("\n");
+                    for (Transition t : m.transitions) {
+                        sb.append("    ").append(id(t.from())).append(" --> ").append(id(t.to())).append(" : ").append(label(t, m)).append("\n");
+                    }
+                    for (String s : terminal) sb.append("    ").append(id(s)).append(" --> [*]\n");
+                    sb.append("```\n");
+                }
+                if (plant) {
+                    sb.append("\n```plantuml\n@startuml\nhide empty description\n");
+                    for (String i : m.initial) sb.append("[*] --> ").append(id(i)).append("\n");
+                    for (Transition t : m.transitions) {
+                        sb.append(id(t.from())).append(" --> ").append(id(t.to())).append(" : ").append(label(t, m)).append("\n");
+                    }
+                    for (String s : terminal) sb.append(id(s)).append(" --> [*]\n");
+                    sb.append("@enduml\n```\n");
+                }
+                sb.append("\n| From | To | Trigger | Extra guard | Held in |\n|---|---|---|---|---|\n");
+                for (Transition t : m.transitions) {
+                    sb.append("| ").append(t.from()).append(" | ").append(t.to()).append(" | `").append(t.trigger()).append("` | ")
+                            .append(t.guard().isEmpty() ? (t.unguarded() ? "_none (unguarded)_" : "") : "`" + t.guard().replace("|", "\\|") + "`")
+                            .append(" | ").append(t.slot()).append(" |\n");
+                }
             }
-
-            sb.append("\n| From | To | Trigger | Extra guard | Held in |\n|---|---|---|---|---|\n");
-            for (Transition t : m.transitions) {
-                sb.append("| ").append(t.from()).append(" | ").append(t.to()).append(" | `").append(t.trigger()).append("` | ")
-                        .append(t.guard().isEmpty() ? (t.unguarded() ? "_none (unguarded)_" : "") : "`" + t.guard().replace("|", "\\|") + "`")
-                        .append(" | ").append(t.slot()).append(" |\n");
-            }
+            renderDerivations(sb, m, mermaid, plant);
             if (!m.rejections.isEmpty()) {
                 sb.append("\n**Rejected operations** (state guard → exception, no transition)\n\n");
                 Set<String> seen = new LinkedHashSet<>();
@@ -373,6 +405,65 @@ public final class StateMachines {
         sb.append("_Heuristic: state reads and writes are matched by holder type + property name (e.g. `Order.status`), "
                 + "not by object identity; catch blocks and callee bodies are not followed._\n");
         return sb.toString();
+    }
+
+    /** Value-derivation rules: methods that compute a state from other facts (status derived from the last event, etc.). */
+    private static void renderDerivations(StringBuilder sb, Machine m, boolean mermaid, boolean plant) {
+        Map<String, Map<String, List<Path>>> rules = m.derivationRules();
+        if (rules.isEmpty()) return;
+        sb.append("\n### Derived state\n\n`").append(Names.simple(m.enumType))
+                .append("` is computed from other facts rather than transitioned step by step.\n");
+        Set<String> produced = new HashSet<>();
+        rules.values().forEach(byValue -> produced.addAll(byValue.keySet()));
+        m.transitions.forEach(t -> produced.add(t.to()));
+        produced.addAll(m.initial);
+        List<String> neverProduced = m.states.stream().filter(s -> !produced.contains(s)).toList();
+        if (!neverProduced.isEmpty()) {
+            sb.append("\n- ⚠ Declared but never produced by analyzed code: ").append(String.join(", ", neverProduced)).append("\n");
+        }
+        int n = 0;
+        for (var rule : rules.entrySet()) {
+            String method = rule.getKey();
+            String name = method.substring(method.indexOf('.') + 1, method.indexOf('('));
+            List<String> storedBy = m.computedWrites.stream().filter(w -> w.contains("." + name + "(") && w.contains(" = ")).toList();
+            sb.append("\n**`").append(method).append("`**");
+            if (!storedBy.isEmpty()) {
+                sb.append(" — stored by ").append(storedBy.stream()
+                        .map(w -> "`" + w.substring(0, w.indexOf(':')) + "` into `" + w.substring(w.indexOf(':') + 2, w.indexOf(" = ")) + "`")
+                        .distinct().collect(Collectors.joining(", ")));
+            }
+            sb.append("\n");
+            if (mermaid) {
+                String node = "d" + (n++);
+                sb.append("\n```mermaid\nflowchart LR\n    ").append(node).append("[\"").append(method).append("\"]\n");
+                for (var v : rule.getValue().entrySet()) {
+                    sb.append("    ").append(node).append(" -- \"").append(diagramLabel(TruthTables.formula(v.getValue())))
+                            .append("\" --> ").append(id("v_" + v.getKey())).append("[").append(v.getKey()).append("]\n");
+                }
+                sb.append("```\n");
+            }
+            if (plant) {
+                sb.append("\n```plantuml\n@startuml\nstart\n");
+                for (var v : rule.getValue().entrySet()) {
+                    sb.append("if (").append(diagramLabel(TruthTables.formula(v.getValue()))).append(") then (yes)\n  :")
+                            .append(v.getKey()).append(";\n  stop\nendif\n");
+                }
+                sb.append("stop\n@enduml\n```\n");
+            }
+            sb.append("\n| Value | When |\n|---|---|\n");
+            for (var v : rule.getValue().entrySet()) {
+                sb.append("| ").append(v.getKey()).append(" | `").append(oneLine(TruthTables.formula(v.getValue())).replace("|", "\\|")).append("` |\n");
+            }
+        }
+    }
+
+    static String oneLine(String formula) {
+        return formula.replace("\n", " ").replaceAll("\\s+", " ");
+    }
+
+    private static String diagramLabel(String formula) {
+        String s = oneLine(formula).replace("&&", "and").replace("||", "or").replace("\"", "'").replace("[", "(").replace("]", ")");
+        return s.length() > 90 ? s.substring(0, 87) + "..." : s;
     }
 
     private static String label(Transition t, Machine m) {
@@ -396,6 +487,13 @@ public final class StateMachines {
             o.put("initial", m.initial);
             o.put("transitions", m.transitions.stream().map(t -> Map.of("from", t.from(), "to", t.to(), "trigger", t.trigger(),
                     "guard", t.guard(), "slot", t.slot(), "unguarded", t.unguarded())).toList());
+            Map<String, Map<String, String>> derived = new LinkedHashMap<>();
+            m.derivationRules().forEach((method, byValue) -> {
+                Map<String, String> rules = new LinkedHashMap<>();
+                byValue.forEach((v, paths) -> rules.put(v, oneLine(TruthTables.formula(paths))));
+                derived.put(method, rules);
+            });
+            o.put("derivations", derived);
             o.put("rejections", m.rejections.stream().map(r -> Map.of("trigger", r.trigger(), "states", r.states(), "outcome", r.outcome())).toList());
             out.add(o);
         }

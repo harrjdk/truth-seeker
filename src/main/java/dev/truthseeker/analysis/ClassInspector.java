@@ -144,7 +144,7 @@ public final class ClassInspector {
         if (v instanceof List<?> l) for (Object o : l) flatten(o, out);
         else if (v instanceof String[] e && e.length == 2) out.add(e[1]); // enum: [desc, value]
         else if (v instanceof Type t) out.add(Names.typeName(t));
-        else if (v instanceof AnnotationNode an) out.add("@" + Names.simple(annotationType(an)));
+        else if (v instanceof AnnotationNode an) out.add(renderAnnotation(an));
         else if (v != null) out.add(String.valueOf(v));
     }
 
@@ -266,7 +266,7 @@ public final class ClassInspector {
         String n = t.getInternalName();
         return n.startsWith("java/lang/") || n.startsWith("java/math/")
                 || (n.startsWith("java/time/") && !n.equals("java/time/Clock"))
-                || (n.startsWith("java/util/") && !n.startsWith("java/util/concurrent/"));
+                || (n.startsWith("java/util/") && !n.startsWith("java/util/concurrent/") && !n.startsWith("java/util/logging/"));
     }
 
     // ---------------------------------------------------------------------------------------------

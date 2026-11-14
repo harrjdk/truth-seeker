@@ -98,6 +98,7 @@ public final class Reports {
         List<Hot> hots = new ArrayList<>();
         for (ClassRepository.ClassEntry e : selected) {
             ClassNode cn = repo.node(e.internalName());
+            if ((cn.access & Opcodes.ACC_SYNTHETIC) != 0) continue; // e.g. javac's $SwitchMap$ holder classes
             for (MethodNode mn : cn.methods) {
                 if (ClassInspector.isSynthetic(mn)) continue;
                 int cx = ClassInspector.complexity(mn);

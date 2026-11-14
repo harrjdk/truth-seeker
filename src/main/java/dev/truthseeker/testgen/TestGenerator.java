@@ -32,7 +32,17 @@ public final class TestGenerator {
     private final Imports imports = new Imports();
     private final Map<String, FieldNode> deps = new LinkedHashMap<>();
     private final List<String> classNotes = new ArrayList<>();
-    private boolean needsSetField, needsGetField;
+    private boolean needsSetField, needsGetField, needsEnumSafe;
+
+    private static final String ENUM_SAFE_ANSWER = """
+                /** Generated mocks answer enum getters with the first constant instead of null (code often switches on them). */
+                private static final Answer<Object> ENUM_SAFE = invocation -> {
+                    Class<?> type = invocation.getMethod().getReturnType();
+                    if (type.isEnum() && type.getEnumConstants().length > 0) return type.getEnumConstants()[0];
+                    return RETURNS_DEFAULTS.answer(invocation);
+                };
+
+            """;
 
     private TestGenerator(ClassRepository repo, ClassNode cn, Options opt) {
         this.repo = repo;
@@ -118,7 +128,8 @@ public final class TestGenerator {
         }
         boolean isEnumSubject = (cn.access & Opcodes.ACC_ENUM) != 0;
         if (!isAbstract && !isEnumSubject) {
-            String setUp = deps.isEmpty() ? null : explicitConstruction(subjectType);
+            // prefer the no-arg constructor for plain classes without collaborators; otherwise build explicitly
+            String setUp = deps.isEmpty() && hasNoArgCtor() ? null : explicitConstruction(subjectType);
             if (setUp != null) {
                 imports.add("org.junit.jupiter.api.BeforeEach");
                 body.append("    private ").append(subjectType).append(" subject;\n\n");
@@ -134,6 +145,10 @@ public final class TestGenerator {
             }
         }
         for (String t : testMethods) body.append(t).append("\n");
+        if (needsEnumSafe) {
+            imports.add("org.mockito.stubbing.Answer");
+            body.append(ENUM_SAFE_ANSWER);
+        }
         if (needsSetField || needsGetField) body.append(REFLECTION_HELPERS);
         body.append("}\n");
 
@@ -204,6 +219,19 @@ public final class TestGenerator {
             }
         }
         StringBuilder sb = new StringBuilder("    @BeforeEach\n    void setUp() {\n");
+        // constructors often switch on an enum getter of an argument; a plain mock would return null there
+        for (String dep : viaCtor) {
+            needsEnumSafe = true;
+            sb.append("        ").append(dep).append(" = mock(").append(imports.ref(Type.getType(deps.get(dep).desc)))
+                    .append(".class, ENUM_SAFE);\n");
+        }
+        for (int i = 0; i < args.size(); i++) {
+            String a = args.get(i);
+            if (a.startsWith("mock(") && a.endsWith(".class)")) {
+                needsEnumSafe = true;
+                args.set(i, a.substring(0, a.length() - 1) + ", ENUM_SAFE)");
+            }
+        }
         sb.append("        subject = new ").append(subjectType).append("(").append(String.join(", ", args)).append(");\n");
         for (FieldNode f : deps.values()) {
             if (viaCtor.contains(f.name)) continue;
@@ -214,16 +242,13 @@ public final class TestGenerator {
         return sb.toString();
     }
 
+    /**
+     * Realistic, non-null constructor arguments: rich domain objects validate them
+     * ({@code Objects.requireNonNull(completionTime, "Completion time is required")}).
+     */
     private String ctorDefault(Type t) {
-        return switch (t.getSort()) {
-            case Type.BOOLEAN -> "false";
-            case Type.CHAR -> "'a'";
-            case Type.BYTE, Type.SHORT, Type.INT -> "0";
-            case Type.LONG -> "0L";
-            case Type.FLOAT -> "0.0f";
-            case Type.DOUBLE -> "0.0";
-            default -> t.getDescriptor().equals("Ljava/lang/String;") ? "\"value\"" : "null /* TODO */";
-        };
+        String s = nonNullSample(t, null);
+        return s != null ? s : "null /* TODO */";
     }
 
     private boolean hasNoArgCtor() {
@@ -232,11 +257,16 @@ public final class TestGenerator {
 
     private void collectDependencies() {
         Set<String> injected = ClassInspector.injections(cn).stream().map(ClassInspector.Injection::fieldName).collect(Collectors.toSet());
+        // Entities, value objects and other plain classes: only what is handed in (constructor / injection) is a
+        // collaborator. Their other object fields are internal state the constructor computes - don't overwrite it.
+        boolean plainDomainClass = ClassInspector.stereotypes(repo, cn).stream()
+                .allMatch(s -> s.startsWith("JPA") || s.equals("record") || s.equals("enum"));
         for (FieldNode f : cn.fields) {
             if ((f.access & (Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC)) != 0) continue;
             Type t = Type.getType(f.desc);
             if (t.getSort() != Type.OBJECT) continue;
             if (isEnum(t.getInternalName())) continue;
+            if (plainDomainClass && !injected.contains(f.name)) continue;
             if (ClassInspector.isValueType(f.desc) && !injected.contains(f.name)) continue;
             if (ClassInspector.isValueType(f.desc)) continue; // e.g. @Value String: configure with setField instead
             deps.put(f.name, f);
@@ -349,6 +379,14 @@ public final class TestGenerator {
                                 constrain(l.target, op, l.args.get(0), n);
                                 break;
                             }
+                        }
+                        // identity checks in equals(): this == o  →  pass the subject itself; != → any other instance
+                        if ((op.equals("==") || op.equals("!=")) && !isStatic
+                                && ((l.kind == Expr.Kind.THIS && rgt.kind == Expr.Kind.PARAM) || (rgt.kind == Expr.Kind.THIS && l.kind == Expr.Kind.PARAM))) {
+                            Expr param = l.kind == Expr.Kind.PARAM ? l : rgt;
+                            if (op.equals("==")) paramValues.put(param.index, "subject");
+                            else if ("subject".equals(paramValues.get(param.index))) todos.add("`" + c.describe() + "` contradicts an earlier identity check");
+                            break;
                         }
                         // s.length() <op> n  →  pick a length, then a string of that length
                         if (l.kind == Expr.Kind.CALL && "length".equals(l.name) && l.target != null && l.args.isEmpty()
@@ -504,8 +542,14 @@ public final class TestGenerator {
                 if (ef.value() != null) roots.add(ef.value());
             }
             if (p.outcome().value() != null) roots.add(p.outcome().value());
+            // receivers of side-effect calls (cargo.specifyNewRoute(..)) must exist
+            for (Effect ef : p.effects()) {
+                if (ef.kind() == Effect.Kind.CALL && ef.target() != null) requireNonNull(ef.target());
+            }
             for (Expr root : roots) {
                 root.mentions(x -> {
+                    // constructor arguments are usually validated (Objects.requireNonNull(origin, "Origin is required"))
+                    if (x.kind == Expr.Kind.NEW) x.args.forEach(this::requireNonNull);
                     if (x.kind != Expr.Kind.CALL || x.target == null) return false;
                     Expr t = x.target;
                     if (isOptional(t) && (x.name.equals("get") || x.name.equals("orElseThrow"))) {
@@ -516,6 +560,19 @@ public final class TestGenerator {
                     }
                     return false;
                 });
+            }
+        }
+
+        /** Makes a collaborator-produced value non-null: a mock for collaborator types, a sample for value types. */
+        void requireNonNull(Expr a) {
+            if (boundLiteral.containsKey(a.text) || ensured.containsKey(a.text)) return;
+            if (a.kind != Expr.Kind.CALL || a.target == null || a.target.kind == Expr.Kind.THIS) return;
+            if (a.desc == null || !a.desc.startsWith("L") || isOptional(a)) return;
+            if (!ClassInspector.isValueType(a.desc)) {
+                ensure(a);
+            } else {
+                String lit = nonNullSample(Type.getType(a.desc), a);
+                if (lit != null) bindLiteral(a, lit);
             }
         }
 
@@ -675,7 +732,7 @@ public final class TestGenerator {
             }
             if (empty != null) return emptyLiteral(type, empty, e);
             if (instanceType != null) {
-                return "mock(" + imports.ref(instanceType) + ".class)";
+                return mockOf(Type.getObjectType(instanceType));
             }
             if (!numeric.isEmpty()) {
                 String n = solveNumeric(type, numeric);
@@ -772,62 +829,6 @@ public final class TestGenerator {
             return null;
         }
 
-        String collectionFactory(Type type) {
-            if (type.getSort() != Type.OBJECT) return null;
-            String n = type.getInternalName();
-            return switch (n) {
-                case "java/util/List", "java/util/Collection", "java/lang/Iterable", "java/util/ArrayList" -> { imports.add("java.util.List"); yield "List.of"; }
-                case "java/util/Set", "java/util/HashSet" -> { imports.add("java.util.Set"); yield "Set.of"; }
-                case "java/util/Map", "java/util/HashMap" -> { imports.add("java.util.Map"); yield "Map.of"; }
-                default -> null;
-            };
-        }
-
-        String mutableCollection(Type type) {
-            String f = collectionFactory(type);
-            if (f == null) return null;
-            return switch (f) {
-                case "List.of" -> { imports.add("java.util.ArrayList"); yield "new ArrayList<>()"; }
-                case "Set.of" -> { imports.add("java.util.HashSet"); yield "new HashSet<>()"; }
-                default -> { imports.add("java.util.HashMap"); yield "new HashMap<>()"; }
-            };
-        }
-
-        String nonNullSample(Type type, Expr e) {
-            String d = type.getDescriptor();
-            switch (d) {
-                case "Z", "Ljava/lang/Boolean;": return "true";
-                case "I", "Ljava/lang/Integer;", "S", "B": return "1";
-                case "J", "Ljava/lang/Long;": return "1L";
-                case "D", "Ljava/lang/Double;": return "1.0";
-                case "F", "Ljava/lang/Float;": return "1.0f";
-                case "C", "Ljava/lang/Character;": return "'a'";
-                case "Ljava/lang/String;", "Ljava/lang/CharSequence;": return "\"value\"";
-                case "Ljava/math/BigDecimal;": imports.add("java.math.BigDecimal"); return "BigDecimal.ONE";
-                case "Ljava/time/LocalDate;": imports.add("java.time.LocalDate"); return "LocalDate.of(2024, 1, 15)";
-                case "Ljava/time/LocalDateTime;": imports.add("java.time.LocalDateTime"); return "LocalDateTime.of(2024, 1, 15, 10, 30)";
-                case "Ljava/time/Instant;": imports.add("java.time.Instant"); return "Instant.parse(\"2024-01-15T10:30:00Z\")";
-                case "Ljava/util/Date;": imports.add("java.util.Date"); return "new Date(1705314600000L)";
-                case "Ljava/util/UUID;": imports.add("java.util.UUID"); return "UUID.fromString(\"00000000-0000-0000-0000-000000000001\")";
-                case "Ljava/util/Optional;": imports.add("java.util.Optional"); return "Optional.empty()";
-                case "Ljava/lang/Object;": return "new Object()";
-                case "Ljava/lang/Class;": return "Object.class";
-                default: break;
-            }
-            // mutable: code under test often adds to passed-in collections (errors, model attributes, results)
-            String coll = mutableCollection(type);
-            if (coll != null) return coll;
-            if (type.getSort() == Type.ARRAY) return "new " + imports.ref(type.getElementType()) + "[0]";
-            if (type.getSort() == Type.OBJECT && isEnum(type.getInternalName())) {
-                List<String> cs = ClassInspector.enumConstants(repo.node(type.getInternalName()));
-                if (!cs.isEmpty()) return imports.ref(type) + "." + cs.get(0);
-            }
-            if (type.getSort() == Type.OBJECT && !type.getInternalName().startsWith("java/lang/")) {
-                return "mock(" + imports.ref(type) + ".class)";
-            }
-            return null;
-        }
-
         /** Element for {@code Optional.of(...)}: a mock of the type the code casts {@code get()} to, if visible on the path. */
         String ensureOptionalElement(Expr optionalExpr) {
             String elemDesc = findUnwrapType(optionalExpr);
@@ -867,7 +868,7 @@ public final class TestGenerator {
             String name = base;
             while (usedNames.contains(name)) name = base + (++varCounter);
             usedNames.add(name);
-            arrange.add(imports.ref(t) + " " + name + " = mock(" + imports.ref(t) + ".class);");
+            arrange.add(imports.ref(t) + " " + name + " = " + mockOf(t) + ";");
             return name;
         }
 
@@ -881,7 +882,7 @@ public final class TestGenerator {
                 case PARAM -> {
                     Type t = Type.getType(e.desc);
                     if (t.getSort() == Type.OBJECT && !ClassInspector.isValueType(e.desc)) {
-                        paramValues.putIfAbsent((Integer) e.index, "mock(" + imports.ref(t) + ".class)");
+                        paramValues.putIfAbsent((Integer) e.index, mockOf(t));
                         // the code casts a wider parameter (e.g. Object) to this type: declare the variable as it
                         paramTypes.putIfAbsent(e.index, t);
                         v = paramVars.get(e.index);
@@ -939,7 +940,12 @@ public final class TestGenerator {
                 case FIELD -> {
                     if (e.target == null) return false;
                     if (e.target.kind == Expr.Kind.THIS) {
-                        if (deps.containsKey(e.name) && !literal.equals("null")) return true; // the @Mock is already non-null
+                        if (deps.containsKey(e.name) && !literal.equals("null")) {
+                            // the @Mock is already non-null: it *is* the value
+                            boundLiteral.put(e.text, e.name);
+                            ensured.put(e.text, e.name);
+                            return true;
+                        }
                         needsSetField = true;
                         arrange.add("setField(subject, \"" + e.name + "\", " + literal + ");");
                         return true;
@@ -952,6 +958,7 @@ public final class TestGenerator {
                 }
                 case CALL -> {
                     if (e.target == null) return false; // static call: would need mockStatic
+                    if (isObjectMethod(e)) return false; // Mockito cannot stub equals/hashCode
                     String tv = ensure(e.target);
                     if (tv == null) return false;
                     if (Type.getReturnType(e.memberDesc).getSort() == Type.VOID) return false;
@@ -1079,6 +1086,8 @@ public final class TestGenerator {
                 out.add((ret.getSort() == Type.OBJECT ? "assertSame(" : "assertEquals(") + paramVars.get(v.index) + ", result);");
             } else if (ensured.containsKey(v.text)) {
                 out.add("assertSame(" + ensured.get(v.text) + ", result);");
+            } else if (boundLiteral.containsKey(v.text) && boundLiteral.get(v.text).startsWith("mock(")) {
+                out.add("assertNotNull(result); // a fresh mock() is never equal to the returned instance");
             } else if (boundLiteral.containsKey(v.text)) {
                 String lit = boundLiteral.get(v.text);
                 if (ret.getSort() == Type.BOOLEAN) out.add(lit.equals("true") ? "assertTrue(result);" : "assertFalse(result);");
@@ -1185,6 +1194,64 @@ public final class TestGenerator {
 
     // =============================================================================================
 
+    // ---- value samples (shared by test bodies and subject construction) ----
+
+    String collectionFactory(Type type) {
+        if (type.getSort() != Type.OBJECT) return null;
+        String n = type.getInternalName();
+        return switch (n) {
+            case "java/util/List", "java/util/Collection", "java/lang/Iterable", "java/util/ArrayList" -> { imports.add("java.util.List"); yield "List.of"; }
+            case "java/util/Set", "java/util/HashSet" -> { imports.add("java.util.Set"); yield "Set.of"; }
+            case "java/util/Map", "java/util/HashMap" -> { imports.add("java.util.Map"); yield "Map.of"; }
+            default -> null;
+        };
+    }
+
+    String mutableCollection(Type type) {
+        String f = collectionFactory(type);
+        if (f == null) return null;
+        return switch (f) {
+            case "List.of" -> { imports.add("java.util.ArrayList"); yield "new ArrayList<>()"; }
+            case "Set.of" -> { imports.add("java.util.HashSet"); yield "new HashSet<>()"; }
+            default -> { imports.add("java.util.HashMap"); yield "new HashMap<>()"; }
+        };
+    }
+
+    String nonNullSample(Type type, Expr e) {
+        String d = type.getDescriptor();
+        switch (d) {
+            case "Z", "Ljava/lang/Boolean;": return "true";
+            case "I", "Ljava/lang/Integer;", "S", "B": return "1";
+            case "J", "Ljava/lang/Long;": return "1L";
+            case "D", "Ljava/lang/Double;": return "1.0";
+            case "F", "Ljava/lang/Float;": return "1.0f";
+            case "C", "Ljava/lang/Character;": return "'a'";
+            case "Ljava/lang/String;", "Ljava/lang/CharSequence;": return "\"value\"";
+            case "Ljava/math/BigDecimal;": imports.add("java.math.BigDecimal"); return "BigDecimal.ONE";
+            case "Ljava/time/LocalDate;": imports.add("java.time.LocalDate"); return "LocalDate.of(2024, 1, 15)";
+            case "Ljava/time/LocalDateTime;": imports.add("java.time.LocalDateTime"); return "LocalDateTime.of(2024, 1, 15, 10, 30)";
+            case "Ljava/time/Instant;": imports.add("java.time.Instant"); return "Instant.parse(\"2024-01-15T10:30:00Z\")";
+            case "Ljava/util/Date;": imports.add("java.util.Date"); return "new Date(1705314600000L)";
+            case "Ljava/util/UUID;": imports.add("java.util.UUID"); return "UUID.fromString(\"00000000-0000-0000-0000-000000000001\")";
+            case "Ljava/util/Optional;": imports.add("java.util.Optional"); return "Optional.empty()";
+            case "Ljava/lang/Object;": return "new Object()";
+            case "Ljava/lang/Class;": return "Object.class";
+            default: break;
+        }
+        // mutable: code under test often adds to passed-in collections (errors, model attributes, results)
+        String coll = mutableCollection(type);
+        if (coll != null) return coll;
+        if (type.getSort() == Type.ARRAY) return "new " + imports.ref(type.getElementType()) + "[0]";
+        if (type.getSort() == Type.OBJECT && isEnum(type.getInternalName())) {
+            List<String> cs = ClassInspector.enumConstants(repo.node(type.getInternalName()));
+            if (!cs.isEmpty()) return imports.ref(type) + "." + cs.get(0);
+        }
+        if (type.getSort() == Type.OBJECT && !type.getInternalName().startsWith("java/lang/")) {
+            return mockOf(type);
+        }
+        return null;
+    }
+
     /**
      * A typed any-matcher. For overloaded methods, reference types get an explicit type witness
      * ({@code ArgumentMatchers.<Integer>any()}) so javac can pick the overload; unlike {@code any(Integer.class)}
@@ -1224,6 +1291,19 @@ public final class TestGenerator {
             todo.addAll(c.interfaces);
         }
         return descs.size() > 1;
+    }
+
+    /** A mock whose enum-returning methods default to the first constant (switch on null would throw NPE). */
+    private String mockOf(Type t) {
+        needsEnumSafe = true;
+        return "mock(" + imports.ref(t) + ".class, ENUM_SAFE)";
+    }
+
+    /** equals/hashCode cannot be stubbed with Mockito (and stubbing toString hides bugs). */
+    private static boolean isObjectMethod(Expr call) {
+        return ("hashCode".equals(call.name) && "()I".equals(call.memberDesc))
+                || ("equals".equals(call.name) && "(Ljava/lang/Object;)Z".equals(call.memberDesc))
+                || ("toString".equals(call.name) && "()Ljava/lang/String;".equals(call.memberDesc));
     }
 
     private boolean isEnumConst(Expr e) {

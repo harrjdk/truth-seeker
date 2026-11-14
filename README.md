@@ -22,7 +22,7 @@ An MCP server that lets an LLM client (Claude Code, Claude Desktop, Codex, or a 
 | `disassemble` | Raw bytecode for a class or one method, as ground truth |
 | `call_graph` | Callers/callees as a Mermaid flowchart. Interface calls are expanded to the implementations in the archive |
 | `truth_table` | Decision table for a method: one row per feasible path, with outcome, side effects, an optional expanded 2ⁿ table, and the **simplified boolean logic per outcome** |
-| `state_machine` | Mermaid / PlantUML state diagrams inferred from enum state. Flags unguarded transitions, never-entered states and state-guard rejections |
+| `state_machine` | Mermaid / PlantUML state diagrams inferred from enum state. Also reports **derived state** (a status computed from other facts, e.g. from the last event). Flags unguarded transitions, never-entered or never-produced states, and state-guard rejections |
 | `generate_unit_tests` | JUnit 5 + Mockito test class, one test per path, with solved inputs, stubs, assertions and `verify()` calls. Unsolved preconditions become exact `TODO`s |
 
 All tools take `path`. The archive index is cached per path, so follow-up calls are fast.
@@ -57,6 +57,31 @@ stateDiagram-v2
     ...
 ```
 In this example the tool also reports: *⚠ Unguarded transitions: OrderService.markDelivered()* and *⚠ Never entered: ARCHIVED*.
+
+Derived state, from [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker)'s `Delivery`:
+
+| TransportStatus | When |
+|---|---|
+| NOT_RECEIVED | `this.lastEvent == null` |
+| ONBOARD_CARRIER | `this.lastEvent != null && this.lastEvent.getType() == Type.LOAD` |
+| IN_PORT | `this.lastEvent != null && this.lastEvent.getType() in {Type.UNLOAD, Type.RECEIVE, Type.CUSTOMS}` |
+| CLAIMED | `this.lastEvent != null && this.lastEvent.getType() == Type.CLAIM` |
+
+The tool also notes that `UNKNOWN` is declared but never produced: its only path is the `default` of a switch that already covers every event type.
+
+## Tested against real applications
+
+The generated tests are compiled against each application and run.
+A test whose preconditions can't all be arranged automatically is emitted as `@Disabled`, with `TODO`s saying exactly what to arrange.
+
+| Application | Archive | Generated tests | Pass | Disabled (TODOs) | Fail |
+|---|---|---|---|---|---|
+| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 174 (12 classes) | 129 | 44 | 1 |
+| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 191 (18 classes) | 163 | 26 | 2 |
+
+The remaining failures are documented limitations:
+- a method that depends on an unstubbed call on `this` (the generated test carries a `NOTE`)
+- a mocked `String` getter returning `null` into string formatting
 
 ## Build
 

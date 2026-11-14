@@ -41,6 +41,18 @@ class StateMachineTest {
     }
 
     @Test
+    void derivedStateFromLastEvent() {
+        String md = TestSupport.run("state_machine", "packagePrefix", "fixtures.shipping");
+        assertTrue(md.contains("## Enum state: `TransportStatus`"), md);
+        assertTrue(md.contains("stored by `Delivery.<init>()` into `Delivery.transportStatus`"), md);
+        assertTrue(md.contains("| ONBOARD_CARRIER | `this.lastEvent != null && this.lastEvent.getType() == EventType.LOAD` |"), md);
+        assertTrue(md.contains("in {EventType.UNLOAD, EventType.RECEIVE}"), md);
+        // the default branch of the exhaustive switch is unreachable, so UNKNOWN is never produced
+        assertTrue(md.contains("Declared but never produced by analyzed code: UNKNOWN"), md);
+        assertFalse(md.contains("Rejected operations"), md);
+    }
+
+    @Test
     void jsonFormat() {
         String json = TestSupport.run("state_machine", "className", "Door", "format", "json");
         assertTrue(json.startsWith("[{\"enum\":\"fixtures.door.Door$State\""), json);

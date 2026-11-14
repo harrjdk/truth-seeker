@@ -39,7 +39,9 @@ class GeneratedTestsExecutionTest {
         List<String> classes = new ArrayList<>(List.of(
                 "fixtures.order.OrderService", "fixtures.rules.Eligibility", "fixtures.door.Door", "fixtures.door.TrafficLight",
                 // PetClinic-shaped regressions: Optional.orElseThrow, overloaded getPet(..), Object-typed param cast, loops
-                "fixtures.clinic.PetLookupService", "fixtures.clinic.PetValidator", "fixtures.clinic.Owner"));
+                "fixtures.clinic.PetLookupService", "fixtures.clinic.PetValidator", "fixtures.clinic.Owner",
+                // Cargo Tracker-shaped regressions: validated constructors, no no-arg ctor, JUL Logger collaborator
+                "fixtures.shipping.HandlingEvent", "fixtures.shipping.Delivery", "fixtures.shipping.HandlingService"));
         if (TestSupport.hasJava21Fixtures()) classes.add("fixtures.modern.Shapes");
 
         Path src = tmp.resolve("src");

@@ -107,6 +107,13 @@ class InventoryToolsTest {
     }
 
     @Test
+    void jakartaEndpointsShowQueuesAndApplicationPath() {
+        String md = TestSupport.run("list_endpoints", "packagePrefix", "fixtures.shipping");
+        assertTrue(md.contains("| JMS (EJB MDB) | consume | `java:app/jms/CargoHandledQueue (Queue)` | `CargoHandledConsumer.onMessage()`"), md);
+        assertTrue(md.contains("| HTTP (JAX-RS) | GET | `/rest/tracking/{id}` | `TrackingResource.track()`"), md);
+    }
+
+    @Test
     void noStateMachinesMessage() {
         String md = TestSupport.run("state_machine", "packagePrefix", "fixtures.clinic");
         assertTrue(md.contains("No state machines inferred"), md);

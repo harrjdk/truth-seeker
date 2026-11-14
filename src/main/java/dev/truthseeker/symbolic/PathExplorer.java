@@ -275,7 +275,10 @@ public final class PathExplorer {
                 String lvName = localNameOrNull(slot, f.pc + 1);
                 boolean trivial = v.kind == Expr.Kind.CONST || v.kind == Expr.Kind.NULL || v.kind == Expr.Kind.PARAM
                         || v.kind == Expr.Kind.THIS || v.kind == Expr.Kind.STATIC || v.kind == Expr.Kind.LOCAL;
-                if (v.kind == Expr.Kind.NEW || v.kind == Expr.Kind.ARRAY_NEW || v.kind == Expr.Kind.LAMBDA) {
+                if (v.kind == Expr.Kind.NEW && !v.isUninitialized() && lvName != null) {
+                    // keep constructor arguments visible behind the name (needed to see what must be non-null)
+                    f.locals[slot] = v.aliased(lvName);
+                } else if (v.kind == Expr.Kind.NEW || v.kind == Expr.Kind.ARRAY_NEW || v.kind == Expr.Kind.LAMBDA) {
                     f.locals[slot] = Expr.local(slot, localName(slot, f.pc + 1), v.desc != null ? v.desc : lvDesc);
                 } else if (!trivial && lvName != null) {
                     f.locals[slot] = v.aliased(lvName); // readable name, structure kept
@@ -543,7 +546,7 @@ public final class PathExplorer {
 
     private boolean branch(Frame f, JumpInsnNode j, Cond taken, Cond fall, Deque<Frame> work) {
         if (repeatsInNewIteration(f, taken)) {
-            String suffix = " [iteration " + (f.iteration + 1) + "]";
+            String suffix = " [iteration " + (evaluations(f, taken) + 1) + "]";
             taken = rekey(taken, suffix);
             fall = rekey(fall, suffix);
         }
@@ -581,6 +584,19 @@ public final class PathExplorer {
             if (f.conds.get(i).key().equals(c.key())) return true;
         }
         return false;
+    }
+
+    /** How many times this same decision was already made on the path (across loop iterations). */
+    private static int evaluations(Frame f, Cond c) {
+        String base = c.left().text;
+        int n = 0;
+        for (Cond e : f.conds) {
+            if (e.kind() != c.kind() || !Objects.equals(e.op(), c.op())) continue;
+            if (!Objects.equals(e.right() == null ? null : e.right().text, c.right() == null ? null : c.right().text)) continue;
+            String t = e.left().text;
+            if (t.equals(base) || t.startsWith(base + " [iteration ")) n++;
+        }
+        return n;
     }
 
     private static boolean isMutable(Expr e) {
@@ -750,9 +766,16 @@ public final class PathExplorer {
             Expr le = labelExprs.get(e.getKey());
             if (!explicitCases.contains(le)) explicitCases.add(le);
         }
+        boolean exhaustive = coversAllEnumConstants(explicitCases);
         List<Frame> branches = new ArrayList<>();
         for (var e : byTarget.entrySet()) {
-            String label = String.join(" | ", e.getValue());
+            List<String> labels = e.getValue();
+            if (exhaustive && labels.contains("default")) {
+                notes.add("Default branch of a switch covering every enum constant omitted (reachable only if constants are added later).");
+                labels = labels.stream().filter(l -> !l.equals("default")).toList();
+                if (labels.isEmpty()) continue;
+            }
+            String label = String.join(" | ", labels);
             if (prior != null && !Arrays.asList(prior.value().split(" \\| ")).stream().anyMatch(e.getValue()::contains)) continue;
             Frame g = f.copy();
             if (prior == null) g.conds.add(Cond.switchCase(selector, label, exprByTarget.get(e.getKey()),
@@ -920,6 +943,19 @@ public final class PathExplorer {
                 || o.equals("java/lang/Long") || o.equals("java/lang/Boolean") || o.equals("java/lang/Enum")) return true;
         if (o.equals("java/util/Objects")) return true;
         return m.name.equals("ordinal") || m.name.equals("hashCode") || m.name.equals("getClass");
+    }
+
+    /** True when the explicit case constants are every constant the enum declares. */
+    private boolean coversAllEnumConstants(List<Expr> cases) {
+        if (repo == null || cases.isEmpty() || cases.stream().anyMatch(c -> c.kind != Expr.Kind.STATIC)) return false;
+        String owner = cases.get(0).owner;
+        ClassNode en = repo.node(owner);
+        if (en == null || (en.access & ACC_ENUM) == 0) return false;
+        Set<String> declared = new HashSet<>();
+        for (FieldNode fn : en.fields) if ((fn.access & ACC_ENUM) != 0) declared.add(fn.name);
+        Set<String> covered = new HashSet<>();
+        for (Expr c : cases) if (owner.equals(c.owner)) covered.add(c.name);
+        return !declared.isEmpty() && covered.containsAll(declared);
     }
 
     private static boolean isOrdinalCall(Expr e) {

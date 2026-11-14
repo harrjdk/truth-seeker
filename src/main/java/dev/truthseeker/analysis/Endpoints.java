@@ -24,10 +24,11 @@ public final class Endpoints {
 
     public static List<Endpoint> find(ClassRepository repo, String packagePrefix) {
         List<Endpoint> out = new ArrayList<>();
+        String appPath = jaxrsApplicationPath(repo);
         for (ClassRepository.ClassEntry e : repo.entries()) {
             if (e.library() || !matches(e.internalName(), packagePrefix)) continue;
             ClassNode cn = repo.node(e.internalName());
-            scanClass(repo, cn, out);
+            scanClass(repo, cn, out, appPath);
         }
         scanDescriptors(repo, out);
         out.sort(Comparator.comparing(Endpoint::kind).thenComparing(Endpoint::path).thenComparing(Endpoint::verb));
@@ -39,7 +40,22 @@ public final class Endpoints {
         return internalName.replace('/', '.').startsWith(prefix.trim());
     }
 
-    private static void scanClass(ClassRepository repo, ClassNode cn, List<Endpoint> out) {
+    /** Base path from a JAX-RS {@code @ApplicationPath} on an {@code Application} subclass (empty if none). */
+    private static String jaxrsApplicationPath(ClassRepository repo) {
+        for (ClassRepository.ClassEntry e : repo.entries()) {
+            if (e.library()) continue;
+            ClassNode cn = repo.node(e.internalName());
+            Optional<AnnotationNode> ap = ClassInspector.find(ClassInspector.annotations(cn),
+                    "javax/ws/rs/ApplicationPath", "jakarta/ws/rs/ApplicationPath");
+            if (ap.isPresent()) {
+                List<String> v = ClassInspector.attr(ap.get(), "value");
+                if (!v.isEmpty()) return v.get(0);
+            }
+        }
+        return "";
+    }
+
+    private static void scanClass(ClassRepository repo, ClassNode cn, List<Endpoint> out, String appPath) {
         List<AnnotationNode> classAnns = ClassInspector.annotations(cn);
         String cls = Names.dotted(cn.name);
 
@@ -72,7 +88,7 @@ public final class Endpoints {
                     List<String> sub = ClassInspector.find(anns, "javax/ws/rs/Path", "jakarta/ws/rs/Path")
                             .map(x -> ClassInspector.attr(x, "value")).orElse(List.of(""));
                     String base = jaxrsBase == null || jaxrsBase.isEmpty() ? "" : jaxrsBase.get(0);
-                    for (String p : sub) out.add(new Endpoint("HTTP (JAX-RS)", simple, join(base, p), handler, cls));
+                    for (String p : sub) out.add(new Endpoint("HTTP (JAX-RS)", simple, join(join(appPath, base), p), handler, cls));
                 }
                 switch (simple) {
                     case "JmsListener" -> out.add(new Endpoint("JMS listener", "consume",
@@ -98,7 +114,7 @@ public final class Endpoints {
                 for (String p : ps) out.add(new Endpoint(simple.equals("WebServlet") ? "HTTP (Servlet)" : "Servlet filter", "*", p, Names.simple(cn.name), cls));
             }
             if (simple.equals("MessageDriven")) {
-                out.add(new Endpoint("JMS (EJB MDB)", "consume", ClassInspector.renderAnnotation(a), Names.simple(cn.name) + ".onMessage()", cls));
+                out.add(new Endpoint("JMS (EJB MDB)", "consume", mdbDestination(a), Names.simple(cn.name) + ".onMessage()", cls));
             }
             if (simple.equals("WebService")) {
                 out.add(new Endpoint("SOAP (JAX-WS)", "service", String.join(",", ClassInspector.attr(a, "serviceName")), Names.simple(cn.name), cls));
@@ -110,6 +126,32 @@ public final class Endpoints {
                 && (cn.access & Opcodes.ACC_ABSTRACT) == 0) {
             out.add(new Endpoint("JMS listener (XML-wired?)", "consume", "?", Names.simple(cn.name) + ".onMessage()", cls));
         }
+    }
+
+    /** Destination of a message-driven bean from activationConfig (destinationLookup / destination) or legacy mappedName. */
+    static String mdbDestination(AnnotationNode a) {
+        Map<String, String> props = new LinkedHashMap<>();
+        if (a.values != null) {
+            for (int i = 0; i + 1 < a.values.size(); i += 2) {
+                if (!"activationConfig".equals(a.values.get(i)) || !(a.values.get(i + 1) instanceof List<?> list)) continue;
+                for (Object o : list) {
+                    if (o instanceof AnnotationNode p) {
+                        List<String> name = ClassInspector.attr(p, "propertyName");
+                        List<String> value = ClassInspector.attr(p, "propertyValue");
+                        if (!name.isEmpty() && !value.isEmpty()) props.put(name.get(0), value.get(0));
+                    }
+                }
+            }
+        }
+        for (String k : List.of("destinationLookup", "destination", "destinationName")) {
+            if (props.containsKey(k)) {
+                String type = props.getOrDefault("destinationType", "");
+                return props.get(k) + (type.isEmpty() ? "" : " (" + Names.simple(type.replace('.', '/')) + ")");
+            }
+        }
+        List<String> mapped = ClassInspector.attr(a, "mappedName");
+        if (!mapped.isEmpty()) return mapped.get(0);
+        return props.isEmpty() ? "?" : props.toString();
     }
 
     private static String scheduleText(AnnotationNode a) {
