@@ -50,9 +50,27 @@ public final class TestGenerator {
         this.opt = opt;
     }
 
+    /** A generated test class plus what a reviewer (or an LLM) needs to know about it. */
+    public record Suite(String className, String code, int tests, int paths, List<Issue> disabled, List<Issue> notes, List<String> skipped) {}
+
+    /** A test with unresolved preconditions (todos) or a note about a dependency that cannot be stubbed. */
+    public record Issue(String test, List<String> details) {}
+
     public static String generate(ClassRepository repo, ClassNode cn, Options opt) {
-        return new TestGenerator(repo, cn, opt).run();
+        return generateSuite(repo, cn, opt).code();
     }
+
+    public static Suite generateSuite(ClassRepository repo, ClassNode cn, Options opt) {
+        TestGenerator g = new TestGenerator(repo, cn, opt);
+        String code = g.run();
+        return new Suite(Names.dotted(cn.name) + "GeneratedTest", code, g.testsMade, g.pathsSeen,
+                List.copyOf(g.disabledTests), List.copyOf(g.noteTests), List.copyOf(g.skippedMethods));
+    }
+
+    private int testsMade, pathsSeen;
+    private final List<Issue> disabledTests = new ArrayList<>();
+    private final List<Issue> noteTests = new ArrayList<>();
+    private final List<String> skippedMethods = new ArrayList<>();
 
     // ---------------------------------------------------------------------------------------------
 
@@ -92,13 +110,21 @@ public final class TestGenerator {
                 Case c = new Case(r, p, isStatic);
                 String base = mn.name + "_" + slug(p);
                 int n = nameCounts.merge(base, 1, Integer::sum);
-                String code = c.render(n == 1 ? base : base + "_" + n, subjectType);
+                String methodName = n == 1 ? base : base + "_" + n;
+                String code = c.render(methodName, subjectType);
                 todosTotal += c.todos.size();
+                if (!c.todos.isEmpty()) disabledTests.add(new Issue(methodName, List.copyOf(c.todos)));
+                String self = c.isStatic ? null : c.selfCall();
+                if (self != null) noteTests.add(new Issue(methodName, List.of("depends on the real behaviour of `" + self + "`")));
                 testMethods.add(code);
                 made++;
                 testsTotal++;
             }
         }
+
+        testsMade = testsTotal;
+        pathsSeen = pathsTotal;
+        skippedMethods.addAll(skipped);
 
         // ---- assemble the class ----
         StringBuilder body = new StringBuilder();

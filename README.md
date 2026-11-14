@@ -21,11 +21,28 @@ An MCP server that lets an LLM client (Claude Code, Claude Desktop, Codex, or a 
 | `describe_class` | Kind, annotations, injected collaborators (field / constructor / setter (XML-wired) injection), fields, methods with cyclomatic complexity |
 | `disassemble` | Raw bytecode for a class or one method, as ground truth |
 | `call_graph` | Callers/callees as a Mermaid flowchart. Interface calls are expanded to the implementations in the archive |
-| `truth_table` | Decision table for a method: one row per feasible path, with outcome, side effects, an optional expanded 2ⁿ table, and the **simplified boolean logic per outcome** |
+| `truth_table` | A method's decisions and the **simplified boolean logic per outcome**. The summary (default) gives one row per outcome, with path counts and side effects listed once. `detail: "full"` gives one row per path, and `expand` adds the 2ⁿ table |
 | `state_machine` | Mermaid / PlantUML state diagrams inferred from enum state. Also reports **derived state** (a status computed from other facts, e.g. from the last event). Flags unguarded transitions, never-entered or never-produced states, and state-guard rejections |
-| `generate_unit_tests` | JUnit 5 + Mockito test class, one test per path, with solved inputs, stubs, assertions and `verify()` calls. Unsolved preconditions become exact `TODO`s |
+| `generate_unit_tests` | JUnit 5 + Mockito test classes (one class or `classNames`): one test per path, with solved inputs, stubs, assertions and `verify()` calls. Tests whose preconditions can't be arranged are `@Disabled` with exact `TODO`s. With `outputDir`, it writes the files and returns only a compact summary |
+| `verify_tests` | Compiles test sources against the archive and runs them on JUnit 5 in a **separate JVM**. Reports passed / failed / disabled, with failures grouped by cause and disabled tests grouped by unresolved precondition. JUnit and Mockito are bundled, so it works offline. **Runs the application's code** |
 
 All tools take `path`. The archive index is cached per path, so follow-up calls are fast.
+
+Outputs are sized for an LLM's context: Markdown summaries by default, with full detail on request.
+`format: "json"` (`truth_table`, `state_machine`), `generate_unit_tests` and `verify_tests` also return MCP `structuredContent`.
+All tools except `generate_unit_tests` (writes files) and `verify_tests` (runs code) are annotated read-only, so clients can auto-approve them.
+
+### The generate → verify loop
+
+```text
+generate_unit_tests  path=app.war  classNames=[...]  outputDir=build/gen-tests
+verify_tests         path=app.war  testDir=build/gen-tests
+```
+
+`verify_tests` derives the classpath from the archive: Spring Boot `BOOT-INF/classes` + `BOOT-INF/lib`, WAR `WEB-INF/classes` + `WEB-INF/lib`, or EAR modules.
+Files that don't compile are reported, and the rest still run.
+If a `provided` API (`jakarta.*`, `javax.*`) is missing from the archive, pass it with `extraClasspath`.
+It needs a JDK, not a JRE, and extracts to `java.io.tmpdir/truth-seeker` (override with `-Dtruthseeker.cache=…`).
 
 ### What it looks like
 
@@ -71,7 +88,7 @@ The tool also notes that `UNKNOWN` is declared but never produced: its only path
 
 ## Tested against real applications
 
-The generated tests are compiled against each application and run.
+The generated tests are compiled against each application and run with `verify_tests`, over MCP, on a Java 17 runtime.
 A test whose preconditions can't all be arranged automatically is emitted as `@Disabled`, with `TODO`s saying exactly what to arrange.
 
 | Application | Archive | Generated tests | Pass | Disabled (TODOs) | Fail |
@@ -91,7 +108,7 @@ You need JDK 21+ to build (it compiles the Java 21 test fixtures), and Java 17+ 
 ./mvnw package
 ```
 
-On Windows: `mvnw.cmd package`. This produces `target/truth-seeker.jar`, a single self-contained jar.
+On Windows: `mvnw.cmd package`. This produces `target/truth-seeker.jar`, a single self-contained jar of about 18 MB. Most of that is the bundled JUnit/Mockito test kit used by `verify_tests`.
 The wrapper uses `JAVA_HOME`, so point it at a JDK 21+ first if your default JDK is older.
 
 The test suite also generates tests for the fixture classes, compiles them and runs them on the JUnit Platform.
@@ -156,7 +173,7 @@ java -jar target/truth-seeker.jar --cli generate_unit_tests path=target/classes 
 3. `call_graph` from an endpoint: follow a request through controller → service → DAO.
 4. `truth_table` on the business-rule methods it reaches: document the rules as they actually are.
 5. `state_machine` on the domain enums: find illegal or unguarded transitions.
-6. `generate_unit_tests`: pin the current behaviour (characterization tests) before you refactor or migrate (e.g. javax → jakarta, Spring 4 → 6).
+6. `generate_unit_tests` with `outputDir`, then `verify_tests`: pin the current behaviour with characterization tests that compile and pass before you refactor or migrate (e.g. javax → jakarta, Spring 4 → 6). Arrange the grouped TODOs it reports.
 
 ## How it works, and its limits
 

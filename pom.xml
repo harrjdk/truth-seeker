@@ -144,6 +144,25 @@
 
     <build>
         <plugins>
+            <!-- verify_tests runs generated tests offline: bundle JUnit + Mockito (and their dependencies) as
+                 plain jar resources, extracted to a cache and used only in the forked test JVM. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <version>3.11.0</version>
+                <executions>
+                    <execution>
+                        <id>bundle-testkit</id>
+                        <phase>process-resources</phase>
+                        <goals><goal>copy-dependencies</goal></goals>
+                        <configuration>
+                            <includeScope>test</includeScope>
+                            <includeGroupIds>org.junit.jupiter,org.junit.platform,org.opentest4j,org.apiguardian,org.jspecify,org.mockito,net.bytebuddy,org.objenesis</includeGroupIds>
+                            <outputDirectory>${project.build.outputDirectory}/truthseeker-testkit</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>

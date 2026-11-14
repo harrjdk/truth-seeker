@@ -22,6 +22,9 @@ public final class TruthSeekerServer {
 
     public static final String VERSION = "0.1.0";
 
+    /** Tools that write files or run application code: not advertised as read-only, so clients ask first. */
+    private static final java.util.Set<String> WRITES_OR_EXECUTES = java.util.Set.of("generate_unit_tests", "verify_tests");
+
     public static void main(String[] args) throws Exception {
         System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", System.getProperty("truthseeker.log", "warn"));
         System.setProperty("org.slf4j.simpleLogger.logFile", "System.err");
@@ -51,7 +54,7 @@ public final class TruthSeekerServer {
                     .title(def.title())
                     .description(def.description())
                     .inputSchema(mapper, def.schema())
-                    .annotations(new McpSchema.ToolAnnotations(def.title(), !def.name().equals("generate_unit_tests"), false, true, false, null))
+                    .annotations(new McpSchema.ToolAnnotations(def.title(), !WRITES_OR_EXECUTES.contains(def.name()), false, true, false, null))
                     .build();
             specs.add(McpServerFeatures.SyncToolSpecification.builder()
                     .tool(tool)
@@ -71,8 +74,10 @@ public final class TruthSeekerServer {
 
     static McpSchema.CallToolResult call(Tools.ToolDef def, Map<String, Object> args) {
         try {
-            String out = def.handler().apply(args == null ? Map.of() : args);
-            return McpSchema.CallToolResult.builder().addTextContent(out).isError(false).build();
+            Object result = def.handler().apply(args == null ? Map.of() : args);
+            McpSchema.CallToolResult.Builder b = McpSchema.CallToolResult.builder().addTextContent(Tools.text(result)).isError(false);
+            if (result instanceof Tools.Output o && o.structured() != null) b.structuredContent(o.structured());
+            return b.build();
         } catch (IllegalArgumentException e) {
             return McpSchema.CallToolResult.builder().addTextContent("Error: " + e.getMessage()).isError(true).build();
         } catch (RuntimeException | StackOverflowError | OutOfMemoryError e) {

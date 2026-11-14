@@ -4,7 +4,9 @@ import dev.truthseeker.analysis.*;
 import dev.truthseeker.archive.ClassRepository;
 import dev.truthseeker.archive.Names;
 import dev.truthseeker.symbolic.PathExplorer;
+import dev.truthseeker.testgen.SuiteReport;
 import dev.truthseeker.testgen.TestGenerator;
+import dev.truthseeker.verify.TestVerifier;
 import io.modelcontextprotocol.json.McpJsonDefaults;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.MethodNode;
@@ -17,7 +19,16 @@ import java.util.function.Function;
 public final class Tools {
     private Tools() {}
 
-    public record ToolDef(String name, String title, String description, String schema, Function<Map<String, Object>, String> handler) {}
+    /** A handler returns either a String (Markdown) or an Output (Markdown plus a JSON object for MCP structuredContent). */
+    public record ToolDef(String name, String title, String description, String schema, Function<Map<String, Object>, Object> handler) {}
+
+    /** Tool result: Markdown for the model, plus machine-readable data sent as MCP structuredContent. */
+    public record Output(String text, Map<String, Object> structured) {}
+
+    /** The Markdown text of a handler result. */
+    public static String text(Object result) {
+        return result instanceof Output o ? o.text() : String.valueOf(result);
+    }
 
     private static final String PATH_PROP = """
             "path": {"type": "string", "description": "Absolute path to a .jar, .war, .ear, Spring Boot fat jar, or a directory of .class files (e.g. target/classes). Join several with the OS path separator."}""";
@@ -96,6 +107,7 @@ public final class Tools {
                         ,"expand": {"type": "boolean", "description": "Also emit the fully expanded table over all condition combinations (≤10 conditions)."},
                         "maxPaths": {"type": "integer", "description": "Path exploration cap (default 256)."},
                         "loopBound": {"type": "integer", "description": "Max loop iterations explored per path (default 1)."},
+                        "detail": {"type": "string", "enum": ["summary", "full"], "description": "summary (default): one row per outcome with path counts, side effects listed once, and the recovered logic. full: one decision-table row per path."},
                         "includeLogging": {"type": "boolean", "description": "Keep log.isDebugEnabled()-style guards as decisions (default false: assumed false and hidden)."},
                         "format": {"type": "string", "enum": ["markdown", "json"], "description": "Output format (default markdown)."}""", "path", "className", "method"),
                 a -> {
@@ -110,9 +122,11 @@ public final class Tools {
                     for (MethodNode mn : ms) {
                         PathExplorer.Result r = PathExplorer.explore(repo, cn, mn, o);
                         if (json) structured.add(TruthTables.structured(r));
-                        else sb.append(TruthTables.markdown(r, bool(a, "expand", false))).append("\n");
+                        else sb.append(TruthTables.markdown(r, bool(a, "expand", false), "full".equalsIgnoreCase(str(a, "detail")))).append("\n");
                     }
-                    return json ? toJson(structured.size() == 1 ? structured.get(0) : structured) : sb.toString();
+                    if (!json) return sb.toString();
+                    Map<String, Object> obj = structured.size() == 1 ? asMap(structured.get(0)) : Map.of("methods", structured);
+                    return new Output(toJson(obj), obj);
                 }));
 
         t.add(new ToolDef("state_machine", "Infer state machine",
@@ -140,47 +154,107 @@ public final class Tools {
                     }
                     var machines = StateMachines.analyze(repo, classes,
                             new StateMachines.Options(str(a, "enumType"), str(a, "stateField"), str(a, "packagePrefix"), integer(a, "maxPathsPerMethod", 64)));
-                    if ("json".equalsIgnoreCase(str(a, "format"))) return toJson(StateMachines.structured(machines));
+                    if ("json".equalsIgnoreCase(str(a, "format"))) {
+                        Map<String, Object> obj = Map.of("machines", StateMachines.structured(machines));
+                        return new Output(toJson(obj), obj);
+                    }
                     return "# Inferred state machines (" + classes.size() + " classes analyzed)\n\n"
                             + StateMachines.render(machines, Optional.ofNullable(str(a, "format")).orElse("mermaid"));
                 }));
 
         t.add(new ToolDef("generate_unit_tests", "Generate unit tests",
-                "Generate a JUnit 5 + Mockito test class for a class (or selected methods): one test per symbolic execution path, "
+                "Generate JUnit 5 + Mockito test classes (one per class): one test per symbolic execution path, "
                         + "with parameter values solved from branch conditions, collaborator stubs (incl. Optional/Spring Data and BigDecimal "
                         + "compareTo idioms), assertions on return values / exceptions / state-field writes, and verify() of collaborator side "
-                        + "effects. Unresolvable preconditions are emitted as precise TODO comments. Tests target Java 17+, JUnit Jupiter and "
-                        + "Mockito 5. Optionally writes the file under outputDir (e.g. src/test/java).",
+                        + "effects. Tests whose preconditions cannot be arranged automatically are emitted @Disabled with precise TODOs. "
+                        + "With outputDir, files are written and only a compact summary is returned (disabled tests grouped by cause); "
+                        + "then call verify_tests on the same outputDir. Tests target Java 17+, JUnit Jupiter and Mockito 5.",
                 schema(PATH_PROP + "," + CLASS_PROP + """
-                        ,"methods": {"type": "array", "items": {"type": "string"}, "description": "Optional method names to cover; default all non-private methods."},
+                        ,"classNames": {"type": "array", "items": {"type": "string"}, "description": "Several classes in one call (instead of className)."},
+                        "methods": {"type": "array", "items": {"type": "string"}, "description": "Optional method names to cover; default all non-private methods."},
                         "maxPathsPerMethod": {"type": "integer", "description": "Path exploration cap per method (default 64)."},
                         "maxTestsPerMethod": {"type": "integer", "description": "Max generated tests per method (default 24)."},
                         "includeTruncated": {"type": "boolean", "description": "Also emit tests for paths whose analysis was cut short (default false)."},
-                        "outputDir": {"type": "string", "description": "Optional test source root to write the file into (package folders are created). Existing files are not overwritten."}""",
-                        "path", "className"),
+                        "outputDir": {"type": "string", "description": "Test source root to write files into (package folders are created). Recommended: keeps the response small."},
+                        "overwrite": {"type": "boolean", "description": "Replace existing generated files in outputDir (default false)."},
+                        "includeSource": {"type": "boolean", "description": "Also return the generated source (default: only when outputDir is not given)."}""",
+                        "path"),
                 a -> {
                     ClassRepository repo = repo(a);
-                    ClassNode cn = repo.require(str(a, "className"));
-                    String code = TestGenerator.generate(repo, cn, new TestGenerator.Options(list(a, "methods"),
-                            integer(a, "maxPathsPerMethod", 64), integer(a, "maxTestsPerMethod", 24), bool(a, "includeTruncated", false)));
+                    List<String> names = new ArrayList<>(list(a, "classNames"));
+                    if (str(a, "className") != null) names.add(0, str(a, "className"));
+                    if (names.isEmpty()) throw new IllegalArgumentException("'className' or 'classNames' is required");
                     String out = str(a, "outputDir");
-                    String header = "";
-                    if (out != null) {
+                    boolean includeSource = bool(a, "includeSource", out == null);
+                    TestGenerator.Options opts = new TestGenerator.Options(list(a, "methods"),
+                            integer(a, "maxPathsPerMethod", 64), integer(a, "maxTestsPerMethod", 24), bool(a, "includeTruncated", false));
+                    List<TestGenerator.Suite> suites = new ArrayList<>();
+                    List<String> written = new ArrayList<>();
+                    List<String> files = new ArrayList<>();
+                    for (String name : names) {
+                        ClassNode cn = repo.require(name);
+                        TestGenerator.Suite suite = TestGenerator.generateSuite(repo, cn, opts);
+                        suites.add(suite);
+                        if (out == null) continue;
                         java.nio.file.Path dir = java.nio.file.Path.of(out).resolve(Names.packageOf(cn.name).replace('.', '/'));
                         java.nio.file.Path file = dir.resolve(Names.simple(cn.name) + "GeneratedTest.java");
                         try {
                             Files.createDirectories(dir);
-                            if (Files.exists(file)) header = "> Not written: `" + file + "` already exists.\n\n";
-                            else {
-                                Files.writeString(file, code);
-                                header = "> Written to `" + file + "`\n\n";
+                            if (Files.exists(file) && !bool(a, "overwrite", false)) {
+                                written.add("Not written (exists; pass overwrite=true): `" + file + "`");
+                            } else {
+                                Files.writeString(file, suite.code());
+                                files.add(file.toString());
                             }
                         } catch (java.io.IOException ex) {
-                            header = "> Could not write to " + file + ": " + ex.getMessage() + "\n\n";
+                            written.add("Could not write " + file + ": " + ex.getMessage());
                         }
                     }
-                    return header + "```java\n" + code + "```\n\nRequired test dependencies: org.junit.jupiter:junit-jupiter, "
-                            + "org.mockito:mockito-junit-jupiter (Mockito 5+).\n";
+                    if (!files.isEmpty()) {
+                        written.add(0, "Wrote " + files.size() + " file(s) under `" + out + "`: "
+                                + files.stream().map(f -> java.nio.file.Path.of(f).getFileName().toString()).collect(java.util.stream.Collectors.joining(", ")));
+                    }
+                    StringBuilder text = new StringBuilder(SuiteReport.markdown(suites, written));
+                    if (includeSource) {
+                        for (TestGenerator.Suite s : suites) text.append("\n```java\n").append(s.code()).append("```\n");
+                        text.append("\nRequired test dependencies: org.junit.jupiter:junit-jupiter, org.mockito:mockito-junit-jupiter (Mockito 5+).\n");
+                    }
+                    Map<String, Object> structured = new LinkedHashMap<>();
+                    structured.put("classes", suites.stream().map(s -> {
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("testClass", s.className());
+                        m.put("tests", s.tests());
+                        m.put("disabled", s.disabled().size());
+                        m.put("paths", s.paths());
+                        return m;
+                    }).toList());
+                    structured.put("files", files);
+                    return new Output(text.toString(), structured);
+                }));
+        t.add(new ToolDef("verify_tests", "Verify tests",
+                "Compile test sources (e.g. the outputDir of generate_unit_tests) against an application archive and run them on "
+                        + "JUnit 5 in a separate JVM; report passed / failed / disabled with failures grouped by cause and disabled tests "
+                        + "grouped by unresolved precondition. The classpath is derived from the archive (Spring Boot BOOT-INF, WAR "
+                        + "WEB-INF, EAR modules); JUnit and Mockito are bundled. Files that do not compile are reported and the rest still "
+                        + "run. Use extraClasspath for `provided` APIs (jakarta.*/javax.*) missing from the archive. "
+                        + "NOTE: this executes the application's code in a child JVM.",
+                schema(PATH_PROP + """
+                        ,"testDir": {"type": "string", "description": "Directory containing the test .java sources (searched recursively)."},
+                        "extraClasspath": {"type": "string", "description": "Additional classpath entries joined with the OS path separator, e.g. provided container APIs."},
+                        "timeoutSeconds": {"type": "integer", "description": "Kill the test JVM after this many seconds (default 300)."}""",
+                        "path", "testDir"),
+                a -> {
+                    TestVerifier.Options o = new TestVerifier.Options(str(a, "path"), str(a, "testDir"), str(a, "extraClasspath"),
+                            integer(a, "timeoutSeconds", 300));
+                    try {
+                        TestVerifier.Result r = TestVerifier.verify(o);
+                        return new Output(TestVerifier.markdown(o, r), TestVerifier.structured(r));
+                    } catch (java.io.IOException e) {
+                        throw new IllegalArgumentException("verify_tests failed: " + e.getMessage(), e);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("interrupted", e);
+                    }
                 }));
         return t;
     }
@@ -190,7 +264,8 @@ public final class Tools {
                 truth-seeker analyzes compiled Java applications (Java 1.x through 25 bytecode; best for Spring, Jakarta/Java EE and legacy J2EE)
                 purely from bytecode — nothing from the target app is loaded or executed, and source code is not required.
                 Suggested workflow: scan_archive → list_endpoints → describe_class on interesting components → truth_table / state_machine
-                on business logic → generate_unit_tests to pin behaviour before refactoring or migrating. Use call_graph to follow a request
+                on business logic → generate_unit_tests (with outputDir) to pin behaviour, then verify_tests on that outputDir to
+                compile and run them and see what still needs arranging. Use call_graph to follow a request
                 through layers and disassemble when you need ground truth. Every tool takes `path` (jar/war/ear/classes dir); indexes are
                 cached per path, so repeated calls are fast. Analyses are static approximations: catch blocks are not explored, loops are
                 bounded and callee bodies are not inlined — state these limits when presenting results.
@@ -244,6 +319,11 @@ public final class Tools {
         if (v == null) return List.of();
         if (v instanceof List<?> l) return l.stream().map(String::valueOf).toList();
         return Arrays.stream(String.valueOf(v).split(",")).map(String::trim).filter(s -> !s.isEmpty()).toList();
+    }
+
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> asMap(Object o) {
+        return (Map<String, Object>) o;
     }
 
     static String toJson(Object o) {

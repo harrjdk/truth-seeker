@@ -24,7 +24,7 @@ final class TestSupport {
         args.put("path", fixtures().toString());
         for (int i = 0; i + 1 < kv.length; i += 2) args.put((String) kv[i], kv[i + 1]);
         Tools.ToolDef def = Tools.all().stream().filter(t -> t.name().equals(tool)).findFirst().orElseThrow();
-        return def.handler().apply(args);
+        return Tools.text(def.handler().apply(args));
     }
 
     static String testClasspath() {

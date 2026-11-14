@@ -86,7 +86,7 @@ class InventoryToolsTest {
         assertEquals("app.war!/WEB-INF/lib/notify.jar!/fixtures/order/Notifier.class", repo.entry("fixtures/order/Notifier").orElseThrow().origin());
 
         Tools.ToolDef endpoints = Tools.all().stream().filter(t -> t.name().equals("list_endpoints")).findFirst().orElseThrow();
-        String md = endpoints.handler().apply(Map.of("path", war.toString()));
+        String md = Tools.text(endpoints.handler().apply(Map.of("path", war.toString())));
         assertTrue(md.contains("`/legacy/*` | `legacy → LegacyServlet`"), md);
         assertTrue(md.contains("`/checkout` | `CheckoutAction`"), md);
         assertFalse(md.contains("commented-out"), md);

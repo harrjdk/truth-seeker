@@ -55,6 +55,6 @@ class StateMachineTest {
     @Test
     void jsonFormat() {
         String json = TestSupport.run("state_machine", "className", "Door", "format", "json");
-        assertTrue(json.startsWith("[{\"enum\":\"fixtures.door.Door$State\""), json);
+        assertTrue(json.startsWith("{\"machines\":[{\"enum\":\"fixtures.door.Door$State\""), json);
     }
 }

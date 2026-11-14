@@ -17,10 +17,21 @@ public final class TruthTables {
     private TruthTables() {}
 
     public static String markdown(PathExplorer.Result r, boolean expand) {
+        return markdown(r, expand, true);
+    }
+
+    /**
+     * @param full true: one decision-table row per path. false (summary): one row per outcome with path counts and
+     *             side effects listed once — usually all an LLM needs, at a fraction of the tokens.
+     */
+    public static String markdown(PathExplorer.Result r, boolean expand, boolean full) {
         StringBuilder sb = new StringBuilder();
         String sig = Names.methodSignature(r.method().name, r.method().desc);
-        sb.append("## Truth table: `").append(Names.simple(r.owner())).append(".").append(sig.substring(sig.indexOf(' ') + 1)).append("`\n\n");
         List<String> cols = columns(r.paths());
+        long outcomes = r.paths().stream().map(p -> p.outcome().describe()).distinct().count();
+        sb.append("## Truth table: `").append(Names.simple(r.owner())).append(".").append(sig.substring(sig.indexOf(' ') + 1)).append("`\n\n");
+        sb.append(r.paths().size()).append(" paths").append(r.truncated() ? " (limit reached)" : "").append(", ")
+                .append(cols.size()).append(" conditions, ").append(outcomes).append(" distinct outcomes\n\n");
         if (r.paths().isEmpty()) {
             sb.append("_No paths explored._\n");
             appendNotes(sb, r);
@@ -39,20 +50,48 @@ public final class TruthTables {
             sb.append("\nwhere (locals from debug info):\n\n");
             aliases.forEach((k, v) -> sb.append("- `").append(k).append("` = `").append(v).append("`\n"));
         }
-        sb.append("\n**Decision table** (one row per feasible path; `-` = not evaluated on that path)\n\n|Path|");
-        for (int i = 0; i < cols.size(); i++) sb.append("C").append(i + 1).append("|");
-        sb.append("Outcome|Side effects|\n|---|");
-        sb.append("---|".repeat(cols.size())).append("---|---|\n");
-        for (Path p : r.paths()) {
-            sb.append("|P").append(p.id()).append("|");
-            for (String c : cols) sb.append(escape(p.cond(c).map(Cond::value).orElse("-"))).append("|");
-            sb.append("`").append(escape(p.outcome().describe())).append("`|").append(escape(effectSummary(p))).append("|\n");
+        if (full) {
+            sb.append("\n**Decision table** (one row per feasible path; `-` = not evaluated on that path)\n\n|Path|");
+            for (int i = 0; i < cols.size(); i++) sb.append("C").append(i + 1).append("|");
+            sb.append("Outcome|Side effects|\n|---|");
+            sb.append("---|".repeat(cols.size())).append("---|---|\n");
+            for (Path p : r.paths()) {
+                sb.append("|P").append(p.id()).append("|");
+                for (String c : cols) sb.append(escape(p.cond(c).map(Cond::value).orElse("-"))).append("|");
+                sb.append("`").append(escape(p.outcome().describe())).append("`|").append(escape(effectSummary(p))).append("|\n");
+            }
+        } else {
+            appendOutcomeSummary(sb, r);
         }
 
         if (expand) appendExpanded(sb, r, cols);
         appendFormulas(sb, r, cols);
         appendNotes(sb, r);
+        if (!full) sb.append("\n_Pass `detail: \"full\"` for the per-path decision table._\n");
         return sb.toString();
+    }
+
+    /** One row per outcome: which paths lead there and the side effects, each listed once. */
+    private static void appendOutcomeSummary(StringBuilder sb, PathExplorer.Result r) {
+        Map<String, List<Path>> byOutcome = new LinkedHashMap<>();
+        for (Path p : r.paths()) byOutcome.computeIfAbsent(p.outcome().describe(), k -> new ArrayList<>()).add(p);
+        sb.append("\n**Outcomes**\n\n| Outcome | Paths | Side effects (all paths / *some paths*) |\n|---|---|---|\n");
+        for (var e : byOutcome.entrySet()) {
+            List<Path> ps = e.getValue();
+            List<Set<String>> perPath = ps.stream()
+                    .map(p -> (Set<String>) p.effects().stream().map(Effect::text).collect(Collectors.toCollection(LinkedHashSet::new)))
+                    .toList();
+            LinkedHashSet<String> union = new LinkedHashSet<>();
+            perPath.forEach(union::addAll);
+            List<String> cells = new ArrayList<>();
+            for (String ef : union) {
+                String t = ef.length() > 90 ? ef.substring(0, 87) + "..." : ef;
+                boolean always = perPath.stream().allMatch(s -> s.contains(ef));
+                cells.add(always ? "`" + t + "`" : "*`" + t + "`*");
+            }
+            String ids = ps.size() <= 6 ? ps.stream().map(p -> "P" + p.id()).collect(Collectors.joining(", ")) : ps.size() + " paths";
+            sb.append("| `").append(escape(e.getKey())).append("` | ").append(ids).append(" | ").append(escape(String.join("; ", cells))).append(" |\n");
+        }
     }
 
     /** Local-variable aliases appearing in conditions or outcomes, with the expression they stand for. */
