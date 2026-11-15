@@ -47,7 +47,7 @@ class GeneratedTestsExecutionTest {
                 // try/catch: thenThrow/doThrow on collaborators, parser input, throws inside inlined helpers
                 "fixtures.legacy.AccountService",
                 // constructors of other classes and rules held by enum constants
-                "fixtures.legacy.ShipmentEventFactory", "fixtures.legacy.ShipmentEvent", "fixtures.legacy.Waybill", "fixtures.legacy.CustomerController", "fixtures.legacy.Roster", "fixtures.legacy.BatchJob", "fixtures.legacy.MessageBoard", "fixtures.legacy.OrderDesk", "fixtures.legacy.SignupValidator", "fixtures.legacy.AccountDesk",
+                "fixtures.legacy.ShipmentEventFactory", "fixtures.legacy.ShipmentEvent", "fixtures.legacy.Waybill", "fixtures.legacy.CustomerController", "fixtures.legacy.Roster", "fixtures.legacy.BatchJob", "fixtures.legacy.MessageBoard", "fixtures.legacy.OrderDesk", "fixtures.legacy.SignupValidator", "fixtures.legacy.AccountDesk", "fixtures.legacy.Kennel",
                 // typed list elements, null elements, stream pipelines, date ordering, paged results
                 "fixtures.legacy.Schedule", "fixtures.legacy.History", "fixtures.legacy.Deadline", "fixtures.legacy.CustomerSearch",
                 // JPetStore-shaped: iterator loops, map fields, objects built on the path, session attributes

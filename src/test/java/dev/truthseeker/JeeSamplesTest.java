@@ -84,4 +84,20 @@ class JeeSamplesTest {
         // the same rejection made before the save and again in its catch block is counted
         assertTrue(code.contains("verify(errors, times(2)).rejectValue(eq(\"name\"), eq(\"required\"));"), code);
     }
+
+    @Test
+    void ownStateAndFoundMembersAreChecked() throws Exception {
+        String code = generate("fixtures.legacy.Kennel");
+        // a constant message is asserted, for JDK exceptions and ones that pass it on unchanged
+        assertTrue(code.contains("assertEquals(\"No dog to admit\", thrown.getMessage());"), code);
+        assertTrue(code.contains("assertEquals(\"Portion must be positive\", thrown.getMessage());"), code);
+        // the subject's own list afterwards: added to, or left as it was
+        // (already there: unchanged; not there yet: added)
+        String unchangedOrAdded = "assertEquals(List.of(dog), getField(subject, \"dogs\"));";
+        assertTrue(code.indexOf(unchangedOrAdded) != code.lastIndexOf(unchangedOrAdded), code);
+        // the member a loop found on the first try gets the call
+        assertTrue(code.contains("verify(dog1, atLeastOnce()).feed(eq(grams));") || code.contains("verify(dog1, atLeastOnce()).feed(eq(1));"), code);
+        // a getter that changes nothing does not assert the list
+        assertFalse(code.substring(code.indexOf("void size_")).split("@Test")[0].contains("getField(subject, \"dogs\")"), code);
+    }
 }

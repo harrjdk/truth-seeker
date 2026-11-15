@@ -12,6 +12,7 @@ import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.LocalVariableNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.MethodInsnNode;
 
 import java.util.*;
 import java.util.regex.Pattern;
@@ -1347,7 +1348,12 @@ public final class TestGenerator {
         void ensureImplicit() {
             requireDereferencedParams();
             // everything recorded on a throwing path happened before the throw; only an NPE path may rely on a null
-            if (p.outcome().kind() == Path.OutcomeKind.THROW && "java/lang/NullPointerException".equals(p.outcome().exceptionType())) return;
+            if (p.outcome().kind() == Path.OutcomeKind.THROW && "java/lang/NullPointerException".equals(p.outcome().exceptionType())) {
+                // but what it dereferenced before the throw was there (cargo.getRouteSpecification() in
+                // new RouteSpecification(cargo.getOrigin(), cargo.getRouteSpecification().getDestination(), ..))
+                for (Expr d : p.dereferenced()) if (loops.stream().noneMatch(l -> d.mentions(l::isElement))) requireNonNull(d);
+                return;
+            }
             List<Expr> roots = new ArrayList<>();
             for (Effect ef : p.effects()) {
                 if (ef.target() != null) roots.add(ef.target());
@@ -2360,7 +2366,9 @@ public final class TestGenerator {
             String act;
             Path.Outcome o = p.outcome();
             if (o.kind() == Path.OutcomeKind.THROW) {
-                act = "assertThrows(" + imports.ref(o.exceptionType()) + ".class, () -> " + invoke + ");";
+                String message = constantMessage(o);
+                act = (message != null ? "var thrown = " : "") + "assertThrows(" + imports.ref(o.exceptionType()) + ".class, () -> " + invoke + ");";
+                if (message != null) asserts.add("assertEquals(" + message + ", thrown.getMessage());");
             } else if (ret.getSort() == Type.VOID || o.kind() != Path.OutcomeKind.RETURN) {
                 act = invoke + ";";
             } else {
@@ -2415,6 +2423,38 @@ public final class TestGenerator {
             }
             sb.append("    }\n");
             return fillElements(sb.toString());
+        }
+
+        /**
+         * The message of a thrown {@code new X("literal")}, when X keeps it as is: a JDK exception, or one whose
+         * (String) constructor only passes it to its superclass. Null otherwise.
+         */
+        String constantMessage(Path.Outcome o) {
+            Expr v = o.value();
+            if (v == null || v.kind != Expr.Kind.NEW || !"(Ljava/lang/String;)V".equals(v.memberDesc) || v.args == null
+                    || v.args.size() != 1 || v.args.get(0).kind != Expr.Kind.CONST || !(v.args.get(0).value instanceof String)) return null;
+            if (!keepsMessage(v.owner, 0)) return null;
+            return literalOf(v.args.get(0));
+        }
+
+        boolean keepsMessage(String type, int depth) {
+            if (type.startsWith("java/") || type.startsWith("javax/") || type.startsWith("jakarta/")) return true;
+            if (depth > 4) return false;
+            ClassNode c = repo.node(type);
+            if (c == null || c.superName == null) return false;
+            for (MethodNode m : c.methods) {
+                if (!m.name.equals("<init>") || !m.desc.equals("(Ljava/lang/String;)V")) continue;
+                List<Integer> ops = new ArrayList<>();
+                MethodInsnNode sup = null;
+                for (AbstractInsnNode in = m.instructions.getFirst(); in != null; in = in.getNext()) {
+                    if (in.getOpcode() < 0) continue;
+                    ops.add(in.getOpcode());
+                    if (in instanceof MethodInsnNode mi) sup = mi;
+                }
+                return ops.equals(List.of(Opcodes.ALOAD, Opcodes.ALOAD, Opcodes.INVOKESPECIAL, Opcodes.RETURN)) && sup != null
+                        && sup.owner.equals(c.superName) && sup.desc.equals("(Ljava/lang/String;)V") && keepsMessage(c.superName, depth + 1);
+            }
+            return false;
         }
 
         String defaultFor(Type t) {
@@ -3556,6 +3596,7 @@ public final class TestGenerator {
                 else if (t.expansion() == null && ensured.containsKey(t.text)) mockVar = ensured.get(t.text);
                 else if (ensured.containsKey(canon(t))) mockVar = ensured.get(canon(t)); // a local alias: Cargo cargo = repo.find(id)
                 else if (t.kind == Expr.Kind.PARAM && isMockParam(t.index)) mockVar = paramVars.get(t.index);
+                else mockVar = foundElement(t);
                 if (mockVar == null) continue;
                 boolean isVoid = Type.getReturnType(e.desc()).getSort() == Type.VOID;
                 if (!isVoid && !MUTATOR.matcher(e.name()).matches()) continue;
@@ -3574,7 +3615,75 @@ public final class TestGenerator {
                 String[] parts = v.split(" ", 2);
                 out.add("verify(" + parts[0] + (n >= 2 ? ", times(" + n + "))" : ", atLeastOnce())") + parts[1]);
             }
+            out.addAll(expectOwnLists());
             if (p.outcome().kind() != Path.OutcomeKind.THROW) out.addAll(expectAbsent());
+            return out;
+        }
+
+        /**
+         * The mock element a driven loop stopped at, when that is unambiguous: the loop took exactly one element and
+         * left early ({@code for (Pet pet : pets) if (..) return pet;} found on the first try), so every call on the
+         * element was made on that one. Null otherwise.
+         */
+        String foundElement(Expr t) {
+            for (Loop loop : loops) {
+                if (!loop.isElement(t) || loop.elements.isEmpty()) continue;
+                int taken = 0;
+                Boolean lastHasNext = null;
+                for (Cond c : p.conds()) {
+                    if (!loop.isHasNext(c.left())) continue;
+                    lastHasNext = c.isTrue();
+                    if (c.isTrue()) taken++;
+                }
+                String v = loop.elements.get(0);
+                return taken == 1 && Boolean.TRUE.equals(lastHasNext) && ensured.containsKey(v) ? v : null;
+            }
+            return null;
+        }
+
+        /**
+         * Lists of the subject the test filled ({@code setField(subject, "pets", new ArrayList<>(List.of(pet1)))}) and the
+         * path only appends to: their contents afterwards, the arranged elements plus what was added, in order. A list
+         * the path does not touch must be unchanged. Skipped when anything else could reach the list.
+         */
+        List<String> expectOwnLists() {
+            List<String> out = new ArrayList<>();
+            if (isStatic || p.outcome().kind() == Path.OutcomeKind.TRUNCATED || selfCall() != null) return out;
+            Pattern lit = Pattern.compile("setField\\(subject, \"(\\w+)\", new (?:ArrayList|LinkedList)<>\\((?:List\\.of\\(([^()]*)\\))?\\)\\);");
+            Set<String> seen = new HashSet<>();
+            for (String a : arrange) {
+                var m = lit.matcher(a);
+                if (!m.matches() || !seen.add(m.group(1))) continue;
+                String name = m.group(1);
+                FieldNode fn = cn.fields.stream().filter(fd -> fd.name.equals(name)).findFirst().orElse(null);
+                if (fn == null || !fn.desc.startsWith("Ljava/util/")) continue;
+                List<String> elems = new ArrayList<>();
+                if (m.group(2) != null && !m.group(2).isBlank()) for (String e : m.group(2).split(",")) elems.add(e.trim());
+                java.util.function.Predicate<Expr> isField = x -> x.kind == Expr.Kind.FIELD && name.equals(x.name)
+                        && x.target != null && x.target.kind == Expr.Kind.THIS;
+                boolean ok = true;
+                for (Effect ef : p.effects()) {
+                    boolean onIt = ef.target() != null && isField.test(ef.target());
+                    boolean mentions = (ef.target() != null && !onIt && ef.target().mentions(isField))
+                            || ef.args().stream().anyMatch(x -> x.mentions(isField))
+                            || (ef.value() != null && ef.value().mentions(isField));
+                    if (ef.kind() == Effect.Kind.FIELD_WRITE && ef.target() != null && ef.target().kind == Expr.Kind.THIS && name.equals(ef.name())) mentions = true;
+                    if (mentions) { ok = false; break; }
+                    if (!onIt || ef.kind() != Effect.Kind.CALL) continue;
+                    if (!ef.name().equals("add") || ef.args().size() != 1) { ok = false; break; }
+                    String el = elementValue(ef.args().get(0), 1);
+                    if (el == null) { ok = false; break; }
+                    elems.add(el);
+                }
+                if (!ok || (p.outcome().value() != null && p.outcome().value().mentions(isField))) continue;
+                // unchanged is only worth saying where some path of this method does change it
+                boolean changes = r.paths().stream().anyMatch(o -> o.effects().stream()
+                        .anyMatch(ef -> ef.target() != null && isField.test(ef.target()) && ef.kind() == Effect.Kind.CALL));
+                if (!changes) continue;
+                needsGetField = true;
+                imports.add("java.util.List");
+                out.add("assertEquals(List.of(" + String.join(", ", elems) + "), getField(subject, \"" + name + "\"));");
+            }
             return out;
         }
 
