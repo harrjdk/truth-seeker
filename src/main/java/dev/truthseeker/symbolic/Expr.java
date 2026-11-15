@@ -155,6 +155,14 @@ public final class Expr {
         return new Expr(Kind.LAMBDA, text, desc, null, null, null, null, null, null, -1, null);
     }
 
+    /**
+     * A lambda or method reference with what it runs: the implementation method ({@code owner.name memberDesc}, handle
+     * kind in {@code index}) and the values it captured ({@code args}), so its body can be applied to an element later.
+     */
+    public static Expr lambda(String text, String desc, String implOwner, String implName, String implDesc, int handleKind, List<Expr> captured) {
+        return new Expr(Kind.LAMBDA, text, desc, null, implOwner, implName, implDesc, null, captured, handleKind, null);
+    }
+
     public static Expr switchIndex(Expr selector, List<String> labels, String enumOwner) {
         return new Expr(Kind.SWITCH_INDEX, "switchIndex(" + selector.text + ")", "I", null, enumOwner, null, null, selector, null, -1, labels);
     }
@@ -242,6 +250,16 @@ public final class Expr {
      */
     public Expr substitute(java.util.function.Predicate<Expr> match, Expr replacement) {
         if (match.test(this)) return replacement;
+        if (kind == Kind.NEW && !isUninitialized() && owner != null && memberDesc != null) {
+            List<Expr> as = args.stream().map(a -> a.substitute(match, replacement)).toList();
+            boolean same = true;
+            for (int i = 0; same && i < as.size(); i++) same = as.get(i) == args.get(i);
+            return same ? this : newObject(owner, memberDesc, as).withExtra(extra);
+        }
+        if (kind == Kind.BINARY && args.size() == 2 && name != null) {
+            Expr a = args.get(0).substitute(match, replacement), b = args.get(1).substitute(match, replacement);
+            return a == args.get(0) && b == args.get(1) ? this : binary(name, a, b, desc);
+        }
         if (kind != Kind.CALL && kind != Kind.FIELD) return this;
         Expr t = target == null ? null : target.substitute(match, replacement);
         List<Expr> as = args.stream().map(a -> a.substitute(match, replacement)).toList();

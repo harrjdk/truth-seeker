@@ -98,10 +98,9 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 | [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 |
 
 Every generated test arranges its path. Expected values are rebuilt from what the test controls (see below); 3
-PetClinic and 4 Cargo Tracker tests (none in JPetStore) still end with `assertNotNull(result)` (or no assertion) and a
+PetClinic and 2 Cargo Tracker tests (none in JPetStore) still end with `assertNotNull(result)` (or no assertion) and a
 `TODO` naming the expected expression, because the result comes from a constructor too deep to follow
-(`new Delivery(..)`), runs a lambda over a non-empty collection, reads the clock, or formats through a library
-(`ToStringCreator`).
+(`new Delivery(..)`), reads the clock, or formats through a library (`ToStringCreator`).
 
 ## Build
 
@@ -217,7 +216,7 @@ What the test generator arranges:
 - lists and sets the method creates and fills with `add`/`addAll` are expected back with the same elements; a collaborator's collection it copies from is stubbed with one mock element (`when(mapper.search(any())).thenReturn(new ArrayList<>(List.of(product)))` … `assertEquals(List.of(product), result)`)
 - a Spring MVC `ModelAndView` the method builds: the view name from the constructor or `setViewName`, and each `addObject` entry (`assertEquals(owner, result.getModel().get("owner"))`, or `containsValue` when the name comes from the value's class)
 - mocks returned by stubs get a variable, so a result that passes one through is asserted with `assertSame`
-- iterators and stream pipelines over the subject's own collections are evaluated on elements the test puts there: `items.iterator()` yields the one arranged mock, `specialties.stream().sorted(..).collect(toList())` returns it as a list, and steps that run a lambda per element (`map(..).reduce(BigDecimal.ZERO, BigDecimal::add)`, `anyMatch`) are decided on an empty collection
+- iterators and stream pipelines over the subject's own collections are evaluated on elements the test puts there: `items.iterator()` yields the one arranged mock, `specialties.stream().sorted(..).collect(toList())` returns it as a list, and steps that run a lambda per element apply its body to the arranged element: method references become calls on it, `lambda$..` bodies are explored with their captured values, predicates are arranged to hold (`leg -> leg.getLoadLocation().equals(event.getLocation()) && ..` takes the path returning true, each `equals` satisfied by returning the same mock), and mappings yield the body's value (`assertEquals(BigDecimal.ZERO.add(BigDecimal.ONE.multiply(new BigDecimal(1))), result)` for a cart subtotal)
 - static constants: accessible `static final` fields by name (`BigDecimal.ZERO`), private ones re-created from a literal initializer (`DateTimeFormatter.ofPattern("yyyy/MM/dd HH:mm:ss")`); queries on an empty collection fold to their value (`size()` → `0`)
 - `equals`-style comparisons with another instance of the subject's class (`Objects.equals(this.voyage, o.voyage)`): a second real instance, with equal or distinct field values set on both
 

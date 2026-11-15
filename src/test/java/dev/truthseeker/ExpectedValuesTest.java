@@ -76,8 +76,17 @@ class ExpectedValuesTest {
         String code = generate("fixtures.legacy.Roster");
         // an iterator over one arranged element yields exactly it
         assertTrue(code.contains("result.forEachRemaining(remaining::add);") && code.contains("assertEquals(List.of(member), remaining);"), code);
-        // a per-element lambda is only decided on an empty list: the reduction's identity
-        assertTrue(code.contains("assertEquals(BigDecimal.ZERO, result);"), code);
+        // lambdas run on the one arranged element: a method reference mapping, then the reduction
+        assertTrue(code.contains("when(member.getFee()).thenReturn(BigDecimal.ONE);") && code.contains("assertEquals(BigDecimal.ZERO.add(BigDecimal.ONE), result);"), code);
+        // a capturing predicate made to hold: equals is arranged through the value it compares with
+        assertTrue(code.contains("when(member.getName()).thenReturn(name);"), code);
+        assertTrue(code.contains("when(member.isActive()).thenReturn(true);") && code.contains("assertEquals(1L, result);"), code);
+        // a mapping lambda's body, with the captured parameter
+        assertTrue(code.contains("assertEquals(BigDecimal.ZERO.add(BigDecimal.ONE.multiply(rate)), result);"), code);
+        // a lambda with && takes the path that returns true: both comparisons arranged to hold
+        assertTrue(code.contains("when(member.getHome()).thenReturn(home);"), code);
+        // a value-type constructor inside the mapping lambda
+        assertTrue(code.contains("assertEquals(BigDecimal.ZERO.add(BigDecimal.ONE.multiply(new BigDecimal(1))), result);"), code);
         // sorting one element, and the lazily created empty set
         assertTrue(code.contains("assertEquals(List.of(member), result);") && code.contains("assertEquals(List.of(), result);"), code);
         // a private formatter constant re-created from its initializer

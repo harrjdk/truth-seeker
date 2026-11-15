@@ -17,6 +17,12 @@ public class Roster {
         String getName();
 
         BigDecimal getFee();
+
+        boolean isActive();
+
+        String getHome();
+
+        int getVisits();
     }
 
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyy/MM/dd");
@@ -42,6 +48,28 @@ public class Roster {
 
     public List<Member> getGuests() {
         return getGuestsInternal().stream().sorted(Comparator.comparing(Member::getName)).collect(Collectors.toList());
+    }
+
+    public boolean hasMember(String name) {
+        return members.stream().anyMatch(m -> m.getName().equals(name));
+    }
+
+    public long countActive() {
+        return members.stream().filter(Member::isActive).count();
+    }
+
+    public BigDecimal totalWithTax(BigDecimal rate) {
+        return members.stream().map(m -> m.getFee().multiply(rate)).reduce(BigDecimal.ZERO, BigDecimal::add);
+    }
+
+    /** Cargo Tracker Itinerary.isExpected-shaped: two comparisons joined with && inside the lambda. */
+    public boolean covers(String name, String home) {
+        return members.stream().anyMatch(m -> m.getName().equals(name) && m.getHome().equals(home));
+    }
+
+    /** JPetStore Cart.getSubTotal-shaped: a constructor inside the mapping lambda. */
+    public BigDecimal visitFees() {
+        return members.stream().map(m -> m.getFee().multiply(new BigDecimal(m.getVisits()))).reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
     public String openedStamp() {

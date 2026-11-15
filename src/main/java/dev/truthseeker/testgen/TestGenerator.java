@@ -2448,6 +2448,9 @@ public final class TestGenerator {
         List<String> expectPipeline(Expr v, Type ret) {
             Pipeline pl = pipeline(v);
             if (pl == null) return List.of();
+            if (!pl.iterator() && ret.getSort() == Type.BOOLEAN && Set.of("true", "false").contains(pl.expected())) {
+                return List.of(pl.expected().equals("true") ? "assertTrue(result);" : "assertFalse(result);");
+            }
             if (!pl.iterator()) return List.of(assertEqualsTo(pl.expected(), ret));
             imports.add("java.util.ArrayList");
             imports.add("java.util.List");
@@ -2478,7 +2481,7 @@ public final class TestGenerator {
             Pipeline result = null;
             if (src.kind == Expr.Kind.NEW && src.args.isEmpty() && src.owner != null && src.owner.startsWith("java/util/")
                     && renderExpected(src, 1) != null) { // created empty, untouched
-                result = evaluate(steps, List.of());
+                result = evaluate(steps, List.of(), null, false);
             } else if (src.kind == Expr.Kind.FIELD && src.target != null && src.target.kind == Expr.Kind.THIS && !isStatic && src.desc != null) {
                 result = pipelineOverField(src, steps);
             }
@@ -2496,12 +2499,12 @@ public final class TestGenerator {
                 boolean onlyNullChecked = elems.isEmpty() && p.conds().stream()
                         .noneMatch(c -> c.describe().contains(field.text + ".") || c.describe().contains(field.text + " ="));
                 Pipeline one = onlyNullChecked ? withOneElement(field, ft, steps, bound) : null;
-                return one != null ? one : evaluate(steps, elems);
+                return one != null ? one : evaluate(steps, elems, declaredElementType(field), false);
             }
             Pipeline one = withOneElement(field, ft, steps, null);
             if (one != null) return one;
             String empty = iterableLiteral(ft, List.of());
-            Pipeline none = evaluate(steps, List.of());
+            Pipeline none = evaluate(steps, List.of(), null, false);
             if (empty == null || none == null || empty.contains("Iterator")) return null;
             needsSetField = true;
             arrange.add("setField(subject, \"" + field.name + "\", " + empty + ");");
@@ -2512,7 +2515,7 @@ public final class TestGenerator {
         /** Arranges the field with one mock element if the steps can be evaluated on it (replacing an empty non-null literal). */
         Pipeline withOneElement(Expr field, Type ft, List<Expr> steps, String replacing) {
             Type et = declaredElementType(field);
-            if (et == null || !isMockable(et) || evaluate(steps, List.of("x")) == null) return null;
+            if (et == null || !isMockable(et) || evaluate(steps, List.of("x"), et, true) == null) return null;
             if (iterableLiteral(ft, List.of("x")) == null || ft.getInternalName().equals("java/util/Iterator")) return null;
             String setLine = replacing == null ? null : "setField(subject, \"" + field.name + "\", " + replacing + ");";
             if (replacing != null && !arrange.contains(setLine)) return null;
@@ -2522,7 +2525,7 @@ public final class TestGenerator {
             if (setLine != null) arrange.remove(setLine);
             arrange.add("setField(subject, \"" + field.name + "\", " + lit + ");");
             boundLiteral.put(field.text, lit);
-            return evaluate(steps, List.of(v));
+            return evaluate(steps, List.of(v), et, false);
         }
 
         /** Elements of a collection literal this generator wrote ({@code new ArrayList<>(List.of(leg))}), or null. */
@@ -2538,58 +2541,253 @@ public final class TestGenerator {
             return out;
         }
 
-        /** Runs the steps over elements known by name. Null when a step cannot be decided. */
-        Pipeline evaluate(List<Expr> steps, List<String> elems) {
+        /** One element flowing through a pipeline: what the code sees, and how the test names it. */
+        record Elem(Expr expr, String code) {}
+
+        /**
+         * Runs the steps over elements known by name. Steps that run a lambda per element apply its body to the
+         * element: a predicate is arranged to hold (stubs on the mock element), a mapping yields the body's value.
+         * In a dry run nothing is arranged; it only says whether the steps could be decided. Null when a step cannot.
+         */
+        Pipeline evaluate(List<Expr> steps, List<String> names, Type elemType, boolean dry) {
             boolean stream = false;
-            List<String> cur = elems;
+            List<Elem> cur = new ArrayList<>();
+            for (String nm : names) {
+                Expr el = Expr.unknown("\u0000elem:" + nm, elemType == null ? null : elemType.getDescriptor());
+                if (!dry) ensured.put(el.text, nm);
+                cur.add(new Elem(el, nm));
+            }
             for (int i = 0; i < steps.size(); i++) {
                 Expr st = steps.get(i);
                 boolean last = i == steps.size() - 1;
                 String n = st.name;
                 if (i == 0) {
-                    if (n.equals("iterator")) return last ? new Pipeline(listOf(cur), true) : null;
+                    if (n.equals("iterator")) return last ? new Pipeline(listOf(codes(cur)), true) : null;
                     stream = true;
                     continue;
                 }
                 if (!stream || st.owner == null || !st.owner.equals("java/util/stream/Stream")) return null;
                 switch (n) {
                     case "sorted", "distinct" -> { if (cur.size() > 1) return null; }
-                    case "filter", "map", "flatMap", "peek", "mapToInt", "mapToLong", "mapToDouble" -> {
-                        if (!cur.isEmpty() || !st.owner.equals("java/util/stream/Stream")) return null;
-                        if (!n.equals("filter") && !n.equals("map") && !n.equals("flatMap") && !n.equals("peek")) return null;
+                    case "filter" -> {
+                        if (cur.size() > 1 || st.args.size() != 1) return null;
+                        if (!cur.isEmpty()) {
+                            Boolean keep = holds(st.args.get(0), cur.get(0), dry);
+                            if (keep == null) return null;
+                            if (!keep) cur = new ArrayList<>();
+                        }
                     }
-                    case "limit", "skip" -> { if (!cur.isEmpty()) return null; }
-                    case "toList" -> { return last ? new Pipeline(listOf(cur), false) : null; }
+                    case "map" -> {
+                        if (cur.size() > 1 || st.args.size() != 1) return null;
+                        if (!cur.isEmpty()) {
+                            Elem mapped = mapped(st.args.get(0), cur.get(0), dry);
+                            if (mapped == null) return null;
+                            cur = new ArrayList<>(List.of(mapped));
+                        }
+                    }
+                    case "peek", "flatMap", "limit", "skip" -> { if (!cur.isEmpty()) return null; }
+                    case "toList" -> { return last ? new Pipeline(listOf(codes(cur)), false) : null; }
                     case "collect" -> {
                         if (!last || st.args.size() != 1) return null;
                         Expr c = st.args.get(0);
                         if (c.kind != Expr.Kind.CALL || !"java/util/stream/Collectors".equals(c.owner) || !c.args.isEmpty()) return null;
                         return switch (c.name) {
-                            case "toList", "toUnmodifiableList" -> new Pipeline(listOf(cur), false);
+                            case "toList", "toUnmodifiableList" -> new Pipeline(listOf(codes(cur)), false);
                             case "toSet", "toUnmodifiableSet" -> {
                                 imports.add("java.util.Set");
-                                yield new Pipeline("Set.of(" + String.join(", ", cur) + ")", false);
+                                yield new Pipeline("Set.of(" + String.join(", ", codes(cur)) + ")", false);
                             }
                             default -> null;
                         };
                     }
                     case "count" -> { return last ? new Pipeline(cur.size() + "L", false) : null; }
-                    case "anyMatch" -> { return last && cur.isEmpty() ? new Pipeline("false", false) : null; }
-                    case "allMatch", "noneMatch" -> { return last && cur.isEmpty() ? new Pipeline("true", false) : null; }
+                    case "anyMatch", "allMatch", "noneMatch" -> {
+                        if (!last || cur.size() > 1 || st.args.size() != 1) return null;
+                        boolean empty = cur.isEmpty();
+                        if (!empty) { // one element: the predicate decides; arrange it to hold
+                            Boolean h = holds(st.args.get(0), cur.get(0), dry);
+                            if (h == null) return null;
+                            boolean any = h;
+                            return new Pipeline(String.valueOf(n.equals("noneMatch") ? !any : any), false);
+                        }
+                        return new Pipeline(n.equals("anyMatch") ? "false" : "true", false);
+                    }
                     case "findFirst", "findAny" -> {
                         if (!last) return null;
                         imports.add("java.util.Optional");
-                        return new Pipeline(cur.isEmpty() ? "Optional.empty()" : "Optional.of(" + cur.get(0) + ")", false);
+                        return new Pipeline(cur.isEmpty() ? "Optional.empty()" : "Optional.of(" + cur.get(0).code() + ")", false);
                     }
                     case "reduce" -> {
-                        if (!last || st.args.size() != 2 || !cur.isEmpty()) return null;
-                        String identity = renderExpected(st.args.get(0), 1);
-                        return identity == null ? null : new Pipeline(identity, false);
+                        if (!last || cur.size() > 1) return null;
+                        if (st.args.size() == 1) { // reduce(op): the single element, or nothing
+                            imports.add("java.util.Optional");
+                            return new Pipeline(cur.isEmpty() ? "Optional.empty()" : "Optional.of(" + cur.get(0).code() + ")", false);
+                        }
+                        if (st.args.size() != 2) return null;
+                        Expr identity = st.args.get(0);
+                        if (cur.isEmpty()) {
+                            String r = dry ? "x" : renderExpected(identity, 1);
+                            return r == null ? null : new Pipeline(r, false);
+                        }
+                        Expr combined = applyLambda(st.args.get(1), List.of(identity, cur.get(0).expr()));
+                        if (combined == null) return null;
+                        if (dry) return new Pipeline("x", false);
+                        String r = renderExpected(combined, 1);
+                        return r == null ? null : new Pipeline(r, false);
                     }
                     default -> { return null; }
                 }
             }
             return null;
+        }
+
+        static List<String> codes(List<Elem> elems) {
+            return elems.stream().map(Elem::code).toList();
+        }
+
+        /**
+         * Whether a predicate holds for the element. A body with decisions ({@code a.equals(x) && b.equals(y)}) is made
+         * to take a path that returns true; a body that is a single call is arranged to return true.
+         */
+        Boolean holds(Expr predicate, Elem el, boolean dry) {
+            List<Applied> paths = applyLambdaPaths(predicate, List.of(el.expr()));
+            if (paths == null) return null;
+            if (paths.stream().allMatch(a -> isFalse(a.value()))) return false;
+            for (Applied a : paths) {
+                Expr body = a.value();
+                boolean returnsTrue = body.kind == Expr.Kind.CONST && body.value instanceof Number num && num.intValue() != 0;
+                boolean callBody = body.kind == Expr.Kind.CALL && body.target != null;
+                if (!returnsTrue && !callBody) continue;
+                if (!a.conds().stream().allMatch(c -> canSatisfy(c.getKey(), c.getValue())) || (callBody && !canSatisfy(body, true))) continue;
+                if (dry) return true;
+                for (var c : a.conds()) if (!satisfy(c.getKey(), c.getValue())) return null;
+                if (callBody && !satisfy(body, true)) return null;
+                return true;
+            }
+            return null;
+        }
+
+        static boolean isFalse(Expr e) {
+            return e.kind == Expr.Kind.CONST && e.value instanceof Number n && n.intValue() == 0;
+        }
+
+        static boolean isObjectEquals(Expr e) {
+            return e.kind == Expr.Kind.CALL && e.name.equals("equals") && e.args.size() == 1 && "(Ljava/lang/Object;)Z".equals(e.memberDesc);
+        }
+
+        boolean canSatisfy(Expr decision, boolean want) {
+            if (decision.kind != Expr.Kind.CALL || decision.target == null) return false;
+            if (isObjectEquals(decision)) return want && decision.target.kind == Expr.Kind.CALL;
+            return !isObjectMethod(decision);
+        }
+
+        /** Arranges a boolean call on a mock to give {@code want}; equals by making the receiver return the other value. */
+        boolean satisfy(Expr decision, boolean want) {
+            if (isObjectEquals(decision)) {
+                // Mockito cannot stub equals: the receiver returns the very value it is compared with
+                String other = renderExpected(decision.args.get(0), 1);
+                return other != null && !other.equals("null") && bindLiteral(decision.target, other);
+            }
+            return bindLiteral(decision, want ? "true" : "false");
+        }
+
+        /** The element a mapping function produces, named for the test (a stubbed mock or value). */
+        Elem mapped(Expr function, Elem el, boolean dry) {
+            Expr body = applyLambda(function, List.of(el.expr()));
+            if (body == null || body.desc == null) return null;
+            if (dry) return new Elem(body, "x");
+            Type t = Type.getType(body.desc);
+            String code;
+            if (t.getSort() == Type.OBJECT && body.kind == Expr.Kind.CALL && isMockable(t)) code = ensure(body);
+            else code = renderExpected(body, 1);
+            if (code == null || code.equals("null")) return null;
+            return new Elem(body, code);
+        }
+
+        /**
+         * The body of a lambda or method reference applied to arguments, as an expression over them:
+         * {@code Leg::getLoadLocation} on {@code leg} is {@code leg.getLoadLocation()}; a {@code lambda$..} method is
+         * explored and must have a single path that returns without side effects. Null otherwise.
+         */
+        Expr applyLambda(Expr lam, List<Expr> actuals) {
+            List<Applied> paths = applyLambdaPaths(lam, actuals);
+            return paths != null && paths.size() == 1 && paths.get(0).conds().isEmpty() ? paths.get(0).value() : null;
+        }
+
+        /** One path through a lambda body applied to arguments: boolean decisions taken (expression, outcome) and the value. */
+        record Applied(List<Map.Entry<Expr, Boolean>> conds, Expr value) {}
+
+        /**
+         * Every path of a lambda's body applied to arguments ({@code leg -> leg.getA().equals(x) && leg.getB().equals(y)}
+         * has three). Only boolean decisions on calls are kept; null when a path has anything else, or side effects.
+         */
+        List<Applied> applyLambdaPaths(Expr lam, List<Expr> actuals) {
+            if (lam.kind != Expr.Kind.LAMBDA || lam.owner == null || lam.name == null || lam.memberDesc == null) return null;
+            List<Expr> all = new ArrayList<>(lam.args);
+            all.addAll(actuals);
+            Type[] ats = Type.getArgumentTypes(lam.memberDesc);
+            String ret = Type.getReturnType(lam.memberDesc).getDescriptor();
+            int tag = lam.index;
+            if (!lam.name.startsWith("lambda$")) {
+                Expr v = switch (tag) {
+                    case Opcodes.H_INVOKESTATIC -> all.size() == ats.length ? Expr.call(null, lam.owner, lam.name, lam.memberDesc, all) : null;
+                    case Opcodes.H_INVOKEVIRTUAL, Opcodes.H_INVOKEINTERFACE ->
+                            all.size() == ats.length + 1 ? Expr.call(all.get(0), lam.owner, lam.name, lam.memberDesc, all.subList(1, all.size())) : null;
+                    default -> null;
+                };
+                return v == null ? null : List.of(new Applied(List.of(), v));
+            }
+            ClassNode node = lam.owner.equals(cn.name) ? cn : repo.node(lam.owner);
+            if (node == null) return null;
+            MethodNode body = node.methods.stream().filter(m -> m.name.equals(lam.name) && m.desc.equals(lam.memberDesc)).findFirst().orElse(null);
+            if (body == null) return null;
+            boolean isStaticBody = (body.access & Opcodes.ACC_STATIC) != 0;
+            if (all.size() != ats.length + (isStaticBody ? 0 : 1)) return null;
+            PathExplorer.Result r;
+            try {
+                r = PathExplorer.explore(repo, node, body, PathExplorer.Options.defaults());
+            } catch (RuntimeException ex) {
+                return null;
+            }
+            if (r.truncated() || r.paths().isEmpty() || r.paths().size() > 8) return null;
+            int offset = isStaticBody ? 0 : 1;
+            List<Expr> params = r.params();
+            java.util.function.UnaryOperator<Expr> bind = x0 -> {
+                Expr x = x0;
+                for (int k = 0; k < params.size(); k++) {
+                    Expr param = params.get(k);
+                    Expr actual = all.get(k + offset);
+                    x = x.substitute(y -> y == param || (y.kind == Expr.Kind.PARAM && y.index == param.index && y.text.equals(param.text)), actual);
+                }
+                if (!isStaticBody) {
+                    Expr self = all.get(0);
+                    x = x.substitute(y -> y.kind == Expr.Kind.THIS, self);
+                }
+                Expr done = x;
+                // anything of the body left unsubstituted (inside an operator, say) cannot be named by the test
+                boolean leftover = params.stream().anyMatch(param -> done.mentions(y -> y.kind == Expr.Kind.PARAM && y.text.equals(param.text)
+                        && all.stream().noneMatch(a -> a.mentions(z -> z == y))));
+                return leftover ? null : done;
+            };
+            List<Applied> out = new ArrayList<>();
+            for (Path path : r.paths()) {
+                if (path.outcome().kind() != Path.OutcomeKind.RETURN || path.outcome().value() == null) return null;
+                for (Effect ef : path.effects()) { // only calls that compute a value (BigDecimal.multiply) may remain
+                    if (ef.kind() != Effect.Kind.CALL || ef.target() == null || ef.owner() == null || !ef.owner().startsWith("java/")
+                            || !isPureInstanceCall(Expr.call(ef.target(), ef.owner(), ef.name(), ef.desc(), ef.args()))) return null;
+                }
+                List<Map.Entry<Expr, Boolean>> conds = new ArrayList<>();
+                for (Cond c : path.conds()) {
+                    if (c.kind() != Cond.Kind.BOOL || c.left() == null) return null;
+                    Expr left = bind.apply(c.left());
+                    if (left == null) return null;
+                    conds.add(Map.entry(left, "T".equals(c.value())));
+                }
+                Expr v = bind.apply(path.outcome().value());
+                if (v == null) return null;
+                out.add(new Applied(conds, v.desc == null ? v.withDesc(ret) : v));
+            }
+            return out;
         }
 
         String listOf(List<String> elems) {
@@ -2737,6 +2935,16 @@ public final class TestGenerator {
                             || (ef.value() != null && ef.value().mentions(x -> x.text.equals(e.text)))));
                     if (!touched && e.args.isEmpty() && e.owner != null && e.owner.startsWith("java/util/") && collectionFactory(Type.getObjectType(e.owner)) != null) {
                         return "new " + imports.ref(Type.getObjectType(e.owner)) + "<>()";
+                    }
+                    if (!touched && e.owner != null && (e.owner.equals("java/math/BigDecimal") || e.owner.equals("java/math/BigInteger"))) {
+                        Type[] cats = Type.getArgumentTypes(e.memberDesc);
+                        List<String> args = new ArrayList<>();
+                        for (int k = 0; k < e.args.size(); k++) {
+                            String a = renderExpected(e.args.get(k), depth + 1);
+                            if (a == null || a.equals("null")) return null;
+                            args.add(cats.length == e.args.size() && cats[k].getSort() == Type.INT && a.matches("-?\\d+L") ? a.substring(0, a.length() - 1) : a);
+                        }
+                        return "new " + imports.ref(Type.getObjectType(e.owner)) + "(" + String.join(", ", args) + ")";
                     }
                     return touched ? filledCollection(e, depth) : null;
                 }

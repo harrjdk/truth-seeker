@@ -342,7 +342,9 @@ public final class PathExplorer {
                 } else if (v.kind == Expr.Kind.NEW && !v.isUninitialized() && lvName != null) {
                     // keep constructor arguments visible behind the name (needed to see what must be non-null)
                     f.locals[slot] = v.aliased(scopedName(f, lvName, v));
-                } else if (v.kind == Expr.Kind.NEW || v.kind == Expr.Kind.ARRAY_NEW || v.kind == Expr.Kind.LAMBDA) {
+                } else if (v.kind == Expr.Kind.LAMBDA) {
+                    f.locals[slot] = v; // keeps what the lambda runs (Predicate<Leg> p = leg -> ..; legs.stream().anyMatch(p))
+                } else if (v.kind == Expr.Kind.NEW || v.kind == Expr.Kind.ARRAY_NEW) {
                     f.locals[slot] = Expr.local(slot, localName(slot, f.pc + 1), v.desc != null ? v.desc : lvDesc);
                 } else if (!trivial && lvName != null) {
                     f.locals[slot] = v.aliased(scopedName(f, lvName, v)); // readable name, structure kept
@@ -1800,7 +1802,7 @@ public final class PathExplorer {
         }
         if (bsmOwner.equals("java/lang/invoke/LambdaMetafactory") && indy.bsmArgs.length > 1 && indy.bsmArgs[1] instanceof Handle h) {
             String text = h.getName().startsWith("lambda$") ? "(lambda)" : Names.simple(h.getOwner()) + "::" + h.getName();
-            f.push(Expr.lambda(text, ret.getDescriptor()));
+            f.push(Expr.lambda(text, ret.getDescriptor(), h.getOwner(), h.getName(), h.getDesc(), h.getTag(), Arrays.asList(args)));
             return;
         }
         if (bsmOwner.equals("java/lang/runtime/SwitchBootstraps") && args.length >= 1) {
