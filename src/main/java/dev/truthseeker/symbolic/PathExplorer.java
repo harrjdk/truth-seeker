@@ -256,7 +256,32 @@ public final class PathExplorer {
     }
 
     private void finish(Frame f, Path.Outcome outcome) {
-        paths.add(new Path(++pathIds, List.copyOf(f.conds), List.copyOf(f.effects), outcome, List.copyOf(f.derefs), returnedFields(f, outcome)));
+        paths.add(new Path(++pathIds, List.copyOf(f.conds), List.copyOf(f.effects), outcome, List.copyOf(f.derefs), returnedFields(f, outcome),
+                handedFields(f)));
+    }
+
+    /** Final field values of every complete object this path built and passed to a call (by identity). */
+    private Map<Object, Map<String, Expr>> handedFields(Frame f) {
+        Map<Object, Map<String, Expr>> out = new HashMap<>();
+        for (Effect ef : f.effects) {
+            List<Expr> roots = new ArrayList<>(ef.args());
+            if (ef.value() != null) roots.add(ef.value());
+            for (Expr root : roots) {
+                root.mentions(x -> {
+                    if (x.kind == Expr.Kind.NEW && x.extra != null && builtObjects.contains(x.extra) && !incompleteObjects.contains(x.extra)
+                            && !out.containsKey(x.extra)) {
+                        String prefix = constructedPrefix(x);
+                        Map<String, Expr> fields = new TreeMap<>();
+                        f.thisFields.forEach((k, e) -> {
+                            if (k.startsWith(prefix) && e != null) fields.put(k.substring(prefix.length()), e);
+                        });
+                        out.put(x.extra, fields);
+                    }
+                    return false;
+                });
+            }
+        }
+        return out;
     }
 
     /** Field values of a returned object this path built with all its constructors followed, or null. */
@@ -1082,6 +1107,11 @@ public final class PathExplorer {
         }
         if (inline(f, m, recv, args)) return true;
         if (inlineOnBuilt(f, m, recv, args)) return true;
+        if (recv != null && recv.kind == Expr.Kind.NEW && recv.extra != null && builtObjects.contains(recv.extra)
+                && m.getOpcode() != INVOKESTATIC && repo != null && !isLibrary(m.owner)) {
+            // a method of the built object not followed (calculateTotal() inside its constructor) may set its fields
+            incompleteObjects.add(recv.extra);
+        }
         Expr fresh = freshCollectionAnswer(f, m, recv);
         if (fresh != null) {
             if (Type.getReturnType(m.desc).getSort() != Type.VOID) f.push(fresh);

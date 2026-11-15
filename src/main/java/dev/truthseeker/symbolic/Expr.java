@@ -256,6 +256,14 @@ public final class Expr {
             for (int i = 0; same && i < as.size(); i++) same = as.get(i) == args.get(i);
             return same ? this : newObject(owner, memberDesc, as).withExtra(extra);
         }
+        if (isConcat()) { // "SKU-" + line.getSku()
+            List<Expr> as = args.stream().map(a -> a.substitute(match, replacement)).toList();
+            boolean same = true;
+            for (int i = 0; same && i < as.size(); i++) same = as.get(i) == args.get(i);
+            if (same) return this;
+            String joined = as.isEmpty() ? "\"\"" : String.join(" + ", as.stream().map(Expr::paren).toList());
+            return concat(joined, as);
+        }
         if (kind == Kind.BINARY && args.size() == 2 && name != null) {
             Expr a = args.get(0).substitute(match, replacement), b = args.get(1).substitute(match, replacement);
             return a == args.get(0) && b == args.get(1) ? this : binary(name, a, b, desc);

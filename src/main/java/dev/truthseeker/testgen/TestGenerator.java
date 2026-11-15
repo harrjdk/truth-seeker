@@ -2372,6 +2372,7 @@ public final class TestGenerator {
                 }
             }
             asserts.addAll(expectEffects());
+            asserts.addAll(expectHanded());
 
             StringBuilder sb = new StringBuilder();
             String display = p.conds().stream().map(Cond::describe).collect(Collectors.joining(" && "));
@@ -2661,17 +2662,26 @@ public final class TestGenerator {
             if (inBuiltFields || v.kind != Expr.Kind.NEW || v.owner == null || p.returnedFields() == null) {
                 return List.of();
             }
+            // declared wider than what it builds (Object processItem(..) returning new MyOutputRecord(..)): cast
+            boolean wider = !Type.getReturnType(r.method().desc).getDescriptor().equals("L" + v.owner + ";");
+            String receiver = wider ? "((" + imports.ref(Type.getObjectType(v.owner)) + ") result)" : "result";
+            List<String> out = fieldAsserts(v.owner, p.returnedFields(), receiver);
+            if (!out.isEmpty()) out.add(0, "assertNotNull(result);");
+            return out;
+        }
+
+        /** Getter assertions for an object of {@code owner} whose fields hold {@code fields} (absent: default), read through {@code receiver}. */
+        List<String> fieldAsserts(String owner, Map<String, Expr> fields, String receiver) {
             List<String> out = new ArrayList<>();
+            if (inBuiltFields) return out;
             inBuiltFields = true;
             try {
-                for (MethodNode g : simpleGetters(v.owner)) {
+                for (MethodNode g : simpleGetters(owner)) {
                     if (out.size() >= MAX_FIELD_ASSERTS) break;
                     String field = getterField(g);
                     Type t = Type.getReturnType(g.desc);
-                    // declared wider than what it builds (Object processItem(..) returning new MyOutputRecord(..)): cast
-                    boolean wider = !Type.getReturnType(r.method().desc).getDescriptor().equals("L" + v.owner + ";");
-                    String actual = (wider ? "((" + imports.ref(Type.getObjectType(v.owner)) + ") result)" : "result") + "." + g.name + "()";
-                    Expr fv = p.returnedFields().get(field);
+                    String actual = receiver + "." + g.name + "()";
+                    Expr fv = fields.get(field);
                     if (fv == null && lazyGetter(g)) continue; // would create the value on first call
                     List<String> lines;
                     if (fv == null) {
@@ -2697,8 +2707,97 @@ public final class TestGenerator {
             } finally {
                 inBuiltFields = false;
             }
-            if (!out.isEmpty()) out.add(0, "assertNotNull(result);");
             return out;
+        }
+
+        /**
+         * Objects the method builds and hands on instead of returning: captured from the mock they are passed to
+         * ({@code visits.save(new Visit(..))}), or read back from the subject's own list or map they are put into
+         * ({@code itemMap.put(id, cartItem)}), and checked through their getters.
+         */
+        List<String> expectHanded() {
+            List<String> out = new ArrayList<>();
+            if (p.handedFields().isEmpty() || p.outcome().kind() == Path.OutcomeKind.THROW) return out;
+            Set<Object> done = new HashSet<>();
+            for (Effect e : p.effects()) {
+                if (e.kind() != Effect.Kind.CALL || e.target() == null || done.size() >= 3) continue;
+                for (int i = 0; i < e.args().size(); i++) {
+                    Expr a = e.args().get(i);
+                    Map<String, Expr> fields = p.fieldsOf(a);
+                    if (a.kind != Expr.Kind.NEW || fields == null || a.owner == null || done.contains(a.extra) || !visibleType(a.owner)) continue;
+                    List<String> lines = handedTo(e, i, a, fields);
+                    if (lines.isEmpty()) continue;
+                    done.add(a.extra);
+                    out.addAll(lines);
+                }
+            }
+            return out;
+        }
+
+        boolean visibleType(String internal) {
+            ClassNode node = repo.node(internal);
+            if (node == null || node.name.contains("$") && (node.access & Opcodes.ACC_PUBLIC) == 0) return false;
+            return (node.access & Opcodes.ACC_PUBLIC) != 0 || Names.packageOf(node.name).equals(Names.packageOf(cn.name));
+        }
+
+        String freshName(String base) {
+            String n = base;
+            for (int k = 1; usedNames.contains(n); k++) n = base + k;
+            usedNames.add(n);
+            return n;
+        }
+
+        List<String> handedTo(Effect e, int argIndex, Expr built, Map<String, Expr> fields) {
+            Type bt = Type.getObjectType(built.owner);
+            String type = imports.ref(bt);
+            String simpleLower = Character.toLowerCase(Names.simple(built.owner).charAt(0)) + Names.simple(built.owner).substring(1);
+            List<String> lines = new ArrayList<>();
+            String var;
+            Expr t = e.target();
+            String mockVar = null;
+            if (t.kind == Expr.Kind.FIELD && t.target != null && t.target.kind == Expr.Kind.THIS && deps.containsKey(t.name)) mockVar = t.name;
+            else if (t.expansion() == null && ensured.containsKey(t.text)) mockVar = ensured.get(t.text);
+            else if (ensured.containsKey(canon(t))) mockVar = ensured.get(canon(t));
+            else if (t.kind == Expr.Kind.PARAM && String.valueOf(paramValues.get(t.index)).startsWith("mock(")) mockVar = paramVars.get(t.index);
+            if (mockVar != null) {
+                // passed to a collaborator: capture it
+                imports.add("org.mockito.ArgumentCaptor");
+                String captor = freshName(simpleLower + "Captor");
+                var = freshName("captured" + Names.simple(built.owner));
+                Type[] ats = Type.getArgumentTypes(e.desc());
+                boolean overloaded = isOverloaded(e.owner(), e.name(), ats.length);
+                List<String> ms = new ArrayList<>();
+                for (int i = 0; i < e.args().size(); i++) ms.add(i == argIndex ? captor + ".capture()" : argMatcher(e.args().get(i), ats[i], overloaded));
+                lines.add("ArgumentCaptor<" + type + "> " + captor + " = ArgumentCaptor.forClass(" + type + ".class);");
+                lines.add("verify(" + mockVar + ", atLeastOnce())." + e.name() + "(" + String.join(", ", ms) + ");");
+                lines.add(type + " " + var + " = " + captor + ".getValue();");
+            } else if (t.kind == Expr.Kind.FIELD && t.target != null && t.target.kind == Expr.Kind.THIS && !isStatic && t.desc != null) {
+                // put into the subject's own collection: read it back after the call
+                String coll = t.desc;
+                needsGetField = true;
+                var = freshName("stored" + Names.simple(built.owner));
+                if (e.name().equals("add") && e.args().size() == 1 && Set.of("Ljava/util/List;", "Ljava/util/ArrayList;", "Ljava/util/LinkedList;").contains(coll)) {
+                    imports.add("java.util.List");
+                    String list = freshName(t.name);
+                    lines.add("List<?> " + list + " = (List<?>) getField(subject, \"" + t.name + "\");");
+                    lines.add(type + " " + var + " = (" + type + ") " + list + ".get(" + list + ".size() - 1);");
+                } else if (e.name().equals("put") && e.args().size() == 2 && argIndex == 1
+                        && Set.of("Ljava/util/Map;", "Ljava/util/HashMap;", "Ljava/util/LinkedHashMap;", "Ljava/util/TreeMap;").contains(coll)) {
+                    String key = renderExpected(e.args().get(0), 1);
+                    if (key == null) return List.of();
+                    imports.add("java.util.Map");
+                    lines.add(type + " " + var + " = (" + type + ") ((Map<?, ?>) getField(subject, \"" + t.name + "\")).get(" + key + ");");
+                } else {
+                    return List.of();
+                }
+            } else {
+                return List.of();
+            }
+            List<String> asserts = fieldAsserts(built.owner, fields, var);
+            if (asserts.isEmpty()) return List.of();
+            lines.add("assertNotNull(" + var + ");");
+            lines.addAll(asserts);
+            return lines;
         }
 
         /** Public no-arg methods of a class (and its application superclasses) that just return one of its fields. */
@@ -3078,13 +3177,22 @@ public final class TestGenerator {
         }
 
         /** One path through a lambda body applied to arguments: boolean decisions taken (expression, outcome) and the value. */
-        record Applied(List<Map.Entry<Expr, Boolean>> conds, Expr value) {}
+        record Applied(List<Map.Entry<Expr, Boolean>> conds, Expr value, List<Effect> effects) {
+            Applied(List<Map.Entry<Expr, Boolean>> conds, Expr value) {
+                this(conds, value, List.of());
+            }
+        }
 
         /**
          * Every path of a lambda's body applied to arguments ({@code leg -> leg.getA().equals(x) && leg.getB().equals(y)}
          * has three). Only boolean decisions on calls are kept; null when a path has anything else, or side effects.
          */
         List<Applied> applyLambdaPaths(Expr lam, List<Expr> actuals) {
+            return applyLambdaPaths(lam, actuals, false);
+        }
+
+        /** With {@code withEffects}, the body's side effects are kept (applied to the arguments) instead of ruling it out. */
+        List<Applied> applyLambdaPaths(Expr lam, List<Expr> actuals, boolean withEffects) {
             if (lam.kind != Expr.Kind.LAMBDA || lam.owner == null || lam.name == null || lam.memberDesc == null) return null;
             List<Expr> all = new ArrayList<>(lam.args);
             all.addAll(actuals);
@@ -3098,7 +3206,11 @@ public final class TestGenerator {
                             all.size() == ats.length + 1 ? Expr.call(all.get(0), lam.owner, lam.name, lam.memberDesc, all.subList(1, all.size())) : null;
                     default -> null;
                 };
-                return v == null ? null : List.of(new Applied(List.of(), v));
+                if (v == null) return null;
+                if (withEffects && Type.getReturnType(lam.memberDesc).getSort() == Type.VOID) {
+                    return List.of(new Applied(List.of(), v, List.of(new Effect(Effect.Kind.CALL, v.target, v.owner, v.name, v.memberDesc, v.args, null))));
+                }
+                return List.of(new Applied(List.of(), v));
             }
             ClassNode node = lam.owner.equals(cn.name) ? cn : repo.node(lam.owner);
             if (node == null) return null;
@@ -3134,10 +3246,33 @@ public final class TestGenerator {
             };
             List<Applied> out = new ArrayList<>();
             for (Path path : r.paths()) {
-                if (path.outcome().kind() != Path.OutcomeKind.RETURN || path.outcome().value() == null) return null;
-                for (Effect ef : path.effects()) { // only calls that compute a value (BigDecimal.multiply) may remain
+                boolean returnsVoid = withEffects && path.outcome().kind() == Path.OutcomeKind.RETURN_VOID;
+                if (!returnsVoid && (path.outcome().kind() != Path.OutcomeKind.RETURN || path.outcome().value() == null)) return null;
+                List<Effect> effects = new ArrayList<>();
+                for (Effect ef : path.effects()) {
+                    if (withEffects) {
+                        Expr t = ef.target() == null ? null : bind.apply(ef.target());
+                        List<Expr> as = new ArrayList<>();
+                        for (Expr a : ef.args()) as.add(bind.apply(a));
+                        Expr val = ef.value() == null ? null : bind.apply(ef.value());
+                        if ((ef.target() != null && t == null) || as.contains(null) || (ef.value() != null && val == null)) return null;
+                        effects.add(new Effect(ef.kind(), t, ef.owner(), ef.name(), ef.desc(), as, val));
+                        continue;
+                    }
+                    // only calls that compute a value (BigDecimal.multiply) may remain
                     if (ef.kind() != Effect.Kind.CALL || ef.target() == null || ef.owner() == null || !ef.owner().startsWith("java/")
                             || !isPureInstanceCall(Expr.call(ef.target(), ef.owner(), ef.name(), ef.desc(), ef.args()))) return null;
+                }
+                if (returnsVoid) {
+                    List<Map.Entry<Expr, Boolean>> conds = new ArrayList<>();
+                    for (Cond c : path.conds()) {
+                        if (c.kind() != Cond.Kind.BOOL || c.left() == null) return null;
+                        Expr left = bind.apply(c.left());
+                        if (left == null) return null;
+                        conds.add(Map.entry(left, "T".equals(c.value())));
+                    }
+                    out.add(new Applied(conds, Expr.nul(), effects));
+                    continue;
                 }
                 List<Map.Entry<Expr, Boolean>> conds = new ArrayList<>();
                 for (Cond c : path.conds()) {
@@ -3148,7 +3283,7 @@ public final class TestGenerator {
                 }
                 Expr v = bind.apply(path.outcome().value());
                 if (v == null) return null;
-                out.add(new Applied(conds, v.desc == null ? v.withDesc(ret) : v));
+                out.add(new Applied(conds, v.desc == null ? v.withDesc(ret) : v, effects));
             }
             return out;
         }
@@ -3405,7 +3540,11 @@ public final class TestGenerator {
             }
             // collaborator interactions: @Mock dependencies and mocks created for this test (e.g. entities)
             Set<String> verified = new LinkedHashSet<>();
-            for (Effect e : p.effects()) {
+            List<Effect> all = new ArrayList<>(p.effects());
+            if (p.outcome().kind() != Path.OutcomeKind.THROW) {
+                for (Effect e : p.effects()) all.addAll(lambdaBodyEffects(e)); // coll.forEach(x -> repo.save(x))
+            }
+            for (Effect e : all) {
                 if (e.kind() != Effect.Kind.CALL || e.target() == null) continue;
                 Expr t = e.target();
                 String mockVar = null;
@@ -3424,6 +3563,46 @@ public final class TestGenerator {
             }
             out.addAll(verified);
             return out;
+        }
+
+        /**
+         * {@code coll.forEach(x -> ..)} (or {@code optional.ifPresent(x -> ..)} on an arranged value): give the
+         * collection one mock element (or use the elements already arranged), make the receivers inside the body
+         * non-null, and return the calls the body makes on it, so they can be verified.
+         */
+        List<Effect> lambdaBodyEffects(Effect ef) {
+            if (ef.kind() != Effect.Kind.CALL || ef.target() == null || !"forEach".equals(ef.name()) || ef.args().size() != 1
+                    || ef.args().get(0).kind != Expr.Kind.LAMBDA || !"(Ljava/util/function/Consumer;)V".equals(ef.desc())) return List.of();
+            Expr coll = ef.target();
+            if (coll.desc == null || !coll.desc.startsWith("Ljava/util/")) return List.of();
+            Type ct = Type.getType(coll.desc);
+            Type et = declaredElementType(coll);
+            if (et == null || !isMockable(et) || ClassInspector.isValueType(et.getDescriptor())) return List.of();
+            List<String> elems;
+            String bound = boundLiteral.get(coll.text);
+            if (bound == null && coll.expansion() == null && ensured.containsKey(coll.text)) return List.of(); // a mock list: forEach does nothing
+            // an empty list only there to be non-null, with no decision on it: give it an element instead
+            boolean decided = p.conds().stream().anyMatch(c -> c.describe().contains(coll.text));
+            if (bound != null && !decided && List.of().equals(elementsOf(bound))) bound = null;
+            if (bound != null) {
+                elems = elementsOf(bound);
+                if (elems == null || elems.isEmpty()) return List.of();
+            } else {
+                if (!(coll.kind == Expr.Kind.PARAM || arrangeable(coll))) return List.of();
+                String v = newVar(et);
+                String lit = iterableLiteral(ct, List.of(v));
+                if (lit == null) return List.of();
+                if (coll.kind == Expr.Kind.PARAM) paramValues.put(coll.index, lit);
+                else if (!bindLiteral(coll, lit)) return List.of();
+                elems = List.of(v);
+            }
+            Expr el = Expr.unknown("\u0000elem:" + elems.get(0), et.getDescriptor());
+            ensured.put(el.text, elems.get(0));
+            List<Applied> paths = applyLambdaPaths(ef.args().get(0), List.of(el), true);
+            if (paths == null || paths.size() != 1 || !paths.get(0).conds().isEmpty()) return List.of();
+            List<Effect> body = paths.get(0).effects();
+            for (Effect b : body) if (b.kind() == Effect.Kind.CALL && b.target() != null) requireNonNull(b.target());
+            return body;
         }
 
         /** {@code eq(value)} when the argument's value is known in the test, otherwise a typed any-matcher. */

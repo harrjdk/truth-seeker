@@ -93,4 +93,16 @@ class ExpectedValuesTest {
         assertTrue(code.contains(".format(DateTimeFormatter.ofPattern(\"yyyy/MM/dd\")), result);"), code);
         assertTrue(!code.contains("TODO: assert"), code);
     }
+
+    @Test
+    void workInLambdasAndObjectsHandedOnAreChecked() throws Exception {
+        String code = generate("fixtures.legacy.OrderDesk");
+        // forEach: one element arranged, the calls in the lambda body verified on it
+        assertTrue(code.contains("when(order.getLines()).thenReturn(new ArrayList<>(List.of(line)));"), code);
+        assertTrue(code.contains("verify(line, atLeastOnce()).setSku(") && code.contains("verify(dao, atLeastOnce()).insert(eq(line));"), code);
+        // the entry handed to the collaborator is captured and checked
+        assertTrue(code.contains("ArgumentCaptor<Entry> entryCaptor = ArgumentCaptor.forClass(Entry.class);"), code);
+        assertTrue(code.contains("verify(audit, atLeastOnce()).record(entryCaptor.capture());"), code);
+        assertTrue(code.contains("assertSame(action, capturedEntry.getAction());") && code.contains("assertEquals((count + 1), capturedEntry.getCount());"), code);
+    }
 }
