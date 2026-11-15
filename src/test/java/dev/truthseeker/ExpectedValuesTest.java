@@ -31,4 +31,26 @@ class ExpectedValuesTest {
         assertTrue(code.contains("assertEquals(\"redirect:/customers/\" + 1, result);"), code);
         assertTrue(!code.contains("TODO: expected `\"redirect:/customers/\""), code);
     }
+
+    @Test
+    void aStringBuilderKeptInALocalCollectsEveryAppend() throws Exception {
+        String code = generate("fixtures.legacy.ShipmentEvent");
+        // appended to again after the branch, through the local variable
+        assertTrue(code.contains("assertEquals(\"value\" + \": \" + Type.LOAD + \" by \" + \"value\", result);"), code);
+        assertTrue(code.contains("assertEquals(\"value\" + \": \" + Type.LOAD, result);"), code);
+    }
+
+    @Test
+    void objectsTheMethodBuildsAreCheckedThroughTheirGetters() throws Exception {
+        String code = generate("fixtures.legacy.ShipmentEventFactory");
+        // constructor arguments come back from the getters; a field no constructor set keeps its default
+        assertTrue(code.contains("assertSame(trackingId, result.getTrackingId());"), code);
+        assertTrue(code.contains("assertSame(carrier, result.getCarrier());"), code);
+        assertTrue(code.contains("assertNull(result.getCarrier());"), code);
+        // a bean filled through setters, with a field initialised where it is declared
+        assertTrue(code.contains("assertSame(reference, result.getReference());"), code);
+        assertTrue(code.contains("assertEquals(1, result.getPriority());") && code.contains("assertEquals(0, result.getPriority());"), code);
+        assertTrue(code.contains("assertNull(result.getId());") && code.contains("assertEquals(new ArrayList<>(), result.getStops());"), code);
+        assertTrue(!code.contains("TODO: expected `new "), code);
+    }
 }

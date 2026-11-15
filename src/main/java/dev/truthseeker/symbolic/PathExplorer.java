@@ -255,7 +255,20 @@ public final class PathExplorer {
     }
 
     private void finish(Frame f, Path.Outcome outcome) {
-        paths.add(new Path(++pathIds, List.copyOf(f.conds), List.copyOf(f.effects), outcome, List.copyOf(f.derefs)));
+        paths.add(new Path(++pathIds, List.copyOf(f.conds), List.copyOf(f.effects), outcome, List.copyOf(f.derefs), returnedFields(f, outcome)));
+    }
+
+    /** Field values of a returned object this path built with all its constructors followed, or null. */
+    private Map<String, Expr> returnedFields(Frame f, Path.Outcome outcome) {
+        Expr v = outcome.value();
+        if (outcome.kind() != Path.OutcomeKind.RETURN || v == null || v.kind != Expr.Kind.NEW || v.extra == null
+                || !builtObjects.contains(v.extra) || incompleteObjects.contains(v.extra)) return null;
+        String prefix = constructedPrefix(v);
+        Map<String, Expr> out = new TreeMap<>();
+        f.thisFields.forEach((k, e) -> {
+            if (k.startsWith(prefix) && e != null) out.put(k.substring(prefix.length()), e);
+        });
+        return out;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -324,7 +337,9 @@ public final class PathExplorer {
                 String lvName = localNameOrNull(slot, f.pc + 1);
                 boolean trivial = v.kind == Expr.Kind.CONST || v.kind == Expr.Kind.NULL || v.kind == Expr.Kind.PARAM
                         || v.kind == Expr.Kind.THIS || v.kind == Expr.Kind.STATIC || v.kind == Expr.Kind.LOCAL;
-                if (v.kind == Expr.Kind.NEW && !v.isUninitialized() && lvName != null) {
+                if (concatState.containsKey(v)) {
+                    f.locals[slot] = v; // a StringBuilder: later appends update it in place
+                } else if (v.kind == Expr.Kind.NEW && !v.isUninitialized() && lvName != null) {
                     // keep constructor arguments visible behind the name (needed to see what must be non-null)
                     f.locals[slot] = v.aliased(scopedName(f, lvName, v));
                 } else if (v.kind == Expr.Kind.NEW || v.kind == Expr.Kind.ARRAY_NEW || v.kind == Expr.Kind.LAMBDA) {
@@ -982,7 +997,9 @@ public final class PathExplorer {
             if (m.name.equals("append") && args.length == 1) {
                 List<Expr> parts = new ArrayList<>(concatParts(recv));
                 parts.add(args[0]);
-                f.push(markConcat(Expr.unknown(joinConcat(parts), "L" + m.owner + ";"), parts));
+                Expr appended = markConcat(Expr.unknown(joinConcat(parts), "L" + m.owner + ";"), parts);
+                replace(f, recv, appended); // append mutates the builder: a local holding it sees the new content
+                f.push(appended);
                 return true;
             }
             if (m.name.equals("toString")) {

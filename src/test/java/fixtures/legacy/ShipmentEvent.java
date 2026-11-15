@@ -60,4 +60,13 @@ public class ShipmentEvent {
     public String getCarrier() {
         return carrier;
     }
+
+    /** A summary built in a local StringBuilder that is appended to again after a branch. */
+    public String describe() {
+        StringBuilder builder = new StringBuilder(trackingId).append(": ").append(type);
+        if (carrier != null) {
+            builder.append(" by ").append(carrier);
+        }
+        return builder.toString();
+    }
 }

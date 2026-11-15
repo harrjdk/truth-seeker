@@ -6,7 +6,9 @@ import dev.truthseeker.archive.Names;
 import dev.truthseeker.symbolic.*;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.LocalVariableNode;
 import org.objectweb.asm.tree.MethodNode;
@@ -402,6 +404,9 @@ public final class TestGenerator {
     }
 
     // =============================================================================================
+
+    /** Getter assertions written for one returned object the method built. */
+    private static final int MAX_FIELD_ASSERTS = 8;
 
     /** Builds the test for one path. */
     private final class Case {
@@ -2140,11 +2145,95 @@ public final class TestGenerator {
                 else out.add("// TODO: assert result equals `" + v.text + "`");
             } else {
                 String rendered = renderExpected(v, 0);
+                List<String> built = rendered == null ? expectBuiltFields(v) : List.of();
                 if (rendered != null) out.add(assertEqualsTo(rendered, ret));
+                else if (!built.isEmpty()) out.addAll(built);
                 else if (ret.getSort() == Type.OBJECT || ret.getSort() == Type.ARRAY) out.add("assertNotNull(result); // TODO: expected `" + v.text + "`");
                 else out.add("// TODO: assert result equals `" + v.text + "`");
             }
             return out;
+        }
+
+        /** Set while asserting the fields of a returned object, so nested objects are not expanded with the wrong fields. */
+        boolean inBuiltFields;
+
+        /**
+         * The method returns an object it built itself ({@code return new Delivery(lastEvent, ..)}): an instance is never
+         * equal to one the test could build, so assert what its getters return instead, from the field values the
+         * constructor set (or the field's default when no constructor set it). Empty when nothing can be asserted.
+         */
+        List<String> expectBuiltFields(Expr v) {
+            if (inBuiltFields || v.kind != Expr.Kind.NEW || v.owner == null || p.returnedFields() == null) {
+                return List.of();
+            }
+            List<String> out = new ArrayList<>();
+            inBuiltFields = true;
+            try {
+                for (MethodNode g : simpleGetters(v.owner)) {
+                    if (out.size() >= MAX_FIELD_ASSERTS) break;
+                    String field = getterField(g);
+                    Type t = Type.getReturnType(g.desc);
+                    String actual = "result." + g.name + "()";
+                    Expr fv = p.returnedFields().get(field);
+                    List<String> lines;
+                    if (fv == null) {
+                        lines = List.of(switch (t.getSort()) {
+                            case Type.OBJECT, Type.ARRAY -> "assertNull(" + actual + ");";
+                            case Type.BOOLEAN -> "assertFalse(" + actual + ");";
+                            case Type.FLOAT, Type.DOUBLE -> "assertEquals(0.0, " + actual + ", 1e-9);";
+                            case Type.LONG -> "assertEquals(0L, " + actual + ");";
+                            case Type.CHAR -> "assertEquals('\0', " + actual + ");";
+                            default -> "assertEquals(0, " + actual + ");";
+                        });
+                    } else {
+                        if (fv.desc != null && !fv.desc.equals(t.getDescriptor()) && t.getSort() == Type.OBJECT) fv = fv.withDesc(t.getDescriptor());
+                        lines = new ArrayList<>();
+                        for (String line : expectReturn(fv, t)) {
+                            lines.add(line.replace("(result)", "(" + actual + ")").replace(", result)", ", " + actual + ")")
+                                    .replace(", result, 1e-9)", ", " + actual + ", 1e-9)"));
+                        }
+                    }
+                    if (lines.stream().anyMatch(l -> l.contains("TODO") || l.contains("fresh mock()"))) continue;
+                    out.addAll(lines);
+                }
+            } finally {
+                inBuiltFields = false;
+            }
+            if (!out.isEmpty()) out.add(0, "assertNotNull(result);");
+            return out;
+        }
+
+        /** Public no-arg methods of a class (and its application superclasses) that just return one of its fields. */
+        List<MethodNode> simpleGetters(String owner) {
+            List<MethodNode> out = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            String pkg = Names.packageOf(cn.name);
+            for (String c = owner; c != null && !c.equals("java/lang/Object"); ) {
+                ClassNode node = repo.node(c);
+                if (node == null) break;
+                boolean visibleClass = (node.access & Opcodes.ACC_PUBLIC) != 0 || Names.packageOf(node.name).equals(pkg);
+                for (MethodNode m : node.methods) {
+                    if (!visibleClass || !m.desc.startsWith("()") || m.name.startsWith("<") || !seen.add(m.name)) continue;
+                    if ((m.access & (Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC | Opcodes.ACC_BRIDGE)) != 0) continue;
+                    boolean visible = (m.access & Opcodes.ACC_PUBLIC) != 0
+                            || (m.access & Opcodes.ACC_PRIVATE) == 0 && Names.packageOf(node.name).equals(pkg);
+                    if (visible && getterField(m) != null) out.add(m);
+                }
+                c = node.superName;
+            }
+            return out;
+        }
+
+        /** The field a method returns when its body is just {@code return this.field;}, else null. */
+        String getterField(MethodNode m) {
+            List<AbstractInsnNode> code = new ArrayList<>();
+            for (AbstractInsnNode in : m.instructions) if (in.getOpcode() >= 0) code.add(in);
+            if (code.size() < 3 || code.size() > 4 || code.get(0).getOpcode() != Opcodes.ALOAD
+                    || ((org.objectweb.asm.tree.VarInsnNode) code.get(0)).var != 0 || code.get(1).getOpcode() != Opcodes.GETFIELD) return null;
+            if (code.size() == 4 && code.get(2).getOpcode() != Opcodes.CHECKCAST) return null;
+            int last = code.get(code.size() - 1).getOpcode();
+            if (last < Opcodes.IRETURN || last > Opcodes.ARETURN) return null;
+            return ((FieldInsnNode) code.get(1)).name;
         }
 
         String assertEqualsTo(String expected, Type ret) {

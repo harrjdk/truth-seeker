@@ -19,4 +19,14 @@ public class ShipmentEventFactory {
             throw new InvalidEventException(e);
         }
     }
+
+    /** Fills a new bean through its setters and returns it. */
+    public Waybill draft(String reference, boolean express) {
+        Waybill waybill = new Waybill();
+        waybill.setReference(reference);
+        if (express) {
+            waybill.setPriority(1);
+        }
+        return waybill;
+    }
 }

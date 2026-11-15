@@ -97,10 +97,11 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 | [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 |
 | [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 |
 
-Every generated test arranges its path. Expected values are rebuilt from what the test controls (see below); 10
-PetClinic, 11 Cargo Tracker and 5 JPetStore tests still end with `assertNotNull(result)` (or no assertion) and a `TODO`
-naming the expected expression, because the method builds the result itself (`new Delivery(..)`, a local `ModelAndView`), runs a
-lambda over it, reads the clock, or formats through a library (`ToStringCreator`).
+Every generated test arranges its path. Expected values are rebuilt from what the test controls (see below); 7
+PetClinic, 5 Cargo Tracker and 5 JPetStore tests still end with `assertNotNull(result)` (or no assertion) and a `TODO`
+naming the expected expression, because the result is a local the method filled (`ModelAndView`, a list), comes from a
+constructor too deep to follow (`new Delivery(..)`), runs a lambda over a collection, reads the clock, or formats through a
+library (`ToStringCreator`).
 
 ## Build
 
@@ -186,7 +187,7 @@ and prunes contradictory paths.
 What it recognizes:
 - local variable names from debug info
 - enum switches (javac `$SwitchMap$`, ECJ `$SWITCH_TABLE$`, direct ordinal switches, Java 21 `enumSwitch`/`typeSwitch`)
-- legacy `StringBuilder` and modern `indy` string concatenation
+- legacy `StringBuilder` and modern `indy` string concatenation, including a `StringBuilder` kept in a local and appended to again after a branch
 - boxing and unboxing
 - pre-Java 5 `class$` literals
 - `assert` statements
@@ -212,6 +213,7 @@ What the test generator arranges:
 - `Math.max`/`Math.min` bounds, and `isEmpty`/`contains`/`startsWith`/`endsWith` on strings through `strip()`/`trim()`/`toLowerCase()`
 - `a.isAfter(b)` / `isBefore` between a field and a stubbed date, including one read through `toLocalDate()`
 - expected values rebuilt in the test's own terms: the subject's fields are set to known values and stubbed results reused, so `"Voyage " + this.voyageNumber` becomes `assertEquals("Voyage " + voyageNumber, result)` and `Objects.hash(origin, destination)` is asserted with the same arguments; getters returning a constructor-injected collaborator assert it is the same `@Mock`
+- objects the method builds and returns (`return new HandlingEvent(cargo, completionTime, ..)`, `Owner owner = new Owner(); owner.setX(..); return owner`) are checked through their getters: each getter that just returns a field is asserted against the value the constructors and setters put there, or the field's default (`assertSame(type, result.getType())`, `assertNull(result.getId())`)
 - `equals`-style comparisons with another instance of the subject's class (`Objects.equals(this.voyage, o.voyage)`): a second real instance, with equal or distinct field values set on both
 
 These are deliberate approximations, and the tool output says so:
