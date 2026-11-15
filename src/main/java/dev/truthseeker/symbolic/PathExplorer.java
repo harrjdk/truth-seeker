@@ -357,6 +357,15 @@ public final class PathExplorer {
                 Expr arr = f.pop();
                 if (arr.kind != Expr.Kind.ARRAY_NEW) {
                     f.effects.add(new Effect(Effect.Kind.ARRAY_WRITE, arr, null, null, null, List.of(idx), v));
+                } else if (arr.args.get(0).value instanceof Integer size && size <= 32 && idx.value instanceof Integer i && i >= 0 && i < size) {
+                    // filling a fresh array (javac's varargs: Objects.hash(a, b)): keep its elements
+                    List<Expr> elems = arr.arrayElements() != null ? new ArrayList<>(arr.arrayElements()) : new ArrayList<>();
+                    if (elems.isEmpty()) {
+                        Expr dflt = op == AASTORE ? Expr.nul() : Expr.constant(0, "I");
+                        for (int k = 0; k < size; k++) elems.add(dflt);
+                    }
+                    elems.set(i, v);
+                    replace(f, arr, Expr.arrayLiteral(arr.name, arr.args.get(0), elems));
                 }
             }
             case POP -> f.pop();
@@ -975,7 +984,7 @@ public final class PathExplorer {
         // javac wraps object operands of string concatenation in String.valueOf(..): keep the operand text
         if (m.getOpcode() == INVOKESTATIC && m.owner.equals("java/lang/String") && m.name.equals("valueOf")
                 && m.desc.equals("(Ljava/lang/Object;)Ljava/lang/String;")) {
-            f.push(Expr.unknown(args[0].text, "Ljava/lang/String;"));
+            f.push(Expr.concat(args[0].text, List.of(args[0]))); // "" + x: same value, structure kept
             return true;
         }
         Expr folded = foldStringCall(m, recv, args);

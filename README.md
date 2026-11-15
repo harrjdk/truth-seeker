@@ -96,9 +96,10 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 | [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 187 (12 classes) | 187 | 0 | 0 |
 | [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 |
 
-Every generated test arranges its path, but not every one can predict the result: 19 PetClinic and 53 Cargo
-Tracker tests end with `assertNotNull(result)` (or no assertion) and a `TODO` naming the expected expression, such
-as a string built from a collaborator's value or the result of a lambda.
+Every generated test arranges its path. Expected values are rebuilt from what the test controls (see below); 10
+PetClinic and 12 Cargo Tracker tests still end with `assertNotNull(result)` (or no assertion) and a `TODO` naming the
+expected expression, because the method builds the result itself (`new Delivery(..)`, a local `ModelAndView`), runs a
+lambda over it, reads the clock, or formats through a library (`ToStringCreator`).
 
 ## Build
 
@@ -205,6 +206,7 @@ What the test generator arranges:
 - `isEmpty()` and `iterator().next()` on mocked containers such as Spring Data's `Page`
 - `Math.max`/`Math.min` bounds, and `isEmpty`/`contains`/`startsWith`/`endsWith` on strings through `strip()`/`trim()`/`toLowerCase()`
 - `a.isAfter(b)` / `isBefore` between a field and a stubbed date, including one read through `toLocalDate()`
+- expected values rebuilt in the test's own terms: the subject's fields are set to known values and stubbed results reused, so `"Voyage " + this.voyageNumber` becomes `assertEquals("Voyage " + voyageNumber, result)` and `Objects.hash(origin, destination)` is asserted with the same arguments; getters returning a constructor-injected collaborator assert it is the same `@Mock`
 - `equals`-style comparisons with another instance of the subject's class (`Objects.equals(this.voyage, o.voyage)`): a second real instance, with equal or distinct field values set on both
 
 These are deliberate approximations, and the tool output says so:

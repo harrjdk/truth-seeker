@@ -124,7 +124,24 @@ public final class Expr {
     }
 
     public static Expr newArray(String elemType, Expr size) {
-        return new Expr(Kind.ARRAY_NEW, "new " + elemType + "[" + size.text + "]", null, null, null, null, null, null, List.of(size), -1, null);
+        return new Expr(Kind.ARRAY_NEW, "new " + elemType + "[" + size.text + "]", null, null, null, elemType, null, null, List.of(size), -1, null);
+    }
+
+    /**
+     * A new array of constant size with known elements ({@code new Object[]{a, b}}, as javac builds varargs):
+     * {@link #args} holds the size, then every element (unset ones as their default value).
+     */
+    public static Expr arrayLiteral(String elemType, Expr size, List<Expr> elements) {
+        String text = "new " + elemType + "[]{" + elements.stream().map(x -> x.text).collect(Collectors.joining(", ")) + "}";
+        List<Expr> all = new java.util.ArrayList<>();
+        all.add(size);
+        all.addAll(elements);
+        return new Expr(Kind.ARRAY_NEW, text, null, null, null, elemType, null, null, all, -1, "literal");
+    }
+
+    /** Elements of an {@link #arrayLiteral}, or null for other arrays. */
+    public List<Expr> arrayElements() {
+        return kind == Kind.ARRAY_NEW && "literal".equals(extra) ? args.subList(1, args.size()) : null;
     }
 
     public static Expr lambda(String text, String desc) {
@@ -135,10 +152,14 @@ public final class Expr {
         return new Expr(Kind.SWITCH_INDEX, "switchIndex(" + selector.text + ")", "I", null, enumOwner, null, null, selector, null, -1, labels);
     }
 
-    /** A string concatenation: displayed as its source text, with the non-constant parts kept as {@link #args}. */
+    /** A string concatenation: displayed as its source text, with its parts kept as {@link #args}. */
     public static Expr concat(String text, List<Expr> parts) {
-        List<Expr> vars = parts.stream().filter(x -> !x.isConst()).toList();
-        return new Expr(Kind.UNKNOWN, text, "Ljava/lang/String;", null, null, null, null, null, vars, -1, null);
+        return new Expr(Kind.UNKNOWN, text, "Ljava/lang/String;", null, null, null, null, null, parts, -1, "concat");
+    }
+
+    /** True for a string concatenation built by {@link #concat}: {@link #args} are its parts in order. */
+    public boolean isConcat() {
+        return kind == Kind.UNKNOWN && "concat".equals(extra);
     }
 
     public static Expr unknown(String text, String desc) {

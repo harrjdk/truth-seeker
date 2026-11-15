@@ -14,6 +14,16 @@ public class Deadline {
         return date;
     }
 
+    @Override
+    public String toString() {
+        return "Deadline " + date + " (" + date.getDayOfWeek() + ")";
+    }
+
+    @Override
+    public int hashCode() {
+        return java.util.Objects.hash(date, "deadline");
+    }
+
     public boolean isMetBy(Schedule schedule) {
         return schedule != null && getDate().isAfter(schedule.finalArrival().toLocalDate());
     }

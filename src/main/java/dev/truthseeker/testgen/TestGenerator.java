@@ -1682,6 +1682,16 @@ public final class TestGenerator {
         boolean bindLiteral(Expr e, String literal) {
             // a fresh mock only says "non-null": a mock already standing for this value (maybe under another name) does
             if (literal.startsWith("mock(") && (ensured.containsKey(e.text) || ensured.containsKey(canon(e)))) return true;
+            String before = boundLiteral.get(e.text);
+            boolean bound = bindLiteralTo(e, literal);
+            if (!bound) { // nothing was arranged: do not claim the value
+                if (before == null) boundLiteral.remove(e.text);
+                else boundLiteral.put(e.text, before);
+            }
+            return bound;
+        }
+
+        private boolean bindLiteralTo(Expr e, String literal) {
             boundLiteral.put(e.text, literal);
             switch (e.kind) {
                 case THIS -> {
@@ -1853,6 +1863,9 @@ public final class TestGenerator {
                 if (ret.getSort() == Type.BOOLEAN) out.add(lit.equals("true") ? "assertTrue(result);" : "assertFalse(result);");
                 else out.add("assertEquals(" + lit + ", result);");
             } else if (v.kind == Expr.Kind.FIELD && v.target != null && v.target.kind == Expr.Kind.THIS && !isStatic
+                    && deps.containsKey(v.name) && v.desc != null && Type.getType(v.desc).getSort() == Type.OBJECT) {
+                out.add("assertSame(" + v.name + ", result);"); // the field holds the injected @Mock
+            } else if (v.kind == Expr.Kind.FIELD && v.target != null && v.target.kind == Expr.Kind.THIS && !isStatic
                     && !deps.containsKey(v.name) && (cn.access & Opcodes.ACC_ENUM) == 0 && v.desc != null) {
                 // getter-like: put a known value into the field and expect it back
                 Type t = Type.getType(v.desc);
@@ -1886,10 +1899,154 @@ public final class TestGenerator {
                         return out;
                     }
                 }
-                out.add("// TODO: assert result equals `" + v.text + "`");
-            } else {
-                if (ret.getSort() == Type.OBJECT || ret.getSort() == Type.ARRAY) out.add("assertNotNull(result); // TODO: expected `" + v.text + "`");
+                String rendered = renderExpected(v, 0);
+                if (rendered != null) out.add(assertEqualsTo(rendered, ret));
                 else out.add("// TODO: assert result equals `" + v.text + "`");
+            } else {
+                String rendered = renderExpected(v, 0);
+                if (rendered != null) out.add(assertEqualsTo(rendered, ret));
+                else if (ret.getSort() == Type.OBJECT || ret.getSort() == Type.ARRAY) out.add("assertNotNull(result); // TODO: expected `" + v.text + "`");
+                else out.add("// TODO: assert result equals `" + v.text + "`");
+            }
+            return out;
+        }
+
+        String assertEqualsTo(String expected, Type ret) {
+            if (ret.getSort() == Type.DOUBLE || ret.getSort() == Type.FLOAT) return "assertEquals(" + expected + ", result, 1e-9);";
+            return "assertEquals(" + expected + ", result);";
+        }
+
+        private static final Set<String> STATIC_PURE = Set.of(
+                "java/util/Objects.hash", "java/util/Objects.hashCode", "java/util/Objects.equals", "java/util/Objects.toString",
+                "java/util/Objects.requireNonNullElse", "java/lang/String.valueOf", "java/lang/String.join",
+                "java/util/Collections.unmodifiableList", "java/util/Collections.unmodifiableSet", "java/util/Collections.unmodifiableMap",
+                "java/util/Collections.unmodifiableCollection", "java/util/Collections.emptyList", "java/util/Collections.emptySet",
+                "java/util/Collections.emptyMap", "java/util/Collections.singletonList", "java/util/List.of", "java/util/List.copyOf",
+                "java/util/Set.of", "java/util/Set.copyOf", "java/util/Map.of", "java/lang/Integer.valueOf", "java/lang/Long.valueOf",
+                "java/lang/Boolean.valueOf", "java/lang/Integer.toString", "java/lang/Long.toString", "java/lang/Math.max",
+                "java/lang/Math.min", "java/lang/Math.abs");
+
+        /** Instance methods that only read their receiver: safe to re-evaluate in the assertion. */
+        boolean isPureInstanceCall(Expr e) {
+            String o = e.owner == null ? "" : e.owner;
+            if (Set.of("hashCode", "toString", "equals").contains(e.name)) return true;
+            if (o.equals("java/lang/String") || o.startsWith("java/time/") || o.startsWith("java/math/")
+                    || Set.of("java/lang/Integer", "java/lang/Long", "java/lang/Boolean", "java/lang/Double").contains(o)) return true;
+            if (o.equals("java/lang/Class")) return Set.of("isAssignableFrom", "isInstance", "getSimpleName", "getName").contains(e.name);
+            if (o.startsWith("java/util/") && Set.of("size", "isEmpty", "contains", "containsKey", "get").contains(e.name)) return true;
+            return false;
+        }
+
+        /**
+         * The expected value as test source built from what the test controls: literals, parameters, the subject's
+         * fields (set here to known values), stubbed collaborator results and pure JDK functions of those
+         * ({@code Objects.hash(origin, destination)}, {@code "Voyage " + voyageNumber}). Null when some part is not
+         * predictable (a lambda, a local builder, the clock, an application constructor).
+         */
+        String renderExpected(Expr e, int depth) {
+            if (depth > 6) return null;
+            switch (e.kind) {
+                case NULL: return "null";
+                case CONST: return literalOf(e);
+                case PARAM: return paramVars.get(e.index);
+                case STATIC: return isEnumConst(e) ? literalOf(e) : null;
+                default: break;
+            }
+            if (e.expansion() == null && ensured.containsKey(e.text)) return ensured.get(e.text);
+            if (ensured.containsKey(canon(e))) return ensured.get(canon(e));
+            String bound = boundLiteral.get(e.text);
+            if (bound != null && !bound.startsWith("mock(") && !bound.contains("new ")) return bound;
+            if (e.isConcat()) {
+                List<Expr> flat = new ArrayList<>();
+                Deque<Expr> todo = new ArrayDeque<>(e.args);
+                while (!todo.isEmpty()) { // "a" + ("" + x) → "a" + x
+                    Expr part = todo.pollFirst();
+                    if (part.isConcat()) {
+                        List<Expr> inner = new ArrayList<>(part.args);
+                        Collections.reverse(inner);
+                        inner.forEach(todo::addFirst);
+                    } else flat.add(part);
+                }
+                List<String> parts = new ArrayList<>();
+                for (Expr part : flat) {
+                    String r = renderExpected(part, depth + 1);
+                    if (r == null) return null;
+                    parts.add(part.kind == Expr.Kind.BINARY ? "(" + r + ")" : r);
+                }
+                if (parts.isEmpty()) return "\"\"";
+                // the first operand must already be a String, or `a + b` would add numerically
+                boolean leadingString = !parts.isEmpty() && (parts.get(0).startsWith("\"") || "Ljava/lang/String;".equals(flat.get(0).desc));
+                return (leadingString ? "" : "\"\" + ") + String.join(" + ", parts);
+            }
+            switch (e.kind) {
+                case FIELD -> {
+                    if (e.target == null || e.target.kind != Expr.Kind.THIS || isStatic || (cn.access & Opcodes.ACC_ENUM) != 0 || e.desc == null) return null;
+                    if (deps.containsKey(e.name)) return e.name;
+                    Type t = Type.getType(e.desc);
+                    String lit;
+                    if (t.getSort() == Type.OBJECT && !ClassInspector.isValueType(e.desc) && !isEnum(t.getInternalName())) lit = newVar(t);
+                    else if (t.getSort() == Type.OBJECT && mutableCollection(t) != null) lit = mutableCollection(t);
+                    else lit = nonNullSample(t, e);
+                    if (lit == null) return null;
+                    needsSetField = true;
+                    arrange.add("setField(subject, \"" + e.name + "\", " + lit + ");");
+                    if (lit.matches("[a-z][A-Za-z0-9_$]*")) ensured.put(e.text, lit);
+                    else boundLiteral.put(e.text, lit);
+                    return lit;
+                }
+                case BINARY -> {
+                    if (e.args.size() != 2 || !Set.of("+", "-", "*", "/", "%").contains(e.name)) return null;
+                    String a = renderExpected(e.args.get(0), depth + 1), b = renderExpected(e.args.get(1), depth + 1);
+                    return a == null || b == null ? null : "(" + a + " " + e.name + " " + b + ")";
+                }
+                case NEW -> {
+                    if (e.args.isEmpty() && e.owner != null && e.owner.startsWith("java/util/") && collectionFactory(Type.getObjectType(e.owner)) != null) {
+                        return "new " + imports.ref(Type.getObjectType(e.owner)) + "<>()";
+                    }
+                    return null;
+                }
+                case CALL -> {
+                    Type[] ats = Type.getArgumentTypes(e.memberDesc);
+                    if (e.target == null) {
+                        if (!STATIC_PURE.contains(e.owner + "." + e.name)) return null;
+                        List<String> args = renderArgs(e, ats, depth);
+                        return args == null ? null : imports.ref(Type.getObjectType(e.owner)) + "." + e.name + "(" + String.join(", ", args) + ")";
+                    }
+                    if (isPureInstanceCall(e)) {
+                        String recv = renderExpected(e.target, depth + 1);
+                        List<String> args = renderArgs(e, ats, depth);
+                        if (recv == null || args == null) return null;
+                        return recv + "." + e.name + "(" + String.join(", ", args) + ")";
+                    }
+                    // a collaborator's answer: stub it (or reuse the stub) and expect that value
+                    if (!arrangeable(e) || e.desc == null) return null;
+                    Type t = Type.getType(e.desc);
+                    if (t.getSort() == Type.OBJECT && !ClassInspector.isValueType(e.desc)) return ensure(e);
+                    String lit = nonNullSample(t, e);
+                    return lit != null && bindLiteral(e, lit) ? lit : null;
+                }
+                default -> {
+                    return null;
+                }
+            }
+        }
+
+        /** Rendered arguments; a varargs array built in place ({@code new Object[]{a, b}}) is spread back out. */
+        List<String> renderArgs(Expr call, Type[] ats, int depth) {
+            List<String> out = new ArrayList<>();
+            for (int i = 0; i < call.args.size(); i++) {
+                Expr a = call.args.get(i);
+                if (i == call.args.size() - 1 && ats.length > 0 && ats[ats.length - 1].getSort() == Type.ARRAY && a.arrayElements() != null) {
+                    for (Expr el : a.arrayElements()) {
+                        String r = renderExpected(el, depth + 1);
+                        if (r == null) return null;
+                        out.add(r.equals("null") ? "(Object) null" : r);
+                    }
+                    continue;
+                }
+                String r = renderExpected(a, depth + 1);
+                if (r == null) return null;
+                out.add(r);
             }
             return out;
         }
