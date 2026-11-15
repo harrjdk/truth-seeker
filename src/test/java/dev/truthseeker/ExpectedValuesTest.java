@@ -53,4 +53,21 @@ class ExpectedValuesTest {
         assertTrue(code.contains("assertNull(result.getId());") && code.contains("assertEquals(new ArrayList<>(), result.getStops());"), code);
         assertTrue(!code.contains("TODO: expected `new "), code);
     }
+
+    @Test
+    void resultsTheMethodFillsLocallyAreRebuilt() throws Exception {
+        String code = generate("fixtures.legacy.CustomerController");
+        // ModelAndView: view name and model entries, the name-less one by value
+        assertTrue(code.contains("assertEquals(\"customer/show\", result.getViewName());"), code);
+        assertTrue(code.contains("assertEquals(\"customer/missing\", result.getViewName());"), code);
+        assertTrue(code.contains("assertEquals(id, result.getModel().get(\"id\"));"), code);
+        assertTrue(code.contains("result.getModel().get(\"customer\"));"), code);
+        assertTrue(code.contains("assertTrue(result.getModel().containsValue("), code);
+        // a list filled from a collaborator's results: stubbed with one element, expected back
+        assertTrue(code.contains("findByName(any())).thenReturn(new ArrayList<>(List.of(customer"), code);
+        assertTrue(code.contains("assertEquals(List.of(customer"), code);
+        // a lazily created list on a built object
+        assertTrue(code.contains("result.getCustomers());"), code);
+        assertTrue(!code.contains("TODO: expected"), code);
+    }
 }

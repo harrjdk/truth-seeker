@@ -1818,6 +1818,15 @@ public final class TestGenerator {
         boolean bindLiteral(Expr e, String literal) {
             // a fresh mock only says "non-null": a mock already standing for this value (maybe under another name) does
             if (literal.startsWith("mock(") && (ensured.containsKey(e.text) || ensured.containsKey(canon(e)))) return true;
+            if (literal.startsWith("mock(") && e.kind == Expr.Kind.CALL && e.target != null && !isMapLookup(e)
+                    && e.desc != null && Type.getType(e.desc).getSort() == Type.OBJECT && !boundLiteral.containsKey(e.text)
+                    && literal.startsWith("mock(" + imports.ref(Type.getType(e.desc)) + ".class")) {
+                String tv = ensure(e.target);
+                String existing = tv == null ? null : stubs.get(stubKey(tv, e));
+                // the same stub (find(any())) already answers another call with a non-null value: keep that one
+                if (existing != null) return !existing.endsWith("thenReturn(null);");
+                if (ensure(e) != null) return true; // a named mock: later assertions can say the result is this very instance
+            }
             String before = boundLiteral.get(e.text);
             boolean bound = bindLiteralTo(e, literal);
             if (!bound) { // nothing was arranged: do not claim the value
@@ -2145,13 +2154,138 @@ public final class TestGenerator {
                 else out.add("// TODO: assert result equals `" + v.text + "`");
             } else {
                 String rendered = renderExpected(v, 0);
-                List<String> built = rendered == null ? expectBuiltFields(v) : List.of();
+                List<String> mav = rendered == null ? expectModelAndView(v) : List.of();
+                List<String> built = rendered == null && mav.isEmpty() ? expectBuiltFields(v) : List.of();
                 if (rendered != null) out.add(assertEqualsTo(rendered, ret));
+                else if (!mav.isEmpty()) out.addAll(mav);
                 else if (!built.isEmpty()) out.addAll(built);
                 else if (ret.getSort() == Type.OBJECT || ret.getSort() == Type.ARRAY) out.add("assertNotNull(result); // TODO: expected `" + v.text + "`");
                 else out.add("// TODO: assert result equals `" + v.text + "`");
             }
             return out;
+        }
+
+        /** Element variables already stubbed into a collaborator's returned collection, by stub key. */
+        final Map<String, String> filledStubs = new HashMap<>();
+
+        /**
+         * A list or set the method created empty and filled with {@code add}/{@code addAll} ({@code products.addAll(mapper.search(..))}):
+         * the same elements in the same order. Collections a collaborator returns get a stub with one mock element. Null when
+         * anything else touches the collection or an element cannot be named.
+         */
+        String filledCollection(Expr coll, int depth) {
+            if (!coll.args.isEmpty() || coll.owner == null || !coll.owner.startsWith("java/util/")) return null;
+            boolean set = coll.owner.endsWith("Set");
+            if (!set && !coll.owner.endsWith("List")) return null;
+            List<String> elems = new ArrayList<>();
+            for (Effect ef : p.effects()) {
+                boolean onIt = ef.target() != null && ef.target().text.equals(coll.text);
+                boolean mentions = (ef.target() != null && ef.target().mentions(x -> x.text.equals(coll.text)))
+                        || ef.args().stream().anyMatch(a -> a.mentions(x -> x.text.equals(coll.text)))
+                        || (ef.value() != null && ef.value().mentions(x -> x.text.equals(coll.text)));
+                if (!mentions) continue;
+                if (!onIt || ef.kind() != Effect.Kind.CALL || ef.args().size() != 1) return null;
+                Expr a = ef.args().get(0);
+                if (ef.name().equals("add")) {
+                    String el = elementValue(a, depth);
+                    if (el == null) return null;
+                    elems.add(el);
+                } else if (ef.name().equals("addAll")) {
+                    List<String> more = collaboratorElements(a);
+                    if (more == null) return null;
+                    elems.addAll(more);
+                } else {
+                    return null;
+                }
+            }
+            if (set && elems.stream().distinct().count() != elems.size()) return null;
+            imports.add("java.util.List");
+            if (!set) return "List.of(" + String.join(", ", elems) + ")";
+            imports.add("java.util.Set");
+            return "Set.of(" + String.join(", ", elems) + ")";
+        }
+
+        /** How the test names a value the method added to a collection, or null. */
+        String elementValue(Expr a, int depth) {
+            if (a.kind == Expr.Kind.NULL) return null;
+            if (a.kind == Expr.Kind.PARAM && paramVars.containsKey(a.index)) {
+                String val = paramValues.get(a.index);
+                return "null".equals(val) ? null : paramVars.get(a.index);
+            }
+            if (a.expansion() == null && ensured.containsKey(a.text)) return ensured.get(a.text);
+            if (ensured.containsKey(canon(a))) return ensured.get(canon(a));
+            String r = renderExpected(a, depth + 1);
+            if (r != null) return r.equals("null") ? null : r;
+            if (a.kind == Expr.Kind.CALL && a.target != null && a.desc != null && isMockable(Type.getType(a.desc))) return ensure(a);
+            return null;
+        }
+
+        /** Elements of a collection a collaborator returns: stubbed to hold one mock element (or what is already stubbed). */
+        List<String> collaboratorElements(Expr c) {
+            String bound = boundLiteral.get(c.text);
+            if (bound != null) return bound.matches("new \\w+<>\\(\\)|List\\.of\\(\\)|Set\\.of\\(\\)|Collections\\.empty\\w*\\(\\)") ? List.of() : null;
+            if (c.kind != Expr.Kind.CALL || c.target == null || c.desc == null || ensured.containsKey(c.text)) return null;
+            Type ct = Type.getType(c.desc);
+            Type et = declaredElementType(c);
+            if (et == null || !isMockable(et) || ct.getSort() != Type.OBJECT || ct.getInternalName().equals("java/util/Iterator")
+                    || iterableLiteral(ct, List.of()) == null) return null;
+            String tv = ensure(c.target);
+            if (tv == null) return null;
+            String key = stubKey(tv, c);
+            if (filledStubs.containsKey(key)) return List.of(filledStubs.get(key));
+            if (stubs.containsKey(key)) return null; // stubbed for a condition already, with other contents
+            String v = newVar(et);
+            if (!bindLiteral(c, iterableLiteral(ct, List.of(v)))) return null;
+            filledStubs.put(key, v);
+            return List.of(v);
+        }
+
+        /**
+         * A Spring {@code ModelAndView} the method built: its view name and the model entries added to it, from the
+         * constructor arguments, {@code setViewName} and {@code addObject} calls. Empty when it cannot be followed.
+         */
+        List<String> expectModelAndView(Expr v) {
+            if (v.kind != Expr.Kind.NEW || !"org/springframework/web/servlet/ModelAndView".equals(v.owner)) return List.of();
+            Expr view = null;
+            LinkedHashMap<String, Expr> named = new LinkedHashMap<>();
+            List<Expr> unnamed = new ArrayList<>();
+            List<Expr> ctor = v.args;
+            if (!ctor.isEmpty() && "Ljava/lang/String;".equals(ctor.get(0).desc)) view = ctor.get(0);
+            if (ctor.size() == 3 && ctor.get(1).kind == Expr.Kind.CONST) named.put(literalOf(ctor.get(1)), ctor.get(2));
+            for (Effect ef : p.effects()) {
+                boolean mentions = (ef.target() != null && ef.target().mentions(x -> x.text.equals(v.text)))
+                        || ef.args().stream().anyMatch(a -> a.mentions(x -> x.text.equals(v.text)));
+                if (!mentions) continue;
+                if (ef.kind() != Effect.Kind.CALL || ef.target() == null || !ef.target().text.equals(v.text)) return List.of();
+                switch (ef.name()) {
+                    case "setViewName" -> view = ef.args().get(0);
+                    case "addObject" -> {
+                        if (ef.args().size() == 2 && ef.args().get(0).kind == Expr.Kind.CONST) named.put(literalOf(ef.args().get(0)), ef.args().get(1));
+                        else if (ef.args().size() == 1) unnamed.add(ef.args().get(0));
+                        else return List.of();
+                    }
+                    default -> { return List.of(); }
+                }
+            }
+            List<String> out = new ArrayList<>();
+            out.add("assertNotNull(result);");
+            if (view != null) {
+                String r = view.kind == Expr.Kind.CONST ? literalOf(view) : renderExpected(view, 0);
+                if (r != null) out.add("assertEquals(" + r + ", result.getViewName());");
+            }
+            for (var en : named.entrySet()) {
+                if (en.getValue().kind == Expr.Kind.NULL) {
+                    out.add("assertNull(result.getModel().get(" + en.getKey() + "));");
+                    continue;
+                }
+                String el = elementValue(en.getValue(), 0);
+                if (el != null) out.add("assertEquals(" + el + ", result.getModel().get(" + en.getKey() + "));");
+            }
+            for (Expr u : unnamed) { // the attribute name comes from the value's class, which a mock does not keep
+                String el = elementValue(u, 0);
+                if (el != null) out.add("assertTrue(result.getModel().containsValue(" + el + "));");
+            }
+            return out.size() > 1 ? out : List.of();
         }
 
         /** Set while asserting the fields of a returned object, so nested objects are not expanded with the wrong fields. */
@@ -2175,6 +2309,7 @@ public final class TestGenerator {
                     Type t = Type.getReturnType(g.desc);
                     String actual = "result." + g.name + "()";
                     Expr fv = p.returnedFields().get(field);
+                    if (fv == null && lazyGetter(g)) continue; // would create the value on first call
                     List<String> lines;
                     if (fv == null) {
                         lines = List.of(switch (t.getSort()) {
@@ -2224,16 +2359,45 @@ public final class TestGenerator {
             return out;
         }
 
-        /** The field a method returns when its body is just {@code return this.field;}, else null. */
+        /**
+         * The field a method returns when its body is just {@code return this.field;}, or a lazy initialisation of it
+         * ({@code if (vets == null) vets = new ArrayList<>(); return vets;}), else null.
+         */
         String getterField(MethodNode m) {
             List<AbstractInsnNode> code = new ArrayList<>();
             for (AbstractInsnNode in : m.instructions) if (in.getOpcode() >= 0) code.add(in);
+            if (lazyGetter(m)) return ((FieldInsnNode) code.get(code.size() - 2)).name;
             if (code.size() < 3 || code.size() > 4 || code.get(0).getOpcode() != Opcodes.ALOAD
                     || ((org.objectweb.asm.tree.VarInsnNode) code.get(0)).var != 0 || code.get(1).getOpcode() != Opcodes.GETFIELD) return null;
             if (code.size() == 4 && code.get(2).getOpcode() != Opcodes.CHECKCAST) return null;
             int last = code.get(code.size() - 1).getOpcode();
             if (last < Opcodes.IRETURN || last > Opcodes.ARETURN) return null;
             return ((FieldInsnNode) code.get(1)).name;
+        }
+
+        /** {@code if (f == null) f = new X(); return f;}: only the field, NEW of a JDK collection and a null check. */
+        boolean lazyGetter(MethodNode m) {
+            List<AbstractInsnNode> code = new ArrayList<>();
+            for (AbstractInsnNode in : m.instructions) if (in.getOpcode() >= 0) code.add(in);
+            int n = code.size();
+            if (n < 8 || n > 12 || code.get(n - 1).getOpcode() != Opcodes.ARETURN || code.get(n - 2).getOpcode() != Opcodes.GETFIELD) return false;
+            String field = ((FieldInsnNode) code.get(n - 2)).name;
+            boolean nullCheck = false, store = false;
+            for (int i = 0; i < n - 2; i++) {
+                AbstractInsnNode in = code.get(i);
+                switch (in.getOpcode()) {
+                    case Opcodes.ALOAD -> { if (((org.objectweb.asm.tree.VarInsnNode) in).var != 0) return false; }
+                    case Opcodes.GETFIELD -> { if (!((FieldInsnNode) in).name.equals(field)) return false; }
+                    case Opcodes.PUTFIELD -> { if (!((FieldInsnNode) in).name.equals(field)) return false; store = true; }
+                    case Opcodes.IFNONNULL, Opcodes.IFNULL -> nullCheck = true;
+                    case Opcodes.NEW -> { if (!((org.objectweb.asm.tree.TypeInsnNode) in).desc.startsWith("java/util/")) return false; }
+                    case Opcodes.DUP, Opcodes.GOTO -> { }
+                    case Opcodes.INVOKESPECIAL -> { if (!((org.objectweb.asm.tree.MethodInsnNode) in).name.equals("<init>")
+                            || !((org.objectweb.asm.tree.MethodInsnNode) in).desc.equals("()V")) return false; }
+                    default -> { return false; }
+                }
+            }
+            return nullCheck && store;
         }
 
         String assertEqualsTo(String expected, Type ret) {
@@ -2331,7 +2495,7 @@ public final class TestGenerator {
                     if (!touched && e.args.isEmpty() && e.owner != null && e.owner.startsWith("java/util/") && collectionFactory(Type.getObjectType(e.owner)) != null) {
                         return "new " + imports.ref(Type.getObjectType(e.owner)) + "<>()";
                     }
-                    return null;
+                    return touched ? filledCollection(e, depth) : null;
                 }
                 case CALL -> {
                     Type[] ats = Type.getArgumentTypes(e.memberDesc);

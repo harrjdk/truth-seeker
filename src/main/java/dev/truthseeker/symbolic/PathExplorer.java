@@ -970,7 +970,7 @@ public final class PathExplorer {
                 }
                 replace(f, recv, created);
                 if (inlineConstructor(f, m, created, args)) return true;
-                if (repo != null && !repo.entry(m.owner).map(ClassRepository.ClassEntry::library).orElse(true)) {
+                if (repo != null && !isLibrary(m.owner)) {
                     forkThrows(f, created, m, work);
                 }
             } else if (recv != null && recv.kind == Expr.Kind.NEW && recv.extra != null && builtObjects.contains(recv.extra)
@@ -1419,7 +1419,7 @@ public final class PathExplorer {
 
     private boolean inlineConstructor(Frame f, MethodInsnNode m, Expr created, Expr[] args, boolean superCall) {
         if (!opt.inlineSelfCalls() || repo == null) return false;
-        if (repo.entry(m.owner).map(ClassRepository.ClassEntry::library).orElse(true)) return false;
+        if (isLibrary(m.owner)) return false;
         ClassNode node = repo.node(m.owner);
         if (node == null || (node.access & (ACC_ENUM | ACC_INTERFACE)) != 0 || (!superCall && (node.access & ACC_ABSTRACT) != 0)) return false;
         // constructors are mostly argument checks and assignments: one level deeper than other calls
@@ -1567,7 +1567,7 @@ public final class PathExplorer {
         String enumType = recv.desc != null && recv.desc.startsWith("L") ? Type.getType(recv.desc).getInternalName() : m.owner;
         ClassNode en = repo.node(enumType);
         if (en == null || (en.access & ACC_ENUM) == 0) return false;
-        if (repo.entry(enumType).map(ClassRepository.ClassEntry::library).orElse(true)) return false;
+        if (isLibrary(enumType)) return false;
         List<EnumConst> all = enumConstants(en);
         if (all.isEmpty()) return false;
 
@@ -1746,9 +1746,27 @@ public final class PathExplorer {
     }
 
     /** Method declared by {@code owner} or its application superclasses (library classes are never inlined). */
+    /**
+     * Library code is never followed: classes from bundled jars, and framework packages even when a copy sits among
+     * the application's own classes (a repackaged {@code ModelAndView} behaves like the real one).
+     */
+    private static final Set<String> SPRING_MODULES = Set.of("aop", "beans", "boot", "cache", "context", "core", "dao", "data",
+            "format", "http", "jdbc", "jms", "jndi", "mail", "orm", "remoting", "scheduling", "security", "stereotype",
+            "transaction", "ui", "util", "validation", "web");
+
+    private boolean isLibrary(String owner) {
+        if (owner.startsWith("javax/") || owner.startsWith("jakarta/")) return true;
+        if (owner.startsWith("org/springframework/")) { // not org/springframework/samples: PetClinic is application code
+            String module = owner.substring("org/springframework/".length());
+            int slash = module.indexOf('/');
+            if (slash > 0 && SPRING_MODULES.contains(module.substring(0, slash))) return true;
+        }
+        return repo.entry(owner).map(ClassRepository.ClassEntry::library).orElse(true);
+    }
+
     private MethodNode resolveOwn(String owner, String name, String desc) {
         for (String c = owner; c != null; ) {
-            if (repo.entry(c).map(ClassRepository.ClassEntry::library).orElse(true)) return null;
+            if (isLibrary(c)) return null;
             ClassNode node = repo.node(c);
             for (MethodNode m : node.methods) if (m.name.equals(name) && m.desc.equals(desc)) return m;
             c = node.superName;

@@ -97,11 +97,10 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 | [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 |
 | [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 |
 
-Every generated test arranges its path. Expected values are rebuilt from what the test controls (see below); 7
-PetClinic, 5 Cargo Tracker and 5 JPetStore tests still end with `assertNotNull(result)` (or no assertion) and a `TODO`
-naming the expected expression, because the result is a local the method filled (`ModelAndView`, a list), comes from a
-constructor too deep to follow (`new Delivery(..)`), runs a lambda over a collection, reads the clock, or formats through a
-library (`ToStringCreator`).
+Every generated test arranges its path. Expected values are rebuilt from what the test controls (see below); 5
+PetClinic, 5 Cargo Tracker and 4 JPetStore tests still end with `assertNotNull(result)` (or no assertion) and a `TODO`
+naming the expected expression, because the result comes from a constructor too deep to follow (`new Delivery(..)`),
+runs a lambda over a collection, reads the clock, returns an iterator, or formats through a library (`ToStringCreator`).
 
 ## Build
 
@@ -213,13 +212,16 @@ What the test generator arranges:
 - `Math.max`/`Math.min` bounds, and `isEmpty`/`contains`/`startsWith`/`endsWith` on strings through `strip()`/`trim()`/`toLowerCase()`
 - `a.isAfter(b)` / `isBefore` between a field and a stubbed date, including one read through `toLocalDate()`
 - expected values rebuilt in the test's own terms: the subject's fields are set to known values and stubbed results reused, so `"Voyage " + this.voyageNumber` becomes `assertEquals("Voyage " + voyageNumber, result)` and `Objects.hash(origin, destination)` is asserted with the same arguments; getters returning a constructor-injected collaborator assert it is the same `@Mock`
-- objects the method builds and returns (`return new HandlingEvent(cargo, completionTime, ..)`, `Owner owner = new Owner(); owner.setX(..); return owner`) are checked through their getters: each getter that just returns a field is asserted against the value the constructors and setters put there, or the field's default (`assertSame(type, result.getType())`, `assertNull(result.getId())`)
+- objects the method builds and returns (`return new HandlingEvent(cargo, completionTime, ..)`, `Owner owner = new Owner(); owner.setX(..); return owner`) are checked through their getters: each getter that just returns a field is asserted against the value the constructors and setters put there, or the field's default (`assertSame(type, result.getType())`, `assertNull(result.getId())`); lazily initialising getters (`if (vets == null) vets = new ArrayList<>()`) count too
+- lists and sets the method creates and fills with `add`/`addAll` are expected back with the same elements; a collaborator's collection it copies from is stubbed with one mock element (`when(mapper.search(any())).thenReturn(new ArrayList<>(List.of(product)))` … `assertEquals(List.of(product), result)`)
+- a Spring MVC `ModelAndView` the method builds: the view name from the constructor or `setViewName`, and each `addObject` entry (`assertEquals(owner, result.getModel().get("owner"))`, or `containsValue` when the name comes from the value's class)
+- mocks returned by stubs get a variable, so a result that passes one through is asserted with `assertSame`
 - `equals`-style comparisons with another instance of the subject's class (`Objects.equals(this.voyage, o.voyage)`): a second real instance, with equal or distinct field values set on both
 
 These are deliberate approximations, and the tool output says so:
 - `finally` and catch-all handlers are not entered; exceptions are only followed into typed `catch` blocks.
 - Loops are unrolled `loopBound` times (default 1). Paths are capped by `maxPaths` (default 256).
-- Bodies of *other* classes' methods are not explored, except constructors, enum queries and methods on objects the path built. Calls on collaborators stay symbolic, e.g. `this.repo.findById(id)`.
+- Bodies of *other* classes' methods are not explored, except constructors, enum queries and methods on objects the path built. Calls on collaborators stay symbolic, e.g. `this.repo.findById(id)`. Framework classes (Spring modules, `javax`, `jakarta`) are never followed, even when a copy sits among the application classes.
 - State machines are inferred without inlining, so derived state (`calculateTransportStatus()`) stays distinct from transitions.
 - State machines match state by holder type and property name (`Order.status`), not by object identity.
 - Pre-Java 6 `JSR`/`RET` subroutines truncate the affected path.
