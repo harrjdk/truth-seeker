@@ -6,7 +6,7 @@ package dev.truthseeker.symbolic;
  */
 public record Cond(Kind kind, Expr left, String op, Expr right, String value, Expr valueExpr, java.util.List<Expr> otherCases) {
 
-    public enum Kind { BOOL, CMP, SWITCH }
+    public enum Kind { BOOL, CMP, SWITCH, THROWS }
 
     public static Cond bool(Expr e, boolean v) {
         return new Cond(Kind.BOOL, e, null, null, v ? "T" : "F", null, java.util.List.of());
@@ -21,11 +21,21 @@ public record Cond(Kind kind, Expr left, String op, Expr right, String value, Ex
         return new Cond(Kind.SWITCH, selector, null, null, label, labelExpr, otherCases);
     }
 
+    /** The call (or constructor) {@code call} throws {@code exception} (internal name, kept in {@link #op()}), caught by a handler. */
+    public static Cond throwing(Expr call, String exception) {
+        return throwing(call, exception, true);
+    }
+
+    public static Cond throwing(Expr call, String exception, boolean throwsIt) {
+        return new Cond(Kind.THROWS, call, exception, null, throwsIt ? "T" : "F", null, java.util.List.of());
+    }
+
     public String key() {
         return switch (kind) {
             case BOOL -> left.text;
             case CMP -> left.text + " " + op + " " + right.text;
             case SWITCH -> "switch (" + left.text + ")";
+            case THROWS -> left.text + " throws " + op.substring(op.lastIndexOf('/') + 1).replace('$', '.');
         };
     }
 
@@ -42,6 +52,7 @@ public record Cond(Kind kind, Expr left, String op, Expr right, String value, Ex
                     : value.startsWith("instanceof ") ? left.text + " " + value
                     : value.contains(" | ") ? left.text + " in {" + value.replace(" | ", ", ").replace(", default", "") + "}"
                     : left.text + " == " + value;
+            case THROWS -> isTrue() ? key() : left.text + " does not throw " + op.substring(op.lastIndexOf('/') + 1).replace('$', '.');
         };
     }
 

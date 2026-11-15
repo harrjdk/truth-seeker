@@ -151,4 +151,25 @@ class TruthTableTest {
         assertTrue(r.paths().stream().anyMatch(p -> p.conds().stream().anyMatch(c -> c.key().equals("StringUtils.hasText(zone)"))),
                 r.paths().stream().map(p -> p.conds().toString()).collect(Collectors.joining(" ;; ")));
     }
+
+    @Test
+    void exceptionsInsideTryBlocksReachTheirHandlers() throws Exception {
+        PathExplorer.Result open = explore("fixtures.legacy.AccountService", "open");
+        String all = open.paths().stream().map(p -> p.conds() + " -> " + p.outcome().describe()).collect(Collectors.joining(" ;; "));
+        // checked exception declared by the DAO, wrapped and rethrown by the handler
+        assertTrue(open.paths().stream().anyMatch(p -> p.outcome().describe().startsWith("throw new IllegalStateException")
+                && p.conds().stream().anyMatch(c -> c.key().equals("this.dao.save(account) throws SQLException"))), all);
+        // the JDK parser guard: failing input goes to the handler, the happy path records that it did not throw
+        assertTrue(open.paths().stream().anyMatch(p -> p.outcome().describe().equals("return \"invalid-amount\"")), all);
+        assertTrue(open.paths().stream().anyMatch(p -> p.outcome().describe().equals("return \"ok\"")
+                && p.conds().stream().anyMatch(c -> c.describe().equals("Integer.parseInt(initialDeposit) does not throw NumberFormatException"))), all);
+
+        PathExplorer.Result close = explore("fixtures.legacy.AccountService", "close");
+        List<String> outcomes = close.paths().stream().map(p -> p.outcome().describe()).toList();
+        // a throw inside the inlined private helper is caught by the caller's handler: no path escapes with it
+        assertTrue(outcomes.stream().noneMatch(o -> o.startsWith("throw")), outcomes.toString());
+        assertTrue(close.paths().stream().anyMatch(p -> p.outcome().describe().equals("return false")
+                && p.conds().stream().anyMatch(c -> c.key().equals("account.getBalance() != 0") && c.isTrue())), outcomes.toString());
+        assertTrue(close.paths().stream().anyMatch(p -> p.conds().stream().anyMatch(c -> c.key().equals("this.dao.find(id) throws IllegalStateException"))), outcomes.toString());
+    }
 }

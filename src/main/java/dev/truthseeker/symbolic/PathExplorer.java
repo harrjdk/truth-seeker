@@ -16,7 +16,7 @@ import static org.objectweb.asm.Opcodes.*;
  * Bounded symbolic execution over a single method's bytecode. Each feasible path records the
  * decisions taken ({@link Cond}), the side effects ({@link Effect}) and how the method exits.
  *
- * <p>Deliberate simplifications (documented in tool output): catch handlers are not entered,
+ * <p>Deliberate simplifications (documented in tool output): only typed catch handlers are entered (via `call throws X` decisions),
  * loops are unrolled at most {@code loopBound} times. Calls on the class's own methods
  * ({@code this.helper(x)}, private/static helpers, getters) are inlined up to {@link #MAX_INLINE_DEPTH}
  * levels so their decisions become part of the caller's paths; all other calls stay symbolic
@@ -159,8 +159,8 @@ public final class PathExplorer {
             notes.add("Method has no bytecode (abstract, interface or native).");
             return new Result(cn.name, mn, params, paths, false, List.copyOf(notes));
         }
-        if (!mn.tryCatchBlocks.isEmpty()) {
-            notes.add("Catch/finally handlers are not explored; exceptions thrown inside try blocks are reported as method exits.");
+        if (mn.tryCatchBlocks.stream().anyMatch(t -> t.type == null)) {
+            notes.add("finally/catch-all handlers are not entered; only typed catch blocks are explored.");
         }
         Frame init = new Frame();
         init.method = mn;
@@ -518,6 +518,7 @@ public final class PathExplorer {
                     notes.add("Compiler-generated default of an exhaustive switch (throws " + Names.simple(type) + ") omitted.");
                     return false;
                 }
+                if (raise(f, v, type, 0)) return true;
                 finish(f, new Path.Outcome(Path.OutcomeKind.THROW, v, type, null));
                 return false;
             }
@@ -900,6 +901,9 @@ public final class PathExplorer {
                     created = markConcat(created, args.length == 1 ? List.of(args[0]) : List.of());
                 }
                 replace(f, recv, created);
+                if (repo != null && !repo.entry(m.owner).map(ClassRepository.ClassEntry::library).orElse(true)) {
+                    forkThrows(f, created, m, work);
+                }
             } else if (recv != null && recv.kind == Expr.Kind.THIS && !m.owner.equals("java/lang/Object")) {
                 f.effects.add(new Effect(Effect.Kind.CALL, recv, m.owner, m.owner.equals(cn.name) ? "this" : "super", m.desc, argList, null));
             }
@@ -945,6 +949,7 @@ public final class PathExplorer {
         if (!loggerCall && !isPureLibraryCall(m) && !(ret.getSort() != Type.VOID && isQuery(m.name))) {
             f.effects.add(new Effect(Effect.Kind.CALL, recv, m.owner, m.name, m.desc, argList, null));
         }
+        if (!loggerCall) forkThrows(f, call, m, work);
         if (ret.getSort() != Type.VOID) f.push(call);
         return true;
     }
@@ -1030,19 +1035,179 @@ public final class PathExplorer {
                 : Expr.newObject(exception, "()V", List.of());
         if (canFail && !canPass) {
             add(f, fail);
+            if (raise(f, thrown, exception, -1)) return true;
             finish(f, new Path.Outcome(Path.OutcomeKind.THROW, thrown, exception, null));
             return false;
         }
         if (canFail) {
             Frame g = f.copy();
             add(g, fail);
-            finish(g, new Path.Outcome(Path.OutcomeKind.THROW, thrown, exception, null));
+            if (raise(g, thrown, exception, 0)) work.push(g);
+            else finish(g, new Path.Outcome(Path.OutcomeKind.THROW, thrown, exception, null));
         }
         if (!canPass) return false; // contradictory path
         add(f, pass);
         if (check.equals("null")) dereferenced(f, a);
         if (Type.getReturnType(m.desc).getSort() != Type.VOID) f.push(returnsArg ? a : Expr.unknown("?", Type.getReturnType(m.desc).getDescriptor()));
         return true;
+    }
+
+    // ---- exceptions and catch handlers -----------------------------------------------------------
+
+    /** A typed catch handler covering an instruction: in the current method (depth 0) or an inlining caller. */
+    private record Handler(int depth, String type, int target) {}
+
+    /** Typed handlers that would see an exception thrown at the current instruction, innermost first, in table order. */
+    private List<Handler> handlers(Frame f) {
+        List<Handler> out = new ArrayList<>();
+        MethodNode m = f.method;
+        int pc = f.pc;
+        Caller c = f.caller;
+        for (int depth = 0; m != null; depth++) {
+            InsnList il = m.instructions;
+            for (TryCatchBlockNode t : m.tryCatchBlocks) {
+                if (t.type == null) continue; // finally / catch-all: not entered
+                if (il.indexOf(t.start) <= pc && pc < il.indexOf(t.end)) out.add(new Handler(depth, t.type, il.indexOf(t.handler)));
+            }
+            if (c == null) break;
+            m = c.method();
+            pc = c.pc();
+            c = c.parent();
+        }
+        return out;
+    }
+
+    /**
+     * Moves {@code f} into the handler that catches {@code type} thrown at its current instruction, unwinding
+     * inlined calls as needed. {@code adjust} compensates for the pc increment that follows a call instruction.
+     */
+    private boolean raise(Frame f, Expr exception, String type, int adjust) {
+        for (Handler h : handlers(f)) {
+            if (!isSubtype(type, h.type())) continue;
+            enterHandler(f, h, exception, adjust);
+            return true;
+        }
+        return false;
+    }
+
+    private void enterHandler(Frame f, Handler h, Expr exception, int adjust) {
+        for (int i = 0; i < h.depth(); i++) {
+            Caller c = f.caller;
+            f.caller = c.parent();
+            f.method = c.method();
+            f.locals = c.locals().clone();
+            f.visits = c.visits().clone();
+        }
+        f.stack = new ArrayList<>();
+        f.push(exception);
+        f.pc = h.target() + adjust;
+        notes.add("Exceptions thrown inside try blocks are followed into their catch handlers (`<call> throws <Type>` decisions).");
+    }
+
+    /** How the exception caught from a {@code call throws X} decision appears in the handler's expressions. */
+    public static String thrownText(String exceptionType, Expr call) {
+        return Names.simple(exceptionType) + " thrown by " + call.text;
+    }
+
+    private static final Set<String> GENERIC_EXCEPTIONS = Set.of("java/lang/Exception", "java/lang/Throwable", "java/lang/RuntimeException", "java/lang/Error");
+
+    /**
+     * For a call inside try blocks: one extra path per handler that could catch what the call throws, carrying a
+     * {@code call throws X} decision. Checked exceptions only when the callee declares them; JDK calls only for
+     * specific unchecked types (NumberFormatException around Integer.parseInt, ...), never for catch (Exception).
+     */
+    private void forkThrows(Frame f, Expr call, MethodInsnNode m, Deque<Frame> work) {
+        List<Handler> hs = handlers(f);
+        if (hs.isEmpty()) return;
+        boolean jdk = m.owner.startsWith("java/") || m.owner.startsWith("javax/") || m.owner.startsWith("jdk/");
+        if (!m.name.equals("<init>") && Type.getArgumentTypes(m.desc).length == 0 && isQuery(m.name) && !jdk && declaredExceptions(m).isEmpty()) return;
+        List<String> declared = declaredExceptions(m);
+        Set<Integer> seen = new HashSet<>();
+        for (Handler h : hs) {
+            String thrown = null;
+            for (String d : declared) {
+                if (isSubtype(d, h.type())) { thrown = d; break; }
+                if (isSubtype(h.type(), d)) { thrown = h.type(); break; }
+            }
+            if (thrown == null && isUnchecked(h.type())) {
+                if (jdk && GENERIC_EXCEPTIONS.contains(h.type())) continue;
+                if (jdk && isPureLibraryCall(m) && !m.name.startsWith("parse") && !m.name.equals("valueOf")) continue;
+                thrown = h.type();
+            }
+            if (thrown == null && !jdk && (h.type().equals("java/lang/Exception") || h.type().equals("java/lang/Throwable"))) {
+                thrown = "java/lang/RuntimeException";
+            }
+            if (thrown == null) continue;
+            // the first handler in table order that accepts the type is the one that runs
+            Handler catching = null;
+            for (Handler o : hs) if (isSubtype(thrown, o.type())) { catching = o; break; }
+            if (catching == null || !seen.add(catching.depth() * 100_000 + catching.target())) continue;
+            Frame g = f.copy();
+            g.conds.add(Cond.throwing(call, thrown));
+            enterHandler(g, catching, Expr.unknown(thrownText(thrown, call), "L" + thrown + ";"), 0);
+            work.push(g);
+            // a JDK parser fails or not depending on its input: the normal path must say it did not throw
+            if (jdk) add(f, Cond.throwing(call, thrown, false));
+        }
+    }
+
+    /** Exceptions the called method declares (application or library bytecode in the archive, else the JDK). */
+    private List<String> declaredExceptions(MethodInsnNode m) {
+        if (repo != null) {
+            for (String c = m.owner; c != null; ) {
+                ClassNode node = repo.node(c);
+                if (node == null) break;
+                for (MethodNode mm : node.methods) if (mm.name.equals(m.name) && mm.desc.equals(m.desc)) return mm.exceptions;
+                c = node.superName;
+            }
+        }
+        Class<?> k = jdkClass(m.owner);
+        if (k != null) {
+            try {
+                for (java.lang.reflect.Executable e : m.name.equals("<init>") ? k.getDeclaredConstructors() : k.getMethods()) {
+                    boolean ctor = e instanceof java.lang.reflect.Constructor;
+                    if (!ctor && !e.getName().equals(m.name)) continue;
+                    String desc = ctor ? Type.getConstructorDescriptor((java.lang.reflect.Constructor<?>) e)
+                            : Type.getMethodDescriptor((java.lang.reflect.Method) e);
+                    if (!desc.equals(m.desc)) continue;
+                    List<String> out = new ArrayList<>();
+                    for (Class<?> x : e.getExceptionTypes()) out.add(Type.getInternalName(x));
+                    return out;
+                }
+            } catch (LinkageError | SecurityException ignored) {
+                // not resolvable here
+            }
+        }
+        return List.of();
+    }
+
+    private static Class<?> jdkClass(String internal) {
+        if (!(internal.startsWith("java/") || internal.startsWith("javax/"))) return null;
+        try {
+            return Class.forName(internal.replace('/', '.'), false, ClassLoader.getPlatformClassLoader());
+        } catch (ClassNotFoundException | LinkageError e) {
+            return null;
+        }
+    }
+
+    /** Is {@code sub} the same as or a subclass of {@code sup}? Resolved through the archive, then the JDK. */
+    private boolean isSubtype(String sub, String sup) {
+        if (sup.equals("java/lang/Throwable") || sub.equals(sup)) return true;
+        for (String c = sub; c != null; ) {
+            if (c.equals(sup)) return true;
+            ClassNode node = repo == null ? null : repo.node(c);
+            if (node != null) {
+                c = node.superName;
+                continue;
+            }
+            Class<?> k = jdkClass(c), s = jdkClass(sup);
+            return k != null && s != null && s.isAssignableFrom(k);
+        }
+        return false;
+    }
+
+    private boolean isUnchecked(String type) {
+        return !type.equals("java/lang/Throwable") && (isSubtype(type, "java/lang/RuntimeException") || isSubtype(type, "java/lang/Error"));
     }
 
     private boolean isSyntheticNullCheck(int pc) {

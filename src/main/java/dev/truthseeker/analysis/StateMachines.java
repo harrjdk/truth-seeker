@@ -403,7 +403,7 @@ public final class StateMachines {
             sb.append("\n");
         }
         sb.append("_Heuristic: state reads and writes are matched by holder type + property name (e.g. `Order.status`), "
-                + "not by object identity; catch blocks and callee bodies are not followed._\n");
+                + "not by object identity; callee bodies are not followed._\n");
         return sb.toString();
     }
 

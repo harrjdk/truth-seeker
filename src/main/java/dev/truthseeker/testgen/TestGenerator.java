@@ -35,10 +35,11 @@ public final class TestGenerator {
     private boolean needsSetField, needsGetField, needsEnumSafe;
 
     private static final String ENUM_SAFE_ANSWER = """
-                /** Generated mocks answer enum getters with the first constant instead of null (code often switches on them). */
+                /** Generated mocks answer enum getters with the first constant and String getters with "" instead of null. */
                 private static final Answer<Object> ENUM_SAFE = invocation -> {
                     Class<?> type = invocation.getMethod().getReturnType();
                     if (type.isEnum() && type.getEnumConstants().length > 0) return type.getEnumConstants()[0];
+                    if (type == String.class) return ""; // unstubbed String getters: empty rather than null
                     return RETURNS_DEFAULTS.answer(invocation);
                 };
 
@@ -665,6 +666,10 @@ public final class TestGenerator {
                     continue;
                 }
                 switch (c.kind()) {
+                    case THROWS -> {
+                        if (c.isTrue()) arrangeThrow(c.left(), c.op());
+                        else arrangeNoThrow(c.left());
+                    }
                     case BOOL -> collectBool(c.left(), c.isTrue(), c);
                     case CMP -> {
                         String op = c.isTrue() ? c.op() : Cond.negate(c.op());
@@ -703,6 +708,8 @@ public final class TestGenerator {
                             Expr k = Expr.constant(pinned, rgt.desc);
                             constrain(rgt, "==", k, pinned);
                             constrain(l, op, k, pinned);
+                        } else if (collectMinMax(l, op, rgt) || collectMinMax(rgt, mirrorOp(op), l)) {
+                            // page <= Math.max(results.getTotalPages(), 1): pinned the inner value, solved the other side
                         } else todos.add("arrange so that `" + c.describe() + "`");
                     }
                     case SWITCH -> {
@@ -841,6 +848,11 @@ public final class TestGenerator {
                 if (cs.size() < 2) return null;
                 return new String[]{imports.ref(t) + "." + cs.get(0), imports.ref(t) + "." + cs.get(1)};
             }
+            String factory = collectionFactory(t);
+            if ("List.of".equals(factory) || "Set.of".equals(factory)) {
+                String coll = mutableCollection(t);
+                return new String[]{coll, coll.replace("<>()", "<>(" + factory + "(new Object()))")};
+            }
             String base = nonNullSample(t, null);
             if (base == null) return null;
             if (d.startsWith("Ljava/time/Local")) return new String[]{base, base + ".plusDays(1)"};
@@ -862,6 +874,132 @@ public final class TestGenerator {
                 if (c.op().equals("==") && c.other() != null && (c.other().isConst() || c.other().kind == Expr.Kind.UNKNOWN)) return c.other();
             }
             return null;
+        }
+
+        /**
+         * Makes {@code call} throw {@code exception}: {@code when(..).thenThrow(..)} / {@code doThrow(..).when(..)} on a
+         * mock, or input that makes a JDK parser fail ({@code Integer.parseInt(param)} → a non-number).
+         */
+        void arrangeThrow(Expr call, String exception) {
+            String simple = Names.simple(exception);
+            if (call.kind == Expr.Kind.CALL && call.target != null && call.target.kind != Expr.Kind.THIS && !isObjectMethod(call)) {
+                String tv = ensure(call.target);
+                if (tv != null) {
+                    String ex = caughtException(call, exception);
+                    boolean isVoid = Type.getReturnType(call.memberDesc).getSort() == Type.VOID;
+                    stubs.put(stubKey(tv, call), isVoid
+                            ? "doThrow(" + ex + ").when(" + tv + ")." + call.name + "(" + matchers(call) + ");"
+                            : "when(" + tv + "." + call.name + "(" + matchers(call) + ")).thenThrow(" + ex + ");");
+                    return;
+                }
+            }
+            if (call.kind == Expr.Kind.CALL && call.target == null && !call.args.isEmpty()
+                    && "Ljava/lang/String;".equals(call.args.get(0).desc) && arrangeable(call.args.get(0))
+                    && (call.name.startsWith("parse") || call.name.equals("valueOf"))
+                    && (call.owner.startsWith("java/lang/") || call.owner.startsWith("java/time/") || call.owner.startsWith("java/math/"))) {
+                constrain(call.args.get(0), "==", Expr.constant("not-a-valid-value", "Ljava/lang/String;"));
+                return;
+            }
+            todos.add("make `" + call.text + "` throw " + simple);
+        }
+
+        /**
+         * The exception to throw: a real instance, or a mock when the handler on this path inspects it
+         * ({@code ex.getMostSpecificCause().getMessage()}) so those getters can be stubbed like any collaborator.
+         */
+        String caughtException(Expr call, String exception) {
+            String text = dev.truthseeker.symbolic.PathExplorer.thrownText(exception, call);
+            Set<String> names = new LinkedHashSet<>();
+            List<Expr> all = new ArrayList<>();
+            for (Cond c : p.conds()) { all.add(c.left()); if (c.right() != null) all.add(c.right()); }
+            for (Effect ef : p.effects()) { if (ef.target() != null) all.add(ef.target()); all.addAll(ef.args()); }
+            for (Expr root : all) root.mentions(x -> {
+                if (x.kind == Expr.Kind.UNKNOWN && canon(x).equals(text)) names.add(x.text);
+                return false;
+            });
+            Type t = Type.getObjectType(exception);
+            if (names.isEmpty()) return exceptionInstance(t);
+            String v = newVar(t);
+            names.add(text);
+            for (String n : names) ensured.put(n, v);
+            return v;
+        }
+
+        /** Valid input for a JDK parser the path needs to succeed ({@code Integer.parseInt(s)} → "1"). */
+        void arrangeNoThrow(Expr call) {
+            if (call.kind != Expr.Kind.CALL || call.target != null || call.args.isEmpty()) return;
+            Expr a = call.args.get(0);
+            if (!"Ljava/lang/String;".equals(a.desc) || !arrangeable(a)) return;
+            String valid = switch (call.owner) {
+                case "java/lang/Integer", "java/lang/Long", "java/lang/Short", "java/lang/Byte", "java/math/BigInteger" -> "1";
+                case "java/lang/Double", "java/lang/Float", "java/math/BigDecimal" -> "1.5";
+                case "java/time/LocalDate" -> "2024-01-15";
+                case "java/time/LocalDateTime" -> "2024-01-15T10:30:00";
+                case "java/time/LocalTime" -> "10:30:00";
+                case "java/time/Instant" -> "2024-01-15T10:30:00Z";
+                default -> null;
+            };
+            if (valid != null) constrain(a, "==", Expr.constant(valid, "Ljava/lang/String;"));
+        }
+
+        /** An instance of an exception type: its (String) or no-arg constructor, else a mock (still a Throwable). */
+        String exceptionInstance(Type t) {
+            String ref = imports.ref(t);
+            ClassNode node = repo.node(t.getInternalName());
+            if (node != null) {
+                if ((node.access & Opcodes.ACC_ABSTRACT) == 0) {
+                    for (MethodNode m : node.methods) {
+                        if (m.name.equals("<init>") && (m.access & Opcodes.ACC_PUBLIC) != 0 && m.desc.equals("(Ljava/lang/String;)V")) return "new " + ref + "(\"simulated failure\")";
+                    }
+                    for (MethodNode m : node.methods) {
+                        if (m.name.equals("<init>") && (m.access & Opcodes.ACC_PUBLIC) != 0 && m.desc.equals("()V")) return "new " + ref + "()";
+                    }
+                }
+                return "mock(" + ref + ".class)";
+            }
+            try {
+                Class<?> k = Class.forName(t.getClassName(), false, ClassLoader.getPlatformClassLoader());
+                if (!java.lang.reflect.Modifier.isAbstract(k.getModifiers())) {
+                    try { k.getConstructor(String.class); return "new " + ref + "(\"simulated failure\")"; } catch (NoSuchMethodException ignored) { }
+                    try { k.getConstructor(); return "new " + ref + "()"; } catch (NoSuchMethodException ignored) { }
+                }
+            } catch (ClassNotFoundException | LinkageError ignored) {
+                // unknown here
+            }
+            return "mock(" + ref + ".class)";
+        }
+
+        /**
+         * {@code x <op> Math.max(a, k)} / {@code Math.min}: pin the arrangeable operand {@code a}, evaluate, and solve
+         * {@code x} against the result.
+         */
+        boolean collectMinMax(Expr x, String op, Expr mm) {
+            if (mm.kind != Expr.Kind.CALL || mm.target != null || !"java/lang/Math".equals(mm.owner) || mm.args.size() != 2
+                    || !(mm.name.equals("max") || mm.name.equals("min")) || !isAssignableNumber(x) && !arrangeable(x)) return false;
+            long[] vals = new long[2];
+            for (int i = 0; i < 2; i++) {
+                Expr a = mm.args.get(i);
+                if (a.kind == Expr.Kind.CONST && a.value instanceof Number n) {
+                    vals[i] = n.longValue();
+                } else if (a.desc != null && "IJ".contains(a.desc) && a.desc.length() == 1 && (arrangeable(a) || isAssignableNumber(a))) {
+                    Number pin = pinnedValue(a);
+                    constrain(a, "==", Expr.constant(pin, a.desc), pin);
+                    vals[i] = pin.longValue();
+                } else {
+                    return false;
+                }
+            }
+            long r = mm.name.equals("max") ? Math.max(vals[0], vals[1]) : Math.min(vals[0], vals[1]);
+            Expr k = "J".equals(x.desc) ? Expr.constant(r, "J") : Expr.constant((int) r, "I");
+            constrain(x, op, k, k.value instanceof Number n ? n : null);
+            return true;
+        }
+
+        /** {@code a op b} written as {@code b op' a}. */
+        static String mirrorOp(String op) {
+            return switch (op) {
+                case "<" -> ">"; case ">" -> "<"; case "<=" -> ">="; case ">=" -> "<="; default -> op;
+            };
         }
 
         /** Values a test can set: parameters, fields of the subject, and calls on mockable receivers. */
@@ -1007,6 +1145,19 @@ public final class TestGenerator {
                             if (b.isConst() || isEnumConst(b)) { constrain(a, v ? "==" : "!=", b); return; }
                             if (a.isConst() || isEnumConst(a)) { constrain(b, v ? "==" : "!=", a); return; }
                             if (sameOrDifferent(a, b, v)) return;
+                        }
+                    }
+                    case "contains", "startsWith", "endsWith" -> {
+                        // s.toLowerCase().contains("dup")  →  s = "dup" (true) / "#" (false)
+                        Expr s = e.target;
+                        while (s.kind == Expr.Kind.CALL && s.target != null && s.args.isEmpty() && "Ljava/lang/String;".equals(s.desc)
+                                && (s.name.equals("toLowerCase") || s.name.equals("toUpperCase") || s.name.equals("trim") || s.name.equals("strip"))) {
+                            s = s.target;
+                        }
+                        if (e.args.size() == 1 && e.args.get(0).kind == Expr.Kind.CONST && e.args.get(0).value instanceof String needle
+                                && "Ljava/lang/String;".equals(s.desc) && arrangeable(s) && !needle.isEmpty()) {
+                            constrain(s, "==", Expr.constant(v ? needle : "#", "Ljava/lang/String;"));
+                            return;
                         }
                     }
                     case "isAfter", "isBefore" -> {
@@ -1186,11 +1337,44 @@ public final class TestGenerator {
             String coll = mutableCollection(type);
             if (coll != null) {
                 if (empty) return coll;
+                String element = elementFor(e);
+                if (element != null) return coll.replace("<>()", "<>(" + collectionFactory(type) + "(" + element + "))");
                 todos.add("`" + e.text + "` must be non-empty: put a realistic element into it");
                 return coll.replace("<>()", "<>(" + collectionFactory(type) + "(new Object()))");
             }
             todos.add("arrange so that `" + e.text + ".isEmpty()` is " + empty);
             return null;
+        }
+
+        /**
+         * One mock element for a collection the path needs non-empty, typed by what the code reads back
+         * ({@code (Leg) this.legs.get(0)}, {@code iterator().next()}); every such read stands for that element.
+         */
+        String elementFor(Expr coll) {
+            List<Expr> all = new ArrayList<>();
+            for (Cond c : p.conds()) { all.add(c.left()); if (c.right() != null) all.add(c.right()); }
+            for (Effect ef : p.effects()) { if (ef.target() != null) all.add(ef.target()); all.addAll(ef.args()); }
+            if (p.outcome().value() != null) all.add(p.outcome().value());
+            List<Expr> reads = new ArrayList<>();
+            String key = canon(coll);
+            for (Expr root : all) root.mentions(x -> {
+                if (x.kind == Expr.Kind.CALL && x.target != null && x.desc != null && x.desc.startsWith("L")) {
+                    boolean get = (x.name.equals("get") && x.args.size() == 1) && canon(x.target).equals(key);
+                    boolean next = x.name.equals("next") && x.args.isEmpty() && x.target.kind == Expr.Kind.CALL
+                            && "iterator".equals(x.target.name) && x.target.target != null && canon(x.target.target).equals(key);
+                    if (get || next) reads.add(x);
+                }
+                return false;
+            });
+            Type t = null;
+            for (Expr r : reads) if (!r.desc.equals("Ljava/lang/Object;")) { t = Type.getType(r.desc); break; }
+            if (t == null || !isMockable(t)) return null;
+            String v = newVar(t);
+            for (Expr r : reads) {
+                ensured.put(r.text, v);
+                ensured.put(canon(r), v);
+            }
+            return v;
         }
 
         /** Element for {@code Optional.of(...)}: a mock of the type the code casts {@code get()} to, if visible on the path. */
@@ -1240,6 +1424,7 @@ public final class TestGenerator {
         String ensure(Expr e) {
             if (e == null) return null;
             if (ensured.containsKey(e.text)) return ensured.get(e.text);
+            if (ensured.containsKey(canon(e))) return ensured.get(canon(e));
             String v = null;
             switch (e.kind) {
                 case THIS -> v = null;
@@ -1278,7 +1463,10 @@ public final class TestGenerator {
                 }
                 default -> v = null;
             }
-            if (v != null) ensured.put(e.text, v);
+            if (v != null) {
+                ensured.put(e.text, v);
+                ensured.put(canon(e), v);
+            }
             return v;
         }
 
@@ -1290,6 +1478,8 @@ public final class TestGenerator {
         String enumReceiver;
 
         boolean bindLiteral(Expr e, String literal) {
+            // a fresh mock only says "non-null": a mock already standing for this value (maybe under another name) does
+            if (literal.startsWith("mock(") && (ensured.containsKey(e.text) || ensured.containsKey(canon(e)))) return true;
             boundLiteral.put(e.text, literal);
             switch (e.kind) {
                 case THIS -> {
@@ -1397,6 +1587,9 @@ public final class TestGenerator {
             sb.append("    void ").append(testName).append("() throws Exception {\n");
             if (o.kind() == Path.OutcomeKind.TRUNCATED) sb.append("        // NOTE: analysis of this path was cut short (").append(o.note()).append(")\n");
             sb.append("        // Arrange\n");
+            // mock declarations first: parameters may be built from them (a list holding a mock element)
+            java.util.function.Predicate<String> isMockDecl = a -> a.matches("[\\w.<>\\[\\]]+ \\w+ = mock\\(.*\\);");
+            for (String a : arrange) if (isMockDecl.test(a)) sb.append("        ").append(a).append("\n");
             for (int i = 0; i < r.params().size(); i++) {
                 Expr param = r.params().get(i);
                 String lit = paramValues.get(param.index);
@@ -1404,7 +1597,7 @@ public final class TestGenerator {
                 Type declared = paramTypes.getOrDefault(param.index, ats[i]);
                 sb.append("        ").append(imports.ref(declared)).append(" ").append(paramVars.get(param.index)).append(" = ").append(lit).append(";\n");
             }
-            for (String a : arrange) sb.append("        ").append(a).append("\n");
+            for (String a : arrange) if (!isMockDecl.test(a)) sb.append("        ").append(a).append("\n");
             for (String s : stubs.values()) sb.append("        ").append(s).append("\n");
             for (String t : todos) sb.append("        // TODO: ").append(t).append("\n");
             String self = selfCall();

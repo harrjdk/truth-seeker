@@ -43,7 +43,9 @@ class GeneratedTestsExecutionTest {
                 // Cargo Tracker-shaped regressions: validated constructors, no no-arg ctor, JUL Logger collaborator
                 "fixtures.shipping.HandlingEvent", "fixtures.shipping.Delivery", "fixtures.shipping.HandlingService",
                 // self-call inlining, for-each loops driven with real collections, precondition helpers
-                "fixtures.rules.ShippingFee"));
+                "fixtures.rules.ShippingFee",
+                // try/catch: thenThrow/doThrow on collaborators, parser input, throws inside inlined helpers
+                "fixtures.legacy.AccountService"));
         if (TestSupport.hasJava21Fixtures()) classes.add("fixtures.modern.Shapes");
 
         Path src = tmp.resolve("src");
