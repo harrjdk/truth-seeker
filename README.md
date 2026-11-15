@@ -114,15 +114,14 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 
 | Application | Archive | Generated tests | Pass | Disabled (TODOs) | Fail | Mutation score |
 |---|---|---|---|---|---|---|
-| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 187 (12 classes) | 187 | 0 | 0 | 74% (107/144) |
+| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 187 (12 classes) | 187 | 0 | 0 | 87% (125/144) |
 | [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 | 99% (207/209) |
-| [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 | 93% (230/247) |
-| [Java EE 7 samples](https://github.com/javaee-samples/javaee7-samples), 10 modules (Batch, JAX-RS, JPA, JMS, Concurrency, WebSocket, Servlet, JACC, JASPIC; Java 8 bytecode) | 10 WARs, 76 app classes | 306 (72 classes) | 251 | 49 | 6 | 89% (237/265) |
+| [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 | 94% (233/247) |
+| [Java EE 7 samples](https://github.com/javaee-samples/javaee7-samples), 10 modules (Batch, JAX-RS, JPA, JMS, Concurrency, WebSocket, Servlet, JACC, JASPIC; Java 8 bytecode) | 10 WARs, 76 app classes | 306 (72 classes) | 251 | 49 | 6 | 90% (238/265) |
 
 Mutation score: the share of small bytecode changes in tested methods that some generated test catches (see
-[mutation testing](#do-the-tests-catch-changes-mutation-testing)). PetClinic's survivors are mostly Spring MVC plumbing
-the tests do not observe (`WebDataBinder.setDisallowedFields`, `BindingResult.rejectValue` in a catch block) and
-negated validation conditions whose two branches end the same way.
+[mutation testing](#do-the-tests-catch-changes-mutation-testing)). What survives is mostly `return null` in `orElseThrow(..)` suppliers on
+paths no test takes, calls on real (unmocked) objects, and boundaries no decision on the path pins down.
 
 The Java EE 7 failures need a running container: static `PolicyContext`/`AuthConfigFactory` lookups and a JSON decoder
 handed `"value"`. Paths that open a real network connection (`new URL(..)`, a JAX-RS `ClientBuilder`) are disabled with
@@ -259,6 +258,7 @@ What the test generator arranges:
 - lists and sets the method creates and fills with `add`/`addAll` are expected back with the same elements; a collaborator's collection it copies from is stubbed with one mock element (`when(mapper.search(any())).thenReturn(new ArrayList<>(List.of(product)))` … `assertEquals(List.of(product), result)`)
 - a Spring MVC `ModelAndView` the method builds: the view name from the constructor or `setViewName`, and each `addObject` entry (`assertEquals(owner, result.getModel().get("owner"))`, or `containsValue` when the name comes from the value's class)
 - mocks returned by stubs get a variable, so a result that passes one through is asserted with `assertSame`; calls on such a mock held in a local (`Cargo cargo = repository.find(id); cargo.specifyNewRoute(..)`) are verified
+- what a method does *not* do: calls on a parameter or `@Mock` that other paths of the same method make are verified `never()` on this one (`verify(errors, never()).rejectValue(eq("name"), eq("size"), ..)` when the name is valid), exactly when the arguments are constants; varargs calls are matched element by element (`setDisallowedFields(eq("id"), eq("*.id"))`)
 - work done inside `forEach` lambdas (`order.getLineItems().forEach(li -> lineItemMapper.insertLineItem(li))`): the collection gets one mock element and the calls in the lambda body are verified on it
 - objects the method builds and hands on instead of returning are checked through their getters: captured from the collaborator they are passed to (`ArgumentCaptor<Visit>` on `visits.save(..)`), or read back from the subject's own list or map they are put into
 - iterators and stream pipelines over the subject's own collections are evaluated on elements the test puts there: `items.iterator()` yields the one arranged mock, `specialties.stream().sorted(..).collect(toList())` returns it as a list, and steps that run a lambda per element apply its body to the arranged element: method references become calls on it, `lambda$..` bodies are explored with their captured values, predicates are arranged to hold (`leg -> leg.getLoadLocation().equals(event.getLocation()) && ..` takes the path returning true, each `equals` satisfied by returning the same mock), and mappings yield the body's value (`assertEquals(BigDecimal.ZERO.add(BigDecimal.ONE.multiply(new BigDecimal(1))), result)` for a cart subtotal)

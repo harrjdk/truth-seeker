@@ -3551,7 +3551,7 @@ public final class TestGenerator {
                 if (t.kind == Expr.Kind.FIELD && t.target != null && t.target.kind == Expr.Kind.THIS && deps.containsKey(t.name)) mockVar = t.name;
                 else if (t.expansion() == null && ensured.containsKey(t.text)) mockVar = ensured.get(t.text);
                 else if (ensured.containsKey(canon(t))) mockVar = ensured.get(canon(t)); // a local alias: Cargo cargo = repo.find(id)
-                else if (t.kind == Expr.Kind.PARAM && String.valueOf(paramValues.get(t.index)).startsWith("mock(")) mockVar = paramVars.get(t.index);
+                else if (t.kind == Expr.Kind.PARAM && isMockParam(t.index)) mockVar = paramVars.get(t.index);
                 if (mockVar == null) continue;
                 boolean isVoid = Type.getReturnType(e.desc()).getSort() == Type.VOID;
                 if (!isVoid && !MUTATOR.matcher(e.name()).matches()) continue;
@@ -3559,10 +3559,92 @@ public final class TestGenerator {
                 boolean overloaded = isOverloaded(e.owner(), e.name(), ats.length);
                 List<String> ms = new ArrayList<>();
                 for (int i = 0; i < e.args().size(); i++) ms.add(argMatcher(e.args().get(i), ats[i], overloaded));
-                verified.add("verify(" + mockVar + ", atLeastOnce())." + e.name() + "(" + String.join(", ", ms) + ");");
+                verified.add("verify(" + mockVar + ", atLeastOnce())." + e.name() + "(" + String.join(", ", spreadVarargs(e, ms)) + ");");
             }
             out.addAll(verified);
+            if (p.outcome().kind() != Path.OutcomeKind.THROW) out.addAll(expectAbsent());
             return out;
+        }
+
+        /**
+         * A varargs call ({@code binder.setDisallowedFields("id")}) passes a literal array: Mockito matches its
+         * elements one by one, so the array's matcher becomes one matcher per element.
+         */
+        List<String> spreadVarargs(Effect e, List<String> ms) {
+            if (e.args().isEmpty() || !isVarargs(e.owner(), e.name(), e.desc())) return ms;
+            Expr last = e.args().get(e.args().size() - 1);
+            List<Expr> elems = last.arrayElements();
+            if (elems == null) return ms;
+            Type[] ats = Type.getArgumentTypes(e.desc());
+            Type elemType = ats[ats.length - 1].getElementType();
+            List<String> out = new ArrayList<>(ms.subList(0, ms.size() - 1));
+            for (Expr el : elems) out.add(argMatcher(el, elemType, false));
+            return out;
+        }
+
+        /** A parameter the test passes a mock for: arranged so, or mocked by default. */
+        boolean isMockParam(int index) {
+            String v = paramValues.get(index);
+            if (v != null) return v.startsWith("mock(");
+            Type t = paramTypes.containsKey(index) ? paramTypes.get(index)
+                    : r.params().stream().filter(q -> q.index == index).map(q -> Type.getType(q.desc)).findFirst().orElse(null);
+            return t != null && t.getSort() == Type.OBJECT && defaultFor(t).startsWith("mock(");
+        }
+
+        /** Which mock an effect's receiver is, the same way on every path: a @Mock field or a parameter. */
+        String stableMock(Expr t) {
+            if (t.kind == Expr.Kind.FIELD && t.target != null && t.target.kind == Expr.Kind.THIS && deps.containsKey(t.name)) return t.name;
+            if (t.kind == Expr.Kind.PARAM && paramVars.containsKey(t.index) && isMockParam(t.index)) return paramVars.get(t.index);
+            return null;
+        }
+
+        static boolean constantArgs(Effect e) {
+            return e.args().stream().allMatch(a -> (a.kind == Expr.Kind.CONST && a.value != null) || a.kind == Expr.Kind.STATIC
+                    || (a.arrayElements() != null && a.arrayElements().stream().allMatch(x -> x.kind == Expr.Kind.CONST && x.value != null)));
+        }
+
+        /**
+         * Calls on the same mocks that other paths of this method make and this one does not
+         * ({@code errors.rejectValue("name", "required", ..)} when the name is present): {@code verify(.., never())}.
+         * Matched exactly when all arguments are constants; with any() only when this path makes no call of that name.
+         */
+        List<String> expectAbsent() {
+            Map<String, Effect> here = new LinkedHashMap<>();
+            Set<String> namesHere = new HashSet<>();
+            for (Effect e : p.effects()) {
+                if (e.kind() != Effect.Kind.CALL || e.target() == null) continue;
+                String m = stableMock(e.target());
+                if (m == null) continue;
+                here.put(m + "." + e.name() + e.args().stream().map(a -> a.text).toList(), e);
+                namesHere.add(m + "." + e.name());
+            }
+            Set<String> out = new LinkedHashSet<>();
+            for (Path other : r.paths()) {
+                if (other == p) continue;
+                for (Effect e : other.effects()) {
+                    if (e.kind() != Effect.Kind.CALL || e.target() == null || Type.getReturnType(e.desc()).getSort() != Type.VOID) continue;
+                    String m = stableMock(e.target());
+                    if (m == null || here.containsKey(m + "." + e.name() + e.args().stream().map(a -> a.text).toList())) continue;
+                    boolean exact = constantArgs(e);
+                    if (!exact && namesHere.contains(m + "." + e.name())) continue;
+                    // an argument this path cannot name the same way (another path's local value): any()
+                    Type[] ats = Type.getArgumentTypes(e.desc());
+                    boolean overloaded = isOverloaded(e.owner(), e.name(), ats.length);
+                    List<String> ms = new ArrayList<>();
+                    for (int i = 0; i < e.args().size(); i++) {
+                        Expr a = e.args().get(i);
+                        boolean constant = (a.kind == Expr.Kind.CONST && a.value != null) || isEnumConst(a);
+                        ms.add(constant ? argMatcher(a, ats[i], overloaded) : anyMatcher(ats[i], overloaded));
+                    }
+                    if (!exact && ms.stream().anyMatch(x -> x.startsWith("eq("))) {
+                        // mixed: keep the constants, any() for the rest, but only if no call of that name happens here
+                        if (namesHere.contains(m + "." + e.name())) continue;
+                    }
+                    out.add("verify(" + m + ", never())." + e.name() + "(" + String.join(", ", spreadVarargs(e, ms)) + ");");
+                    if (out.size() >= 6) break;
+                }
+            }
+            return new ArrayList<>(out);
         }
 
         /**
@@ -3716,6 +3798,25 @@ public final class TestGenerator {
     }
 
     /** Does the owner (or a supertype in the archive) declare another method with this name and arity? Unknown owners count as overloaded. */
+    /** Is the method declared with {@code ...} (from the archive's bytecode, or the JDK's)? */
+    private boolean isVarargs(String owner, String name, String desc) {
+        for (String c = owner; c != null; ) {
+            ClassNode node = repo.node(c);
+            if (node == null) break;
+            for (MethodNode m : node.methods) if (m.name.equals(name) && m.desc.equals(desc)) return (m.access & Opcodes.ACC_VARARGS) != 0;
+            c = node.superName;
+        }
+        try {
+            Class<?> k = Class.forName(owner.replace('/', '.'), false, ClassLoader.getPlatformClassLoader());
+            for (java.lang.reflect.Method m : k.getMethods()) {
+                if (m.getName().equals(name) && Type.getMethodDescriptor(m).equals(desc)) return m.isVarArgs();
+            }
+        } catch (ReflectiveOperationException | LinkageError ignored) {
+            // not a JDK class
+        }
+        return false;
+    }
+
     private boolean isOverloaded(String owner, String name, int arity) {
         ClassNode start = repo.node(owner);
         if (start == null) return true;

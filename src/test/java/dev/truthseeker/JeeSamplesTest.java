@@ -61,4 +61,16 @@ class JeeSamplesTest {
         // a String element of a driven Enumeration loop gets the value each decision needs
         assertTrue(code.contains("Collections.enumeration(List.of(\"grant\"))") && code.contains("Collections.enumeration(List.of(\"\"))"), code);
     }
+
+    @Test
+    void validatorsAreCheckedForWhatTheyRejectAndWhatNot() throws Exception {
+        String code = generate("fixtures.legacy.SignupValidator");
+        // a parameter mocked by default is verified like any other mock
+        assertTrue(code.contains("verify(errors, atLeastOnce()).rejectValue(eq(\"email\"), eq(\"required\"));"), code);
+        // what other paths reject, this one must not
+        assertTrue(code.contains("verify(errors, never()).rejectValue(eq(\"age\"), eq(\"tooYoung\"));"), code);
+        assertTrue(code.contains("verify(errors, never()).rejectValue(eq(\"email\"), eq(\"required\"));"), code);
+        // a varargs call is matched element by element
+        assertTrue(code.contains("verify(binder, atLeastOnce()).setDisallowedFields(eq(\"id\"), eq(\"*.id\"));"), code);
+    }
 }
