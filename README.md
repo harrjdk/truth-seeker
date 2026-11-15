@@ -93,11 +93,12 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 
 | Application | Archive | Generated tests | Pass | Disabled (TODOs) | Fail |
 |---|---|---|---|---|---|
-| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 190 (12 classes) | 174 | 16 | 0 |
-| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 256 | 8 | 0 |
+| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 187 (12 classes) | 187 | 0 | 0 |
+| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 |
 
-The disabled tests are preconditions the generator can't arrange yet, such as a date comparison between two
-collaborators or a list the method builds itself. Each one carries a `TODO` that names what to arrange.
+Every generated test arranges its path, but not every one can predict the result: 19 PetClinic and 53 Cargo
+Tracker tests end with `assertNotNull(result)` (or no assertion) and a `TODO` naming the expected expression, such
+as a string built from a collaborator's value or the result of a lambda.
 
 ## Build
 
@@ -192,13 +193,18 @@ What it recognizes:
 - precondition helpers as branches to the exception they throw: `Objects.requireNonNull`, Spring `Assert`, Guava `Preconditions`, commons-lang `Validate`
 - null checks on values the path already dereferenced (pruned as infeasible)
 - **constructors of other application classes** (`new HandlingEvent(..)`), inlined so their validation (guards, `throw`s) becomes decisions on the arguments; their field writes stay inside
+- calls on constant strings (`"".isEmpty()`) are computed, so impossible branches are dropped
+- getters on a parameter (`pet.isNew()`) keep their value across loop iterations unless the path changes that parameter
 - **rules held by enum constants**: a no-argument query on an application enum value (`type.requiresVoyage()`) is evaluated per constant from the enum's bytecode, and the path splits into groups such as `type in {LOAD, UNLOAD}`, which tests arrange by passing a matching constant
 - **typed `catch` blocks**: a call inside `try` that can throw a caught type gets a path into the handler, as a `call throws X` decision (checked exceptions when the callee declares them; JDK calls only for specific types such as `NumberFormatException` around `Integer.parseInt`). `throw`s and failing guards inside `try` jump to their handler too, also across inlined helpers
 
 What the test generator arranges:
 - `for`-each loops over parameters, subject fields and stubbed collaborator results: a real collection with one mock element per iteration taken, each stubbed for its own iteration's decisions; `contains(x)` decides membership
 - exception paths: `when(..).thenThrow(..)` / `doThrow(..).when(..)` on the collaborator, a mock exception when the handler inspects it (`ex.getMessage()`), and invalid/valid input for JDK parsers
-- non-empty collections with a mock element of the type the code reads back (`(Leg) legs.get(0)`), `Math.max`/`Math.min` bounds, and `contains`/`startsWith`/`endsWith` on strings (through `toLowerCase()`/`trim()`)
+- non-empty collections with a mock element of the type the code reads back (`(Leg) legs.get(0)`) or declares (`List<Leg> legs`), a `null` element when the path needs one, and emptiness through stream pipelines (`List.copyOf(events.stream().distinct().sorted(..).collect(toList()))` is empty when `events` is)
+- `isEmpty()` and `iterator().next()` on mocked containers such as Spring Data's `Page`
+- `Math.max`/`Math.min` bounds, and `isEmpty`/`contains`/`startsWith`/`endsWith` on strings through `strip()`/`trim()`/`toLowerCase()`
+- `a.isAfter(b)` / `isBefore` between a field and a stubbed date, including one read through `toLocalDate()`
 - `equals`-style comparisons with another instance of the subject's class (`Objects.equals(this.voyage, o.voyage)`): a second real instance, with equal or distinct field values set on both
 
 These are deliberate approximations, and the tool output says so:

@@ -191,4 +191,27 @@ class TruthTableTest {
         // no generic "constructor throws RuntimeException" guess once the body is followed
         assertTrue(r.paths().stream().noneMatch(p -> p.conds().stream().anyMatch(c -> c.kind() == dev.truthseeker.symbolic.Cond.Kind.THROWS)), all);
     }
+
+    @Test
+    void callsOnConstantStringsAreDecidedStatically() throws Exception {
+        PathExplorer.Result r = explore("fixtures.legacy.CustomerSearch", "find");
+        String all = r.paths().stream().map(p -> p.conds().stream().map(c -> c.describe()).toList() + " -> " + p.outcome().describe())
+                .collect(Collectors.joining("\n"));
+        // name = "" when rawName is null: `"".isEmpty()` is not a decision, and its impossible branch is gone
+        assertTrue(r.paths().stream().noneMatch(p -> p.conds().stream().anyMatch(c -> c.key().contains("\"\".isEmpty()"))), all);
+        assertTrue(r.paths().stream().noneMatch(p -> p.outcome().describe().contains("?name=")
+                && p.conds().stream().anyMatch(c -> c.describe().equals("rawName == null"))), all);
+    }
+
+    @Test
+    void parameterGettersKeepTheirValueAcrossLoopIterations() throws Exception {
+        PathExplorer.Result r = explore("fixtures.legacy.Schedule", "accepts");
+        String all = r.paths().stream().map(p -> p.conds().stream().map(c -> c.describe()).toList() + " -> " + p.outcome().describe())
+                .collect(Collectors.joining("\n"));
+        for (var p : r.paths()) {
+            long isNull = p.conds().stream().filter(c -> c.key().startsWith("candidate.getArrival() == null")).map(c -> c.value()).distinct().count();
+            assertTrue(isNull <= 1, "contradictory decisions on candidate.getArrival() kept:\n" + all);
+            assertTrue(p.conds().stream().noneMatch(c -> c.key().startsWith("candidate.getArrival() [iteration")), all);
+        }
+    }
 }

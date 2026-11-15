@@ -8,6 +8,7 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldNode;
+import org.objectweb.asm.tree.LocalVariableNode;
 import org.objectweb.asm.tree.MethodNode;
 
 import java.util.*;
@@ -562,6 +563,11 @@ public final class TestGenerator {
                     });
                     alias = aliasOf[0];
                     Type elemType = elemDesc[0] == null ? Type.getType(Object.class) : Type.getType(elemDesc[0]);
+                    if (elemType.getInternalName().equals("java/lang/Object")) {
+                        // the body never inspects the element on this path: type it from List<Stop> in the declaration
+                        Type declared = declaredElementType(coll);
+                        if (declared != null) elemType = declared;
+                    }
                     if (alias != null) usedNames.add(alias);
                     for (int k = 0; k < trues.get(e.getKey())[0]; k++) {
                         String v;
@@ -647,6 +653,32 @@ public final class TestGenerator {
             return null;
         }
 
+        final Cond SAME_AS_BEFORE = Cond.bool(Expr.constant(1, "Z"), true);
+
+        /**
+         * A later-iteration decision on something the loop does not change (a parameter's getter, not the element or
+         * the iterator): {@link #SAME_AS_BEFORE} when an earlier iteration already decided it the same way, the
+         * decision without its iteration tag when it is decided here first, null when it varies or contradicts.
+         */
+        Cond loopInvariant(Cond c, Cond original) {
+            boolean varies = c.left().mentions(x -> x.kind == Expr.Kind.CALL && (Set.of("hasNext", "next", "iterator").contains(x.name)))
+                    || (c.right() != null && c.right().mentions(x -> x.kind == Expr.Kind.CALL && Set.of("hasNext", "next", "iterator").contains(x.name)))
+                    || c.left().mentions(x -> x.kind == Expr.Kind.LOCAL || x.kind == Expr.Kind.UNKNOWN);
+            if (varies) return null;
+            String base = stripIteration(c.key());
+            for (Cond earlier : p.conds()) {
+                if (earlier == original) break;
+                if (stripIteration(earlier.key()).equals(base)) return earlier.value().equals(c.value()) ? SAME_AS_BEFORE : null;
+            }
+            Expr left = c.left().withText(stripIteration(c.left().text));
+            Expr right = c.right() == null ? null : c.right().withText(stripIteration(c.right().text));
+            return new Cond(c.kind(), left, c.op(), right, c.value(), c.valueExpr(), c.otherCases());
+        }
+
+        String stripIteration(String text) {
+            return text.replaceAll(" \\[iteration \\d+\\]", "");
+        }
+
         void collect() {
             arrangePeers();
             arrangeLoops();
@@ -661,9 +693,14 @@ public final class TestGenerator {
                 }
                 if (collectPeerComparison(c)) continue;
                 if (c.left().text.contains(" [iteration ")) {
-                    // stubbing one value for a per-iteration decision (e.g. hasNext()) could loop forever
-                    todos.add("loop: arrange so that `" + c.describe() + "`");
-                    continue;
+                    Cond invariant = loopInvariant(c, c0);
+                    if (invariant == SAME_AS_BEFORE) continue; // e.g. the parameter's pet.isNew(): one stub answers every iteration
+                    if (invariant != null) c = invariant;
+                    else {
+                        // stubbing one value for a per-iteration decision (e.g. hasNext()) could loop forever
+                        todos.add("loop: arrange so that `" + c.describe() + "`");
+                        continue;
+                    }
                 }
                 switch (c.kind()) {
                     case THROWS -> {
@@ -1056,7 +1093,7 @@ public final class TestGenerator {
                     if (isOptional(t) && (x.name.equals("get") || x.name.equals("orElseThrow"))) {
                         if (!boundLiteral.containsKey(t.text)) ensure(x);
                     } else if (t.kind == Expr.Kind.CALL && !isOptional(t) && t.desc != null && t.desc.startsWith("L")
-                            && !ClassInspector.isValueType(t.desc) && !boundLiteral.containsKey(t.text)) {
+                            && !ClassInspector.isValueType(t.desc) && !boundLiteral.containsKey(t.text) && !boundLiteral.containsKey(canon(t))) {
                         ensure(t);
                     }
                     return false;
@@ -1166,17 +1203,33 @@ public final class TestGenerator {
                             constrain(e.target, "==", Expr.unknown(relativeToNow(e.target.desc, future), e.target.desc));
                             return;
                         }
+                        if (e.args.size() == 1 && orderDates(e.target, e.args.get(0), e.name.equals("isAfter") == v)) return;
                     }
                     case "isEmpty" -> {
-                        if (isOptional(e.target)) constrain(e.target, "present", null, v ? 0 : 1);
-                        else constrain(e.target, "empty", null, v ? 1 : 0);
+                        if (isOptional(e.target)) {
+                            constrain(e.target, "present", null, v ? 0 : 1);
+                            return;
+                        }
+                        Expr t = e.target;
+                        if (isStringLike(t)) {
+                            constrain(unwrapString(t), "empty", null, v ? 1 : 0);
+                            return;
+                        }
+                        Expr src = pipelineSource(t, false);
+                        if (src != t && arrangeable(src)) t = src;
+                        if (t.desc != null && t.desc.startsWith("L") && mutableCollection(Type.getType(t.desc)) == null
+                                && arrangeable(e) && !t.desc.equals("Ljava/lang/Object;")) {
+                            constrain(e, "bool", null, v ? 1 : 0); // a mocked Page/Slice/custom container: stub isEmpty() itself
+                            return;
+                        }
+                        constrain(t, "empty", null, v ? 1 : 0);
                         return;
                     }
                     case "isPresent" -> {
                         if (isOptional(e.target)) { constrain(e.target, "present", null, v ? 1 : 0); return; }
                     }
                     case "isBlank" -> {
-                        constrain(e.target, "empty", null, v ? 1 : 0);
+                        constrain(unwrapString(e.target), "empty", null, v ? 1 : 0);
                         return;
                     }
                     default -> {}
@@ -1195,12 +1248,95 @@ public final class TestGenerator {
 
         // ---- solving ----
         void solve() {
-            for (Target t : targets.values()) {
+            // collections first: their element may settle reads such as `lastLeg == null`
+            List<Target> order = new ArrayList<>(targets.values());
+            order.sort(Comparator.comparingInt(t -> t.cs.stream().anyMatch(c -> c.op().equals("empty")) ? 0 : 1));
+            for (Target t : order) {
+                if (satisfied.contains(canon(t.expr))) continue;
                 String literal = literalFor(t);
                 if (literal == null) continue;
                 bind(t.expr, literal, t);
             }
         }
+
+        /** Targets already arranged as a side effect of another (an element read that the collection literal provides). */
+        final Set<String> satisfied = new HashSet<>();
+
+        boolean isStringLike(Expr e) {
+            return "Ljava/lang/String;".equals(e.desc) || "Ljava/lang/CharSequence;".equals(e.desc);
+        }
+
+        /** {@code s.strip().toLowerCase()} → {@code s}: normalisations that keep emptiness and plain literals unchanged. */
+        Expr unwrapString(Expr s) {
+            while (s.kind == Expr.Kind.CALL && s.target != null && s.args.isEmpty() && "Ljava/lang/String;".equals(s.desc)
+                    && Set.of("toLowerCase", "toUpperCase", "trim", "strip", "stripLeading", "stripTrailing").contains(s.name)) {
+                s = s.target;
+            }
+            return s;
+        }
+
+        /**
+         * The collection a derived one was built from, through steps that keep it empty exactly when the source is
+         * ({@code List.copyOf(src.stream().distinct().sorted(c).collect(toList()))} → {@code src}). With
+         * {@code keepsElements}, only steps that also keep the element objects ({@code map} is excluded).
+         */
+        Expr pipelineSource(Expr e, boolean keepsElements) {
+            for (int guard = 0; guard < 20; guard++) {
+                if (e.kind == Expr.Kind.CALL && e.target == null && e.args.size() == 1
+                        && ((Set.of("java/util/List", "java/util/Set", "java/util/Collection").contains(e.owner) && e.name.equals("copyOf"))
+                        || (e.owner.equals("java/util/Collections") && e.name.startsWith("unmodifiable")))) {
+                    e = e.args.get(0);
+                } else if (e.kind == Expr.Kind.NEW && e.args.size() == 1 && e.owner != null && e.owner.startsWith("java/util/")
+                        && Set.of("ArrayList", "LinkedList", "HashSet", "LinkedHashSet", "TreeSet", "ArrayDeque").contains(Names.simple(e.owner))
+                        && e.args.get(0).desc != null && !e.args.get(0).desc.equals("I")) {
+                    e = e.args.get(0);
+                } else if (e.kind == Expr.Kind.CALL && e.target != null && (
+                        (e.args.isEmpty() && Set.of("stream", "parallelStream", "distinct", "sorted", "toList").contains(e.name))
+                        || (e.args.size() == 1 && e.name.equals("sorted"))
+                        || (e.args.size() == 1 && e.name.equals("map") && !keepsElements)
+                        || (e.args.size() == 1 && e.name.equals("collect") && isCollectingToCollection(e.args.get(0))))) {
+                    e = e.target;
+                } else break;
+            }
+            return e;
+        }
+
+        boolean isCollectingToCollection(Expr c) {
+            return c.kind == Expr.Kind.CALL && c.target == null && "java/util/stream/Collectors".equals(c.owner)
+                    && Set.of("toList", "toSet", "toUnmodifiableList", "toUnmodifiableSet").contains(c.name);
+        }
+
+        /**
+         * {@code a.isAfter(b)} (or before) where both sides can be set: pin {@code a} to a sample date and put
+         * {@code b} a day away; a side read through {@code toLocalDate()} is set as the start of that day.
+         */
+        boolean orderDates(Expr a, Expr b, boolean aAfter) {
+            if (!isTemporal(a) || !isTemporal(b)) return false;
+            Expr sa = dateSettable(a), sb = dateSettable(b);
+            if (sa == null || sb == null) return false;
+            String base = nonNullSample(Type.getType(a.desc), a);
+            if (base == null) return false;
+            String other = a.desc.equals("Ljava/time/Instant;") ? base + (aAfter ? ".minusSeconds(86400)" : ".plusSeconds(86400)")
+                    : base + (aAfter ? ".minusDays(1)" : ".plusDays(1)");
+            constrain(sa, "==", Expr.unknown(asDateOf(sa, a, base), sa.desc));
+            constrain(sb, "==", Expr.unknown(asDateOf(sb, b, other), sb.desc));
+            return true;
+        }
+
+        /** The value a test sets to control date {@code e}: itself, or the date-time it was converted from. */
+        Expr dateSettable(Expr e) {
+            if (e.kind == Expr.Kind.CALL && e.target != null && e.args.isEmpty() && "toLocalDate".equals(e.name)
+                    && "Ljava/time/LocalDateTime;".equals(e.target.desc)) return arrangeable(e.target) ? e.target : null;
+            // a call on a JDK value (date.plusDays(1)) cannot be stubbed
+            if (e.kind == Expr.Kind.CALL && e.target != null && e.target.desc != null && e.target.desc.startsWith("Ljava/")) return null;
+            return arrangeable(e) ? e : null;
+        }
+
+        String asDateOf(Expr settable, Expr compared, String src) {
+            if (settable == compared) return src;
+            return "(" + src + ").atStartOfDay()"; // LocalDate → LocalDateTime read back through toLocalDate()
+        }
+
 
         String literalFor(Target t) {
             Expr e = t.expr;
@@ -1338,6 +1474,10 @@ public final class TestGenerator {
             if (coll != null) {
                 if (empty) return coll;
                 String element = elementFor(e);
+                if (element != null && element.endsWith(") null")) {
+                    imports.add("java.util.Arrays");
+                    return coll.replace("<>()", "<>(Arrays.asList(" + element + "))"); // List.of rejects null
+                }
                 if (element != null) return coll.replace("<>()", "<>(" + collectionFactory(type) + "(" + element + "))");
                 todos.add("`" + e.text + "` must be non-empty: put a realistic element into it");
                 return coll.replace("<>()", "<>(" + collectionFactory(type) + "(new Object()))");
@@ -1359,16 +1499,34 @@ public final class TestGenerator {
             String key = canon(coll);
             for (Expr root : all) root.mentions(x -> {
                 if (x.kind == Expr.Kind.CALL && x.target != null && x.desc != null && x.desc.startsWith("L")) {
-                    boolean get = (x.name.equals("get") && x.args.size() == 1) && canon(x.target).equals(key);
+                    boolean get = (x.name.equals("get") && x.args.size() == 1)
+                            && (canon(x.target).equals(key) || canon(pipelineSource(x.target, true)).equals(key));
                     boolean next = x.name.equals("next") && x.args.isEmpty() && x.target.kind == Expr.Kind.CALL
-                            && "iterator".equals(x.target.name) && x.target.target != null && canon(x.target.target).equals(key);
+                            && "iterator".equals(x.target.name) && x.target.target != null
+                            && (canon(x.target.target).equals(key) || canon(pipelineSource(x.target.target, true)).equals(key));
                     if (get || next) reads.add(x);
                 }
                 return false;
             });
             Type t = null;
             for (Expr r : reads) if (!r.desc.equals("Ljava/lang/Object;")) { t = Type.getType(r.desc); break; }
+            if (t == null) t = declaredElementType(coll);
             if (t == null || !isMockable(t)) return null;
+            // a read the path needs null (`lastLeg == null` on a non-empty list): the element itself is null
+            for (Expr r : reads) {
+                Target rt = targets.get(canon(r));
+                if (rt != null && rt.cs.stream().anyMatch(c -> c.op().equals("==") && c.other() != null && c.other().kind == Expr.Kind.NULL)) {
+                    for (Expr x : reads) satisfied.add(canon(x));
+                    return "(" + imports.ref(t) + ") null";
+                }
+            }
+            if (reads.isEmpty()) {
+                // only traversed by a stream/lambda the path does not show: an element whose getters return mocks, not null
+                imports.add("org.mockito.Mockito");
+                String name = newVarNamed(t);
+                arrange.add(imports.ref(t) + " " + name + " = mock(" + imports.ref(t) + ".class, Mockito.RETURNS_MOCKS);");
+                return name;
+            }
             String v = newVar(t);
             for (Expr r : reads) {
                 ensured.put(r.text, v);
@@ -1410,6 +1568,39 @@ public final class TestGenerator {
             return found[0];
         }
 
+        /** Element type from the generic signature of a subject field or parameter ({@code List<Leg> legs}). */
+        Type declaredElementType(Expr coll) {
+            String sig = null;
+            if (coll.kind == Expr.Kind.FIELD && coll.target != null && coll.target.kind == Expr.Kind.THIS) {
+                for (String c = cn.name; c != null && sig == null; ) {
+                    ClassNode node = c.equals(cn.name) ? cn : repo.node(c);
+                    if (node == null) break;
+                    for (FieldNode fn : node.fields) if (fn.name.equals(coll.name)) sig = fn.signature;
+                    c = node.superName;
+                }
+            } else if (coll.kind == Expr.Kind.PARAM && r.method().localVariables != null && coll.extra instanceof Integer slot) {
+                for (LocalVariableNode lv : r.method().localVariables) if (lv.index == slot && lv.signature != null) sig = lv.signature;
+            }
+            if (sig == null) return null;
+            int lt = sig.indexOf('<');
+            if (lt < 0) return null;
+            int i = lt + 1;
+            if (i < sig.length() && (sig.charAt(i) == '+' || sig.charAt(i) == '=')) i++;
+            if (i >= sig.length() || sig.charAt(i) != 'L') return null;
+            int end = i;
+            while (end < sig.length() && sig.charAt(end) != ';' && sig.charAt(end) != '<') end++;
+            return Type.getObjectType(sig.substring(i + 1, end));
+        }
+
+        String newVarNamed(Type t) {
+            String base = Names.simple(t.getInternalName());
+            base = Character.toLowerCase(base.charAt(0)) + base.substring(1);
+            String name = base;
+            while (usedNames.contains(name)) name = base + (++varCounter);
+            usedNames.add(name);
+            return name;
+        }
+
         String newVar(Type t) {
             String base = Names.simple(t.getInternalName());
             base = Character.toLowerCase(base.charAt(0)) + base.substring(1);
@@ -1423,7 +1614,8 @@ public final class TestGenerator {
         /** Returns a variable that holds the (mock) value of {@code e}, creating stubs as needed; null if impossible. */
         String ensure(Expr e) {
             if (e == null) return null;
-            if (ensured.containsKey(e.text)) return ensured.get(e.text);
+            // an alias is looked up by what it stands for: a reassigned parameter's name may mean another value
+            if (e.expansion() == null && ensured.containsKey(e.text)) return ensured.get(e.text);
             if (ensured.containsKey(canon(e))) return ensured.get(canon(e));
             String v = null;
             switch (e.kind) {
@@ -1456,6 +1648,16 @@ public final class TestGenerator {
                     }
                     Type t = e.desc == null ? null : Type.getType(e.desc);
                     if (t == null || t.getSort() != Type.OBJECT || ClassInspector.isValueType(e.desc)) break;
+                    if (e.name.equals("next") && e.args.isEmpty() && e.target.kind == Expr.Kind.CALL && "iterator".equals(e.target.name)
+                            && e.target.args.isEmpty() && e.target.target != null && isMockable(t)) {
+                        // page.iterator().next() on a mocked Page/Iterable: a real iterator over one mock element
+                        String owner = ensure(e.target.target);
+                        if (owner == null) break;
+                        v = newVar(t);
+                        imports.add("java.util.List");
+                        stubs.put(stubKey(owner, e.target), "when(" + owner + ".iterator()).thenReturn(List.of(" + v + ").iterator());");
+                        break;
+                    }
                     String tv = ensure(e.target);
                     if (tv == null) break;
                     v = newVar(t);
@@ -1464,7 +1666,7 @@ public final class TestGenerator {
                 default -> v = null;
             }
             if (v != null) {
-                ensured.put(e.text, v);
+                if (e.expansion() == null) ensured.put(e.text, v);
                 ensured.put(canon(e), v);
             }
             return v;

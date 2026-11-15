@@ -47,7 +47,9 @@ class GeneratedTestsExecutionTest {
                 // try/catch: thenThrow/doThrow on collaborators, parser input, throws inside inlined helpers
                 "fixtures.legacy.AccountService",
                 // constructors of other classes and rules held by enum constants
-                "fixtures.legacy.ShipmentEventFactory"));
+                "fixtures.legacy.ShipmentEventFactory",
+                // typed list elements, null elements, stream pipelines, date ordering, paged results
+                "fixtures.legacy.Schedule", "fixtures.legacy.History", "fixtures.legacy.Deadline", "fixtures.legacy.CustomerSearch"));
         if (TestSupport.hasJava21Fixtures()) classes.add("fixtures.modern.Shapes");
 
         Path src = tmp.resolve("src");

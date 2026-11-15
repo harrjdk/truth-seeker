@@ -135,6 +135,12 @@ public final class Expr {
         return new Expr(Kind.SWITCH_INDEX, "switchIndex(" + selector.text + ")", "I", null, enumOwner, null, null, selector, null, -1, labels);
     }
 
+    /** A string concatenation: displayed as its source text, with the non-constant parts kept as {@link #args}. */
+    public static Expr concat(String text, List<Expr> parts) {
+        List<Expr> vars = parts.stream().filter(x -> !x.isConst()).toList();
+        return new Expr(Kind.UNKNOWN, text, "Ljava/lang/String;", null, null, null, null, null, vars, -1, null);
+    }
+
     public static Expr unknown(String text, String desc) {
         return new Expr(Kind.UNKNOWN, text, desc, null, null, null, null, null, null, -1, null);
     }

@@ -647,7 +647,7 @@ public final class PathExplorer {
      */
     private boolean repeatsInNewIteration(Frame f, Cond c) {
         if (f.iteration == 0) return false;
-        boolean mutable = isMutable(c.left()) || (c.right() != null && isMutable(c.right()));
+        boolean mutable = isMutableIn(f, c.left()) || (c.right() != null && isMutableIn(f, c.right()));
         if (!mutable) return false;
         for (int i = 0; i < f.barrier && i < f.conds.size(); i++) {
             if (f.conds.get(i).key().equals(c.key())) return true;
@@ -668,9 +668,30 @@ public final class PathExplorer {
         return n;
     }
 
-    private static boolean isMutable(Expr e) {
-        return e.mentions(x -> x.kind == Expr.Kind.CALL || x.kind == Expr.Kind.FIELD || x.kind == Expr.Kind.ARRAY_ELEM
-                || x.kind == Expr.Kind.LOCAL || x.kind == Expr.Kind.UNKNOWN);
+    /**
+     * Mutable state (calls, fields, array elements, locals) may change between iterations, except a getter chain on a
+     * parameter this path never changed ({@code pet.isNew()}, {@code pet.getOwner().getId()}): it answers the same each time.
+     */
+    private static boolean isMutableIn(Frame f, Expr e) {
+        return e.mentions(x -> (x.kind == Expr.Kind.CALL && !isStableGetter(f, x)) || x.kind == Expr.Kind.FIELD
+                || x.kind == Expr.Kind.ARRAY_ELEM || x.kind == Expr.Kind.LOCAL || x.kind == Expr.Kind.UNKNOWN);
+    }
+
+    private static boolean isStableGetter(Frame f, Expr x) {
+        Expr root = x;
+        while (root.kind == Expr.Kind.CALL) {
+            if (root.target == null || !root.args.isEmpty() || root.expansion() != null) return false;
+            String n = root.name;
+            boolean getter = (n.startsWith("get") && n.length() > 3) || (n.startsWith("is") && n.length() > 2) || (n.startsWith("has") && n.length() > 3);
+            if (!getter || n.equals("hasNext")) return false;
+            root = root.target;
+        }
+        if (root.kind != Expr.Kind.PARAM) return false;
+        String rootText = root.text;
+        for (Effect ef : f.effects) {
+            if (ef.target() != null && (ef.target().text.equals(rootText) || ef.target().text.startsWith(rootText + "."))) return false;
+        }
+        return true;
     }
 
     private static Cond rekey(Cond c, String suffix) {
@@ -943,7 +964,7 @@ public final class PathExplorer {
                 return true;
             }
             if (m.name.equals("toString")) {
-                f.push(Expr.unknown(joinConcat(concatParts(recv)), "Ljava/lang/String;"));
+                f.push(Expr.concat(joinConcat(concatParts(recv)), concatParts(recv)));
                 return true;
             }
         }
@@ -955,6 +976,11 @@ public final class PathExplorer {
         if (m.getOpcode() == INVOKESTATIC && m.owner.equals("java/lang/String") && m.name.equals("valueOf")
                 && m.desc.equals("(Ljava/lang/Object;)Ljava/lang/String;")) {
             f.push(Expr.unknown(args[0].text, "Ljava/lang/String;"));
+            return true;
+        }
+        Expr folded = foldStringCall(m, recv, args);
+        if (folded != null) {
+            f.push(folded);
             return true;
         }
         if (inline(f, m, recv, args)) return true;
@@ -969,6 +995,54 @@ public final class PathExplorer {
         if (!loggerCall) forkThrows(f, call, m, work);
         if (ret.getSort() != Type.VOID) f.push(call);
         return true;
+    }
+
+    /**
+     * A String method on a constant receiver with constant arguments ({@code "".isEmpty()}, {@code "A".equals("B")}),
+     * computed here so the branch it feeds is decided statically. Null when it is not one.
+     */
+    private static Expr foldStringCall(MethodInsnNode m, Expr recv, Expr[] args) {
+        if (recv == null || m.getOpcode() != INVOKEVIRTUAL || !m.owner.equals("java/lang/String")
+                || recv.kind != Expr.Kind.CONST || !(recv.value instanceof String s)) return null;
+        Type ret = Type.getReturnType(m.desc);
+        if (ret.getSort() != Type.BOOLEAN && ret.getSort() != Type.INT && !ret.getDescriptor().equals("Ljava/lang/String;")) return null;
+        if (m.name.equals("intern") || m.name.equals("hashCode") || m.name.equals("formatted")) return null;
+        Type[] ats = Type.getArgumentTypes(m.desc);
+        Class<?>[] types = new Class<?>[ats.length];
+        Object[] values = new Object[ats.length];
+        for (int i = 0; i < ats.length; i++) {
+            Expr a = args[i];
+            if (a.kind != Expr.Kind.CONST) return null;
+            switch (ats[i].getDescriptor()) {
+                case "Ljava/lang/String;", "Ljava/lang/Object;", "Ljava/lang/CharSequence;" -> {
+                    if (!(a.value instanceof String v)) return null;
+                    types[i] = ats[i].getDescriptor().equals("Ljava/lang/String;") ? String.class
+                            : ats[i].getDescriptor().equals("Ljava/lang/Object;") ? Object.class : CharSequence.class;
+                    values[i] = v;
+                }
+                case "I" -> {
+                    if (!(a.value instanceof Number n)) return null;
+                    types[i] = int.class;
+                    values[i] = n.intValue();
+                }
+                case "C" -> {
+                    if (a.value instanceof Number n) values[i] = (char) n.intValue();
+                    else if (a.value instanceof Character c) values[i] = c;
+                    else return null;
+                    types[i] = char.class;
+                }
+                default -> { return null; }
+            }
+        }
+        try {
+            Object r = String.class.getMethod(m.name, types).invoke(s, values);
+            if (r instanceof Boolean b) return Expr.constant(b ? 1 : 0, "Z");
+            if (r instanceof Integer n) return Expr.constant(n, "I");
+            if (r instanceof String str) return Expr.constant(str, "Ljava/lang/String;");
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return null; // would throw at run time (e.g. charAt out of range): leave it symbolic
+        }
+        return null;
     }
 
     /**
@@ -1561,7 +1635,7 @@ public final class PathExplorer {
                 }
                 if (lit.length() > 0) parts.add(Expr.constant(lit.toString(), "Ljava/lang/String;"));
             } else parts.addAll(Arrays.asList(args));
-            f.push(Expr.unknown(joinConcat(parts), "Ljava/lang/String;"));
+            f.push(Expr.concat(joinConcat(parts), parts));
             return;
         }
         if (bsmOwner.equals("java/lang/invoke/LambdaMetafactory") && indy.bsmArgs.length > 1 && indy.bsmArgs[1] instanceof Handle h) {
