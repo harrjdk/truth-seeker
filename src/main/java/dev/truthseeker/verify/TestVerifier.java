@@ -67,6 +67,17 @@ public final class TestVerifier {
         Map<String, List<String>> compileErrors = new LinkedHashMap<>();
         List<String> notCompiled = new ArrayList<>();
         List<String> errors = compile(javac, sources, classes, cp);
+        Set<String> missingApis = ProvidedApis.missingPackages(errors);
+        if (!missingApis.isEmpty()) {
+            // `provided` container APIs are never inside a WAR/EAR: borrow them from the local Maven repository
+            List<Path> apis = ProvidedApis.find(missingApis);
+            if (!apis.isEmpty()) {
+                apis.forEach(p -> cp.add(p.toString()));
+                notes.add("Added `provided` API jar(s) from the local Maven repository for " + String.join(", ", missingApis) + ": "
+                        + apis.stream().map(p -> p.getFileName().toString()).collect(java.util.stream.Collectors.joining(", ")) + ".");
+                errors = compile(javac, sources, classes, cp);
+            }
+        }
         int compiled = sources.size();
         if (!errors.isEmpty()) {
             compiled = 0;

@@ -49,7 +49,9 @@ class GeneratedTestsExecutionTest {
                 // constructors of other classes and rules held by enum constants
                 "fixtures.legacy.ShipmentEventFactory",
                 // typed list elements, null elements, stream pipelines, date ordering, paged results
-                "fixtures.legacy.Schedule", "fixtures.legacy.History", "fixtures.legacy.Deadline", "fixtures.legacy.CustomerSearch"));
+                "fixtures.legacy.Schedule", "fixtures.legacy.History", "fixtures.legacy.Deadline", "fixtures.legacy.CustomerSearch",
+                // JPetStore-shaped: iterator loops, map fields, objects built on the path, session attributes
+                "fixtures.shop.Basket", "fixtures.shop.BasketController", "fixtures.shop.OrderLine", "fixtures.shop.Shelf"));
         if (TestSupport.hasJava21Fixtures()) classes.add("fixtures.modern.Shapes");
 
         Path src = tmp.resolve("src");

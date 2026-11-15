@@ -95,6 +95,13 @@ public final class Expr {
                 "<init>", ctorDesc, null, args, -1, null);
     }
 
+    /** Same expression tagged with an identity ({@code new Cart()} built at a given point of a path). */
+    public Expr withExtra(Object newExtra) {
+        Expr e = new Expr(kind, text, desc, value, owner, name, memberDesc, target, args, index, newExtra);
+        e.expansion = expansion;
+        return e;
+    }
+
     /** Placeholder for the result of NEW before its constructor runs. */
     public static Expr uninitialized(String owner, int insnIndex) {
         return new Expr(Kind.NEW, "new " + Names.simple(owner), "L" + owner + ";", null, owner, null, null, null, null,
@@ -155,6 +162,16 @@ public final class Expr {
     /** A string concatenation: displayed as its source text, with its parts kept as {@link #args}. */
     public static Expr concat(String text, List<Expr> parts) {
         return new Expr(Kind.UNKNOWN, text, "Ljava/lang/String;", null, null, null, null, null, parts, -1, "concat");
+    }
+
+    /** {@code arr.length}: kept as the array (in {@link #args}) so later stages can see what was measured. */
+    public static Expr arrayLength(Expr array) {
+        return new Expr(Kind.UNKNOWN, array.paren() + ".length", "I", null, null, "length", null, null, List.of(array), -1, "arraylength");
+    }
+
+    /** The array measured by an {@link #arrayLength}, or null. */
+    public Expr measuredArray() {
+        return kind == Kind.UNKNOWN && "arraylength".equals(extra) ? args.get(0) : null;
     }
 
     /** True for a string concatenation built by {@link #concat}: {@link #args} are its parts in order. */

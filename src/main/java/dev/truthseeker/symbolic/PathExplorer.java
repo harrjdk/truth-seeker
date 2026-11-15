@@ -119,6 +119,8 @@ public final class PathExplorer {
         HashMap<String, Expr> thisFields;
         /** Values dereferenced on this path (call receivers, field targets, checked non-null): cannot be null afterwards. */
         HashSet<String> nonNull;
+        /** Collaborator results dereferenced on this path, in order (kept across loop iterations, unlike nonNull). */
+        ArrayList<Expr> derefs;
         /** Local-variable display names bound on this path: name → (method that bound it, full expression). */
         HashMap<String, Binding> aliases;
         ArrayList<Cond> conds;
@@ -140,6 +142,7 @@ public final class PathExplorer {
             f.locals = locals.clone();
             f.thisFields = new HashMap<>(thisFields);
             f.nonNull = new HashSet<>(nonNull);
+            f.derefs = new ArrayList<>(derefs);
             f.aliases = new HashMap<>(aliases);
             f.conds = new ArrayList<>(conds);
             f.effects = new ArrayList<>(effects);
@@ -177,6 +180,7 @@ public final class PathExplorer {
         init.locals = new Expr[Math.max(mn.maxLocals, 1 + argTypes.length * 2)];
         init.thisFields = new HashMap<>(seedFields);
         init.nonNull = new HashSet<>();
+        init.derefs = new ArrayList<>();
         init.aliases = new HashMap<>();
         init.conds = new ArrayList<>();
         init.effects = new ArrayList<>();
@@ -251,7 +255,7 @@ public final class PathExplorer {
     }
 
     private void finish(Frame f, Path.Outcome outcome) {
-        paths.add(new Path(++pathIds, List.copyOf(f.conds), List.copyOf(f.effects), outcome));
+        paths.add(new Path(++pathIds, List.copyOf(f.conds), List.copyOf(f.effects), outcome, List.copyOf(f.derefs)));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -558,6 +562,9 @@ public final class PathExplorer {
                 dereferenced(f, target);
                 String built = constructedKey(f, target, fi.name);
                 if (built != null && f.thisFields.containsKey(built)) f.push(f.thisFields.get(built));
+                else if (built != null && !incompleteObjects.contains(target.extra) && !insideConstructorOf(f, target)) {
+                    f.push(defaultValue(fi.desc)); // no constructor of the object set it (lazy init: if (vets == null))
+                }
                 else if (target.kind == Expr.Kind.THIS && f.thisFields.containsKey(fi.name)) f.push(f.thisFields.get(fi.name));
                 else f.push(Expr.field(target, fi.owner, fi.name, fi.desc));
             }
@@ -599,7 +606,7 @@ public final class PathExplorer {
             }
             case ARRAYLENGTH -> {
                 Expr a = f.pop();
-                f.push(Expr.unknown(a.text + ".length", "I"));
+                f.push(Expr.arrayLength(a));
             }
             case CHECKCAST -> {
                 Expr v = f.pop();
@@ -745,7 +752,8 @@ public final class PathExplorer {
     }
 
     private static void dereferenced(Frame f, Expr e) {
-        if (e.kind != Expr.Kind.THIS && e.kind != Expr.Kind.STATIC) f.nonNull.add(valueKey(e));
+        if (e.kind != Expr.Kind.THIS && e.kind != Expr.Kind.STATIC && f.nonNull.add(valueKey(e)) && e.kind == Expr.Kind.CALL
+                && f.derefs.stream().noneMatch(d -> d.text.equals(e.text))) f.derefs.add(e);
     }
 
     /** Statically known outcome, including null checks on values this path already dereferenced; else null. */
@@ -940,7 +948,7 @@ public final class PathExplorer {
 
         if (m.name.equals("<init>")) {
             if (recv != null && recv.isUninitialized()) {
-                Expr created = Expr.newObject(m.owner, m.desc, argList);
+                Expr created = Expr.newObject(m.owner, m.desc, argList).withExtra(++objectIds);
                 if (isStringBuilder(m.owner)) {
                     created = Expr.unknown(args.length == 1 ? args[0].text : "", "L" + m.owner + ";");
                     created = markConcat(created, args.length == 1 ? List.of(args[0]) : List.of());
@@ -950,6 +958,11 @@ public final class PathExplorer {
                 if (repo != null && !repo.entry(m.owner).map(ClassRepository.ClassEntry::library).orElse(true)) {
                     forkThrows(f, created, m, work);
                 }
+            } else if (recv != null && recv.kind == Expr.Kind.NEW && recv.extra != null && builtObjects.contains(recv.extra)
+                    && !m.owner.equals("java/lang/Object")) {
+                // super(..) inside a followed constructor: follow it too, or the object's fields are not all known
+                if (inlineConstructor(f, m, recv, args, true)) return true;
+                incompleteObjects.add(recv.extra);
             } else if (recv != null && recv.kind == Expr.Kind.THIS && !m.owner.equals("java/lang/Object")) {
                 f.effects.add(new Effect(Effect.Kind.CALL, recv, m.owner, m.owner.equals(cn.name) ? "this" : "super", m.desc, argList, null));
             }
@@ -993,6 +1006,12 @@ public final class PathExplorer {
             return true;
         }
         if (inline(f, m, recv, args)) return true;
+        if (inlineOnBuilt(f, m, recv, args)) return true;
+        Expr fresh = freshCollectionAnswer(f, m, recv);
+        if (fresh != null) {
+            if (Type.getReturnType(m.desc).getSort() != Type.VOID) f.push(fresh);
+            return true;
+        }
         Boolean guarded = guard(f, m, args, work);
         if (guarded != null) return guarded;
         if (enumRule(f, m, recv, args, work)) return true;
@@ -1231,10 +1250,12 @@ public final class PathExplorer {
             }
             if (thrown == null && isUnchecked(h.type())) {
                 if (jdk && GENERIC_EXCEPTIONS.contains(h.type())) continue;
-                boolean parser = m.name.startsWith("parse") || m.name.equals("valueOf");
-                if (jdk && isPureLibraryCall(m) && !parser) continue;
-                // value types (dates, decimals, UUIDs) only fail on bad input when parsed or converted
-                if (jdk && isJdkValueType(m.owner) && !parser && !m.name.equals("of") && !m.name.startsWith("from")) continue;
+                // JDK code fails on bad input where it parses or converts it (Integer.parseInt, LocalDate.of, UUID.fromString);
+                // an Iterator.remove() or List.add() inside the same try is not what the handler is for
+                boolean converts = m.name.startsWith("parse") || m.name.equals("valueOf") || m.name.equals("of")
+                        || m.name.startsWith("from") || m.name.equals("decode") || m.name.equals("forName")
+                        || (m.name.equals("<init>") && isJdkValueType(m.owner));
+                if (jdk && !converts) continue;
                 thrown = h.type();
             }
             if (thrown == null && !jdk && (h.type().equals("java/lang/Exception") || h.type().equals("java/lang/Throwable"))) {
@@ -1359,8 +1380,6 @@ public final class PathExplorer {
         Caller c = f.caller;
         if (c.effectMark() >= 0) {
             while (f.effects.size() > c.effectMark()) f.effects.remove(f.effects.size() - 1);
-            String prefix = constructedPrefix(c.constructing());
-            f.thisFields.keySet().removeIf(k -> k.startsWith(prefix));
         }
         f.caller = c.parent();
         f.method = c.method();
@@ -1378,15 +1397,21 @@ public final class PathExplorer {
      * of the path: guards, {@code throw}s and decisions on the arguments. Its field writes and calls stay inside it.
      */
     private boolean inlineConstructor(Frame f, MethodInsnNode m, Expr created, Expr[] args) {
+        return inlineConstructor(f, m, created, args, false);
+    }
+
+    private boolean inlineConstructor(Frame f, MethodInsnNode m, Expr created, Expr[] args, boolean superCall) {
         if (!opt.inlineSelfCalls() || repo == null) return false;
         if (repo.entry(m.owner).map(ClassRepository.ClassEntry::library).orElse(true)) return false;
         ClassNode node = repo.node(m.owner);
-        if (node == null || (node.access & (ACC_ENUM | ACC_ABSTRACT | ACC_INTERFACE)) != 0) return false;
-        if (f.caller != null && f.caller.depth() >= MAX_INLINE_DEPTH) return false;
+        if (node == null || (node.access & (ACC_ENUM | ACC_INTERFACE)) != 0 || (!superCall && (node.access & ACC_ABSTRACT) != 0)) return false;
+        // constructors are mostly argument checks and assignments: one level deeper than other calls
+        if (f.caller != null && f.caller.depth() >= MAX_INLINE_DEPTH + 1) return false;
         MethodNode target = null;
         for (MethodNode c : node.methods) if (c.name.equals("<init>") && c.desc.equals(m.desc)) target = c;
         if (target == null || target.instructions.size() == 0 || target.instructions.size() > MAX_INLINE_INSNS) return false;
         if (target == f.method || (f.caller != null && f.caller.contains(target))) return false;
+        if (created.extra != null) builtObjects.add(created.extra);
         f.caller = new Caller(f.method, f.pc, List.copyOf(f.stack), f.locals, f.visits, f.caller, created, f.effects.size());
         Expr[] locals = new Expr[Math.max(target.maxLocals, 1 + args.length * 2)];
         int slot = 0;
@@ -1406,13 +1431,104 @@ public final class PathExplorer {
     }
 
     private static String constructedPrefix(Expr built) {
-        return "\u0000" + System.identityHashCode(built) + ".";
+        return "\u0000new" + built.extra + ".";
     }
 
-    /** thisFields key for a field of the object the current inlined constructor builds, or null. */
-    private static String constructedKey(Frame f, Expr target, String field) {
-        Expr built = f.caller == null ? null : f.caller.constructing();
-        return built != null && target == built ? constructedPrefix(built) + field : null;
+    /** Objects built on a path whose constructor was followed: their fields are known (ids from {@link #objectIds}). */
+    private final Set<Object> builtObjects = new HashSet<>();
+    /** Built objects with a superclass constructor that could not be followed: unset fields are not known to be default. */
+    private final Set<Object> incompleteObjects = new HashSet<>();
+    private int objectIds;
+
+    /**
+     * thisFields key for a field of an object this path built with a followed constructor ({@code new Cart()}), or null.
+     * Its fields keep the constructor's values afterwards, so methods called on it can be followed too.
+     */
+    private String constructedKey(Frame f, Expr target, String field) {
+        return target.kind == Expr.Kind.NEW && target.extra != null && builtObjects.contains(target.extra)
+                ? constructedPrefix(target) + field : null;
+    }
+
+    /**
+     * A method called on an application object this path built ({@code cart = new Cart(); cart.containsItemId(id)}):
+     * followed like a self-call, with the fields its constructor set.
+     */
+    private boolean inlineOnBuilt(Frame f, MethodInsnNode m, Expr recv, Expr[] args) {
+        if (!opt.inlineSelfCalls() || recv == null || recv.kind != Expr.Kind.NEW || recv.extra == null || !builtObjects.contains(recv.extra)) return false;
+        if (m.getOpcode() == INVOKESTATIC || m.name.equals("<init>")) return false;
+        if (f.caller != null && f.caller.depth() >= MAX_INLINE_DEPTH) return false;
+        for (Caller c = f.caller; c != null; c = c.parent()) if (c.constructing() != null) return false; // its own constructor's calls stay symbolic
+        MethodNode target = resolveOwn(recv.owner, m.name, m.desc);
+        if (target == null || target.instructions.size() == 0 || target.instructions.size() > MAX_INLINE_INSNS
+                || (target.access & (ACC_ABSTRACT | ACC_NATIVE | ACC_STATIC)) != 0) return false;
+        if (target == f.method || (f.caller != null && f.caller.contains(target))) return false;
+        f.caller = new Caller(f.method, f.pc, List.copyOf(f.stack), f.locals, f.visits, f.caller, null, -1);
+        Expr[] locals = new Expr[Math.max(target.maxLocals, 1 + args.length * 2)];
+        int slot = 0;
+        locals[slot++] = recv;
+        Type[] ats = Type.getArgumentTypes(target.desc);
+        for (int i = 0; i < args.length; i++) {
+            locals[slot] = args[i];
+            slot += ats[i].getSize();
+        }
+        f.method = target;
+        f.stack = new ArrayList<>();
+        f.locals = locals;
+        f.visits = new int[target.instructions.size()];
+        f.pc = -1;
+        notes.add("Methods called on objects the path itself built (new Cart()) are followed with the fields their constructor set.");
+        return true;
+    }
+
+    private static final Set<String> FRESH_COLLECTIONS = Set.of("java/util/ArrayList", "java/util/LinkedList", "java/util/HashMap",
+            "java/util/LinkedHashMap", "java/util/TreeMap", "java/util/HashSet", "java/util/LinkedHashSet", "java/util/TreeSet",
+            "java/util/ArrayDeque", "java/util/concurrent/ConcurrentHashMap", "java/util/concurrent/CopyOnWriteArrayList");
+
+    /**
+     * A query on a collection created empty on this path and not touched since ({@code new ArrayList<>()} in a
+     * constructor): {@code isEmpty()} is true, {@code size()} 0, lookups miss, its iterator has nothing. Else null.
+     */
+    private Expr freshCollectionAnswer(Frame f, MethodInsnNode m, Expr recv) {
+        if (recv == null || m.getOpcode() == INVOKESTATIC) return null;
+        Expr coll = recv;
+        boolean viaIterator = false;
+        if (m.name.equals("hasNext") && recv.kind == Expr.Kind.CALL && "iterator".equals(recv.name) && recv.target != null) {
+            coll = recv.target;
+            viaIterator = true;
+        }
+        if (coll.kind != Expr.Kind.NEW || !coll.args.isEmpty() || coll.owner == null || !FRESH_COLLECTIONS.contains(coll.owner)) return null;
+        String text = coll.text;
+        for (Effect e : f.effects) { // added to, or handed somewhere that might add to it: no longer known to be empty
+            if (e.target() != null && e.target().mentions(x -> x.text.equals(text))) return null;
+            if (e.args().stream().anyMatch(a -> a.mentions(x -> x.text.equals(text)))) return null;
+            if (e.value() != null && e.value().mentions(x -> x.text.equals(text))) return null;
+        }
+        boolean map = coll.owner.endsWith("Map");
+        String d = m.desc;
+        if (viaIterator) return Expr.constant(0, "Z");
+        return switch (m.name) {
+            case "isEmpty" -> d.equals("()Z") ? Expr.constant(1, "Z") : null;
+            case "size" -> d.equals("()I") ? Expr.constant(0, "I") : null;
+            case "contains", "containsKey", "containsValue" -> d.equals("(Ljava/lang/Object;)Z") ? Expr.constant(0, "Z") : null;
+            case "get", "remove" -> map && d.equals("(Ljava/lang/Object;)Ljava/lang/Object;") ? Expr.nul() : null;
+            default -> null;
+        };
+    }
+
+    private static boolean insideConstructorOf(Frame f, Expr built) {
+        for (Caller c = f.caller; c != null; c = c.parent()) if (c.constructing() != null && Objects.equals(c.constructing().extra, built.extra)) return true;
+        return false;
+    }
+
+    private static Expr defaultValue(String desc) {
+        return switch (desc.charAt(0)) {
+            case 'Z' -> Expr.constant(0, "Z");
+            case 'J' -> Expr.constant(0L, "J");
+            case 'F' -> Expr.constant(0f, "F");
+            case 'D' -> Expr.constant(0d, "D");
+            case 'L', '[' -> Expr.nul();
+            default -> Expr.constant(0, desc);
+        };
     }
 
     // ---- rules held by enum constants -----------------------------------------------------------

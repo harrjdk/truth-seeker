@@ -41,7 +41,7 @@ verify_tests         path=app.war  testDir=build/gen-tests
 
 `verify_tests` derives the classpath from the archive: Spring Boot `BOOT-INF/classes` + `BOOT-INF/lib`, WAR `WEB-INF/classes` + `WEB-INF/lib`, or EAR modules.
 Files that don't compile are reported, and the rest still run.
-If a `provided` API (`jakarta.*`, `javax.*`) is missing from the archive, pass it with `extraClasspath`.
+`provided` container APIs (`javax.servlet`, `jakarta.persistence`, ...) are never inside a WAR. When the generated tests need one, `verify_tests` takes it from the local Maven repository (`~/.m2`) and says so; otherwise pass it with `extraClasspath`.
 It needs a JDK, not a JRE, and extracts to `java.io.tmpdir/truth-seeker` (override with `-Dtruthseeker.cache=…`).
 
 ### What it looks like
@@ -95,10 +95,11 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 |---|---|---|---|---|---|
 | [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 187 (12 classes) | 187 | 0 | 0 |
 | [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 |
+| [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 |
 
 Every generated test arranges its path. Expected values are rebuilt from what the test controls (see below); 10
-PetClinic and 12 Cargo Tracker tests still end with `assertNotNull(result)` (or no assertion) and a `TODO` naming the
-expected expression, because the method builds the result itself (`new Delivery(..)`, a local `ModelAndView`), runs a
+PetClinic, 11 Cargo Tracker and 5 JPetStore tests still end with `assertNotNull(result)` (or no assertion) and a `TODO`
+naming the expected expression, because the method builds the result itself (`new Delivery(..)`, a local `ModelAndView`), runs a
 lambda over it, reads the clock, or formats through a library (`ToStringCreator`).
 
 ## Build
@@ -194,6 +195,7 @@ What it recognizes:
 - precondition helpers as branches to the exception they throw: `Objects.requireNonNull`, Spring `Assert`, Guava `Preconditions`, commons-lang `Validate`
 - null checks on values the path already dereferenced (pruned as infeasible)
 - **constructors of other application classes** (`new HandlingEvent(..)`), inlined so their validation (guards, `throw`s) becomes decisions on the arguments; their field writes stay inside
+- **methods called on objects the path itself built** (`cart = new Cart(); cart.containsItemId(id)`), followed with the fields their constructors set; collections created empty and not touched since answer `isEmpty()`, `size()`, lookups and `iterator().hasNext()` accordingly, and fields no constructor set read as their default (lazy `if (vets == null)` getters)
 - calls on constant strings (`"".isEmpty()`) are computed, so impossible branches are dropped
 - getters on a parameter (`pet.isNew()`) keep their value across loop iterations unless the path changes that parameter
 - **rules held by enum constants**: a no-argument query on an application enum value (`type.requiresVoyage()`) is evaluated per constant from the enum's bytecode, and the path splits into groups such as `type in {LOAD, UNLOAD}`, which tests arrange by passing a matching constant
@@ -201,6 +203,9 @@ What it recognizes:
 
 What the test generator arranges:
 - `for`-each loops over parameters, subject fields and stubbed collaborator results: a real collection with one mock element per iteration taken, each stubbed for its own iteration's decisions; `contains(x)` decides membership
+- `while (it.hasNext())` over an `Iterator` a collaborator returns (`cart.getAllCartItems()`): a real iterator over mock elements, so `it.remove()` works too
+- entries in the subject's own maps for `get`/`remove`/`containsKey` lookups, `Integer.parseInt(request.getParameter(..))` solved through the parameter text, `keywords.split("\s+").length` through a string with that many tokens
+- calls with constant arguments are stubbed per argument (`session.getAttribute(eq("cart"))` and `getAttribute(eq("accountBean"))`), and everything the path dereferences, including inside followed constructors, is a mock rather than null
 - exception paths: `when(..).thenThrow(..)` / `doThrow(..).when(..)` on the collaborator, a mock exception when the handler inspects it (`ex.getMessage()`), and invalid/valid input for JDK parsers
 - non-empty collections with a mock element of the type the code reads back (`(Leg) legs.get(0)`) or declares (`List<Leg> legs`), a `null` element when the path needs one, and emptiness through stream pipelines (`List.copyOf(events.stream().distinct().sorted(..).collect(toList()))` is empty when `events` is)
 - `isEmpty()` and `iterator().next()` on mocked containers such as Spring Data's `Page`
@@ -212,7 +217,7 @@ What the test generator arranges:
 These are deliberate approximations, and the tool output says so:
 - `finally` and catch-all handlers are not entered; exceptions are only followed into typed `catch` blocks.
 - Loops are unrolled `loopBound` times (default 1). Paths are capped by `maxPaths` (default 256).
-- Bodies of *other* classes' methods are not explored (their constructors and enum queries are). Those calls stay symbolic, e.g. `this.repo.findById(id)`.
+- Bodies of *other* classes' methods are not explored, except constructors, enum queries and methods on objects the path built. Calls on collaborators stay symbolic, e.g. `this.repo.findById(id)`.
 - State machines are inferred without inlining, so derived state (`calculateTransportStatus()`) stays distinct from transitions.
 - State machines match state by holder type and property name (`Order.status`), not by object identity.
 - Pre-Java 6 `JSR`/`RET` subroutines truncate the affected path.

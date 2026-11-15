@@ -41,6 +41,7 @@ public final class TestGenerator {
                     Class<?> type = invocation.getMethod().getReturnType();
                     if (type.isEnum() && type.getEnumConstants().length > 0) return type.getEnumConstants()[0];
                     if (type == String.class) return ""; // unstubbed String getters: empty rather than null
+                    if (type == java.util.Iterator.class) return java.util.Collections.emptyIterator();
                     return RETURNS_DEFAULTS.answer(invocation);
                 };
 
@@ -212,6 +213,16 @@ public final class TestGenerator {
             if (ctor == null || Type.getArgumentTypes(m.desc).length > Type.getArgumentTypes(ctor.desc).length) ctor = m;
         }
         if (ctor == null) return null;
+        if (hasNoArgCtor() && !ctor.desc.equals("()V") && readsThroughMockArgument(ctor)) {
+            // new LineItem(1, mock(CartItem)) would hit cartItem.getItem().getItemId() on a null: start empty instead
+            StringBuilder sb = new StringBuilder("    @BeforeEach\n    void setUp() {\n");
+            sb.append("        subject = new ").append(subjectType).append("();\n");
+            for (FieldNode f : deps.values()) {
+                needsSetField = true;
+                sb.append("        setField(subject, \"").append(f.name).append("\", ").append(f.name).append(");\n");
+            }
+            return sb.append("    }\n\n").toString();
+        }
         Type[] ats = Type.getArgumentTypes(ctor.desc);
         List<String> paramNames = new ArrayList<>();
         int slot = 1;
@@ -304,6 +315,36 @@ public final class TestGenerator {
             args.add(a);
         }
         return "new " + type + "(" + String.join(", ", args) + ")";
+    }
+
+    /**
+     * Does the constructor call a method on what a getter of an object argument returns ({@code cartItem.getItem().getItemId()})?
+     * A mock argument answers that getter with null, so the constructor would throw.
+     */
+    private boolean readsThroughMockArgument(MethodNode ctor) {
+        Set<String> depTypes = deps.values().stream().map(f -> f.desc).collect(Collectors.toSet());
+        PathExplorer.Result r = PathExplorer.explore(repo, cn, ctor, PathExplorer.Options.defaults().withInlining(false));
+        boolean[] found = {false};
+        java.util.function.Predicate<Expr> chained = x -> {
+            if (x.kind == Expr.Kind.CALL && x.target != null && x.target.kind == Expr.Kind.CALL && x.target.target != null
+                    && x.target.target.kind == Expr.Kind.PARAM && x.target.target.desc != null && x.target.target.desc.startsWith("L")
+                    && !ClassInspector.isValueType(x.target.target.desc) && !depTypes.contains(x.target.target.desc)
+                    && x.target.desc != null && x.target.desc.startsWith("L") && !ClassInspector.isValueType(x.target.desc)) {
+                found[0] = true;
+            }
+            return found[0];
+        };
+        for (Path p : r.paths()) {
+            if (p.outcome().kind() == Path.OutcomeKind.THROW) continue;
+            for (Effect e : p.effects()) {
+                if (e.target() != null) e.target().mentions(chained);
+                if (e.value() != null) e.value().mentions(chained);
+                e.args().forEach(a -> a.mentions(chained));
+            }
+            for (Cond c : p.conds()) c.left().mentions(chained);
+            if (found[0]) return true;
+        }
+        return false;
     }
 
     private boolean hasNoArgCtor() {
@@ -524,7 +565,19 @@ public final class TestGenerator {
             for (Cond c : p.conds()) {
                 Expr l = c.left();
                 if (c.kind() != Cond.Kind.BOOL || l.kind != Expr.Kind.CALL || l.target == null) continue;
-                if ("hasNext".equals(l.name) && l.args.isEmpty() && isIteratorOf(l.target)) {
+                if ("hasNext".equals(l.name) && l.args.isEmpty() && !isIteratorOf(l.target) && l.target.kind == Expr.Kind.CALL
+                        && "Ljava/util/Iterator;".equals(l.target.desc) && !l.text.contains(" [iteration ")) {
+                    // Iterator<CartItem> it = cart.getAllCartItems(); while (it.hasNext()): the call itself is the source
+                    Expr source = l.target;
+                    colls.putIfAbsent(source.text, source);
+                    iterators.putIfAbsent(source.text, source);
+                    int[] n = trues.computeIfAbsent(source.text, k -> new int[1]);
+                    if (c.isTrue()) n[0]++;
+                } else if ("hasNext".equals(l.name) && l.args.isEmpty() && !isIteratorOf(l.target) && l.target.kind == Expr.Kind.CALL
+                        && "Ljava/util/Iterator;".equals(l.target.desc)) {
+                    int[] n = trues.computeIfAbsent(stripIterationTag(l.target.text), k -> new int[1]);
+                    if (c.isTrue()) n[0]++;
+                } else if ("hasNext".equals(l.name) && l.args.isEmpty() && isIteratorOf(l.target)) {
                     Expr coll = l.target.target;
                     colls.putIfAbsent(coll.text, coll);
                     iterators.putIfAbsent(coll.text, l.target);
@@ -609,12 +662,24 @@ public final class TestGenerator {
         /** Collections (by expression text) this test filled with real elements: their contains(..) is decided. */
         final Set<String> arrangedCollections = new HashSet<>();
 
+        static String stripIterationTag(String text) {
+            return text.replaceAll(" \\[iteration \\d+\\]", "");
+        }
+
         /** A mutable collection of the given elements in iteration order, or null for unsupported types. */
         String iterableLiteral(Type t, List<String> elems) {
             if (t.getSort() != Type.OBJECT) return null;
             imports.add("java.util.List");
             String of = "List.of(" + String.join(", ", elems) + ")";
             return switch (t.getInternalName()) {
+                case "java/util/Iterator" -> { // a real iterator, so the code under test may also remove()
+                    if (elems.isEmpty()) {
+                        imports.add("java.util.Collections");
+                        yield "Collections.emptyIterator()";
+                    }
+                    imports.add("java.util.ArrayList");
+                    yield "new ArrayList<>(" + of + ").iterator()";
+                }
                 case "java/util/List", "java/util/Collection", "java/lang/Iterable", "java/util/ArrayList" -> {
                     imports.add("java.util.ArrayList");
                     yield "new ArrayList<>(" + of + ")";
@@ -737,6 +802,7 @@ public final class TestGenerator {
                                 break;
                             }
                         }
+                        if (splitCount(l, op, rgt)) break;
                         if (rgt.isConst() || isEnumConst(rgt)) constrain(l, op, rgt, rgt.value instanceof Number num ? num : null);
                         else if (l.isConst() || isEnumConst(l)) constrain(rgt, op, l, l.value instanceof Number num ? num : null);
                         else if (isAssignableNumber(rgt) && isAssignableNumber(l)) {
@@ -1084,6 +1150,28 @@ public final class TestGenerator {
             for (Effect ef : p.effects()) {
                 if (ef.kind() == Effect.Kind.CALL && ef.target() != null) requireNonNull(ef.target());
             }
+            // so must everything the path dereferenced, also inside inlined constructors (cartItem.getItem().getItemId())
+            for (Expr d : p.dereferenced()) {
+                Loop over = null;
+                for (Loop l : loops) if (d.mentions(l::isElement)) over = l;
+                if (over == null) {
+                    requireNonNull(d);
+                    continue;
+                }
+                // cartItem.getItem() inside a driven loop: every element the test supplies needs its own answer
+                for (String v : over.elements) {
+                    if (!ensured.containsKey(v)) continue;
+                    Loop l = over;
+                    requireNonNull(d.substitute(l::isElement, Expr.unknown(v, null)));
+                }
+            }
+            // a collaborator's answer handed on to code that is not followed (order.initOrder(accountBean.getAccount(), cart))
+            for (Effect ef : p.effects()) {
+                if (ef.kind() != Effect.Kind.CALL) continue;
+                for (Expr a : ef.args()) {
+                    if (a.kind == Expr.Kind.CALL && a.desc != null && a.desc.startsWith("L") && !ClassInspector.isValueType(a.desc)) requireNonNull(a);
+                }
+            }
             for (Expr root : roots) {
                 root.mentions(x -> {
                     // constructor arguments are usually validated (Objects.requireNonNull(origin, "Origin is required"))
@@ -1257,6 +1345,34 @@ public final class TestGenerator {
                 if (literal == null) continue;
                 bind(t.expr, literal, t);
             }
+        }
+
+        /** {@code keywords.split("\\s+").length > i}: a string with as many tokens as the comparison needs. */
+        boolean splitCount(Expr l, String op, Expr rgt) {
+            Expr arr = l.measuredArray();
+            if (arr == null || arr.kind != Expr.Kind.CALL || !"split".equals(arr.name) || arr.args.isEmpty() || arr.target == null
+                    || !(rgt.value instanceof Number n) || !"Ljava/lang/String;".equals(arr.target.desc)) return false;
+            Expr s0 = unwrapString(arr.target);
+            if (!arrangeable(s0) || !(arr.args.get(0).value instanceof String regex)) return false;
+            String sep = switch (regex) {
+                case "\\s+", "\\s", " +", " ", "\\s*", "[ ]+" -> " ";
+                case ",", ";", ":", "\\|", "/", "-", "\\." -> regex.replace("\\", "");
+                case "\\s*,\\s*", ",\\s*" -> ",";
+                default -> null;
+            };
+            if (sep == null) return false;
+            String count = solveNumeric(Type.INT_TYPE, List.of(new Constraint(op, rgt, n)));
+            if (count == null) return false;
+            int k = Integer.parseInt(count);
+            if (k == 0 && sep.equals(" ")) { // "   ".split("\\s+") has no tokens at all
+                constrain(s0, "==", Expr.constant("   ", "Ljava/lang/String;"));
+                return true;
+            }
+            if (k < 1 || k > 20) return false;
+            List<String> tokens = new ArrayList<>();
+            for (int i = 0; i < k; i++) tokens.add(String.valueOf((char) ('a' + i)));
+            constrain(s0, "==", Expr.constant(String.join(sep, tokens), "Ljava/lang/String;"));
+            return true;
         }
 
         /** Targets already arranged as a side effect of another (an element read that the collection literal provides). */
@@ -1580,6 +1696,17 @@ public final class TestGenerator {
                 }
             } else if (coll.kind == Expr.Kind.PARAM && r.method().localVariables != null && coll.extra instanceof Integer slot) {
                 for (LocalVariableNode lv : r.method().localVariables) if (lv.index == slot && lv.signature != null) sig = lv.signature;
+            } else if (coll.kind == Expr.Kind.CALL && coll.owner != null) {
+                for (String c = coll.owner; c != null && sig == null; ) {
+                    ClassNode node = repo.node(c);
+                    if (node == null) break;
+                    for (MethodNode m : node.methods) {
+                        if (m.name.equals(coll.name) && m.desc.equals(coll.memberDesc) && m.signature != null) {
+                            sig = m.signature.substring(m.signature.indexOf(')') + 1);
+                        }
+                    }
+                    c = node.superName;
+                }
             }
             if (sig == null) return null;
             int lt = sig.indexOf('<');
@@ -1644,6 +1771,10 @@ public final class TestGenerator {
                         imports.add("java.util.Optional");
                         bindLiteral(e.target, "Optional.of(" + elem + ")");
                         v = elem.equals("new Object()") ? null : elem;
+                        break;
+                    }
+                    if (isMapLookup(e) && !e.name.equals("containsKey")) {
+                        if (arrangeMapLookup(e, "mock(")) v = ensured.get(canon(e));
                         break;
                     }
                     Type t = e.desc == null ? null : Type.getType(e.desc);
@@ -1724,7 +1855,12 @@ public final class TestGenerator {
                     return true;
                 }
                 case CALL -> {
+                    if (e.target == null && isNumberParse(e) && !literal.equals("null")) {
+                        // Integer.parseInt(request.getParameter(id)) < 1: hand the parser that number as text
+                        return bindLiteral(e.args.get(0), "\"" + literal.replaceAll("[LlfFdD]$", "").replace(".0", "") + "\"");
+                    }
                     if (e.target == null) return false; // static call: would need mockStatic
+                    if (isMapLookup(e)) return arrangeMapLookup(e, literal);
                     if (isObjectMethod(e)) return false; // Mockito cannot stub equals/hashCode
                     String tv = ensure(e.target);
                     if (tv == null) return false;
@@ -1738,15 +1874,115 @@ public final class TestGenerator {
             }
         }
 
+        boolean isNumberParse(Expr e) {
+            return e.kind == Expr.Kind.CALL && e.target == null && e.args.size() == 1 && "Ljava/lang/String;".equals(e.args.get(0).desc)
+                    && (("java/lang/Integer".equals(e.owner) && (e.name.equals("parseInt") || e.name.equals("valueOf")))
+                    || ("java/lang/Long".equals(e.owner) && (e.name.equals("parseLong") || e.name.equals("valueOf"))));
+        }
+
+        /** {@code this.itemMap.get(key)} / {@code remove(key)} / {@code containsKey(key)} on a map the subject owns. */
+        boolean isMapLookup(Expr e) {
+            return e.kind == Expr.Kind.CALL && e.target != null && e.args.size() == 1
+                    && Set.of("get", "remove", "containsKey", "getOrDefault").contains(e.name)
+                    && e.target.kind == Expr.Kind.FIELD && e.target.target != null && e.target.target.kind == Expr.Kind.THIS && !isStatic
+                    && !deps.containsKey(e.target.name) && e.target.desc != null && isMapType(Type.getType(e.target.desc));
+        }
+
+        boolean isMapType(Type t) {
+            return t.getSort() == Type.OBJECT && Set.of("java/util/Map", "java/util/HashMap", "java/util/LinkedHashMap", "java/util/TreeMap",
+                    "java/util/concurrent/ConcurrentHashMap", "java/util/concurrent/ConcurrentMap").contains(t.getInternalName());
+        }
+
+        final Map<String, String> mapVars = new HashMap<>();
+
+        /** A real map put into the subject's field (once per test), so entries can be added for the path's lookups. */
+        String mapVar(Expr field) {
+            if (mapVars.containsKey(field.name)) return mapVars.get(field.name);
+            Type t = Type.getType(field.desc);
+            String impl = t.getInternalName().startsWith("java/util/concurrent/") ? "java.util.concurrent.ConcurrentHashMap"
+                    : t.getInternalName().equals("java/util/Map") ? "java.util.HashMap" : t.getClassName();
+            imports.add(impl);
+            List<Type> kv = declaredTypeArguments(field);
+            String decl = imports.ref(t) + (kv.size() == 2 ? "<" + imports.ref(kv.get(0)) + ", " + imports.ref(kv.get(1)) + ">" : "<Object, Object>");
+            String name = newVarNamed(Type.getObjectType("java/util/" + Character.toUpperCase(field.name.charAt(0)) + field.name.substring(1)));
+            arrange.add(decl + " " + name + " = new " + impl.substring(impl.lastIndexOf('.') + 1) + "<>();");
+            needsSetField = true;
+            arrange.add("setField(subject, \"" + field.name + "\", " + name + ");");
+            mapVars.put(field.name, name);
+            return name;
+        }
+
+        /** Puts (or leaves out) the entry a lookup needs: {@code cartItem == null} → none, non-null → a mock value. */
+        boolean arrangeMapLookup(Expr e, String literal) {
+            String map = mapVar(e.target);
+            boolean absent = e.name.equals("containsKey") ? literal.equals("false") : literal.equals("null");
+            if (absent) return true;
+            String key = renderExpected(e.args.get(0), 0);
+            if (key == null) return false;
+            List<Type> kv = declaredTypeArguments(e.target);
+            Type valueType = kv.size() == 2 ? kv.get(1) : Type.getType(Object.class);
+            String value;
+            if (!e.name.equals("containsKey") && !literal.startsWith("mock(")) value = literal;
+            else if (isMockable(valueType)) value = newVar(valueType);
+            else value = nonNullSample(valueType, null);
+            if (value == null) return false;
+            arrange.add(map + ".put(" + key + ", " + value + ");");
+            if (!e.name.equals("containsKey") && value.matches("[a-z][A-Za-z0-9_$]*")) {
+                ensured.put(canon(e), value);
+                if (e.expansion() == null) ensured.put(e.text, value);
+            }
+            return true;
+        }
+
+        /** Type arguments of a subject field's generic declaration ({@code Map<String, CartItem>} → [String, CartItem]). */
+        List<Type> declaredTypeArguments(Expr field) {
+            String sig = null;
+            for (String c = cn.name; c != null && sig == null; ) {
+                ClassNode node = c.equals(cn.name) ? cn : repo.node(c);
+                if (node == null) break;
+                for (FieldNode fn : node.fields) if (fn.name.equals(field.name)) sig = fn.signature;
+                c = node.superName;
+            }
+            List<Type> out = new ArrayList<>();
+            if (sig == null || sig.indexOf('<') < 0) return out;
+            String body = sig.substring(sig.indexOf('<') + 1);
+            int depth = 0, start = 0;
+            for (int i = 0; i < body.length() && depth >= 0; i++) {
+                char ch = body.charAt(i);
+                if (ch == '<') depth++;
+                else if (ch == '>') { if (depth == 0) break; depth--; }
+                else if (ch == ';' && depth == 0) {
+                    String one = body.substring(start, i + 1);
+                    if (one.startsWith("+") || one.startsWith("-")) one = one.substring(1);
+                    int lt = one.indexOf('<');
+                    if (lt >= 0) one = one.substring(0, lt) + ";";
+                    if (one.startsWith("L")) out.add(Type.getType(one));
+                    else return List.of();
+                    start = i + 1;
+                }
+            }
+            return out;
+        }
+
         String stubKey(String tv, Expr call) {
-            return tv + "." + call.name + call.memberDesc;
+            StringBuilder k = new StringBuilder(tv + "." + call.name + call.memberDesc);
+            for (Expr a : call.args) if ((a.kind == Expr.Kind.CONST && a.value != null) || isEnumConst(a)) k.append('|').append(a.text);
+            return k.toString();
         }
 
         String matchers(Expr call) {
             Type[] ats = Type.getArgumentTypes(call.memberDesc);
             boolean overloaded = isOverloaded(call.owner, call.name, ats.length);
             List<String> ms = new ArrayList<>();
-            for (Type t : ats) ms.add(anyMatcher(t, overloaded));
+            for (int i = 0; i < ats.length; i++) {
+                Expr a = i < call.args.size() ? call.args.get(i) : null;
+                // session.getAttribute("cart") and getAttribute("accountBean") are different stubs
+                if (a != null && ((a.kind == Expr.Kind.CONST && a.value != null) || isEnumConst(a))) {
+                    String lit = literalOf(a);
+                    if (ats[i].getSort() == Type.LONG && !lit.endsWith("L")) lit += "L";
+                    ms.add("eq(" + lit + ")");
+                } else ms.add(anyMatcher(ats[i], overloaded));
+            }
             return String.join(", ", ms);
         }
 
@@ -2000,7 +2236,10 @@ public final class TestGenerator {
                     return a == null || b == null ? null : "(" + a + " " + e.name + " " + b + ")";
                 }
                 case NEW -> {
-                    if (e.args.isEmpty() && e.owner != null && e.owner.startsWith("java/util/") && collectionFactory(Type.getObjectType(e.owner)) != null) {
+                    // an empty collection only if nothing on the path added to it (List<OrderLine> lines = new ArrayList<>(); lines.add(..))
+                    boolean touched = p.effects().stream().anyMatch(ef -> (ef.target() != null && ef.target().mentions(x -> x.text.equals(e.text)))
+                            || ef.args().stream().anyMatch(a -> a.mentions(x -> x.text.equals(e.text))));
+                    if (!touched && e.args.isEmpty() && e.owner != null && e.owner.startsWith("java/util/") && collectionFactory(Type.getObjectType(e.owner)) != null) {
                         return "new " + imports.ref(Type.getObjectType(e.owner)) + "<>()";
                     }
                     return null;
@@ -2095,7 +2334,8 @@ public final class TestGenerator {
             String known = null;
             if (a.kind == Expr.Kind.CONST || a.kind == Expr.Kind.NULL || isEnumConst(a)) known = literalOf(a);
             else if (a.kind == Expr.Kind.PARAM) known = paramVars.get(a.index);
-            else if (ensured.containsKey(a.text)) known = ensured.get(a.text);
+            else if (ensured.containsKey(canon(a))) known = ensured.get(canon(a));
+            else if (a.expansion() == null && ensured.containsKey(a.text)) known = ensured.get(a.text); // not a reassigned parameter's name
             if (known != null && !known.equals("null")) {
                 if (t.getSort() == Type.LONG && a.kind == Expr.Kind.CONST && !known.endsWith("L")) known += "L";
                 return "eq(" + known + ")";
