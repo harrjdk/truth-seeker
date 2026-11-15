@@ -80,9 +80,21 @@ public final class TestVerifier {
         }
         int compiled = sources.size();
         if (!errors.isEmpty()) {
+            Map<Path, List<String>> perFile = new LinkedHashMap<>();
+            for (Path src : sources) perFile.put(src, compile(javac, List.of(src), classes, cp));
+            // a syntax error elsewhere stops javac before it resolves imports: files compiled alone name what is missing
+            Set<String> laterMissing = new TreeSet<>(ProvidedApis.missingPackages(perFile.values().stream().flatMap(List::stream).toList()));
+            laterMissing.removeAll(missingApis);
+            List<Path> moreApis = laterMissing.isEmpty() ? List.of() : ProvidedApis.find(laterMissing).stream().filter(j -> !cp.contains(j.toString())).toList();
+            if (!moreApis.isEmpty()) {
+                moreApis.forEach(j -> cp.add(j.toString()));
+                notes.add("Added `provided` API jar(s) from the local Maven repository for " + String.join(", ", laterMissing) + ": "
+                        + moreApis.stream().map(j -> j.getFileName().toString()).collect(java.util.stream.Collectors.joining(", ")) + ".");
+                for (Path src : sources) perFile.put(src, compile(javac, List.of(src), classes, cp));
+            }
             compiled = 0;
             for (Path src : sources) {
-                List<String> errs = compile(javac, List.of(src), classes, cp);
+                List<String> errs = perFile.get(src);
                 if (errs.isEmpty()) compiled++;
                 else {
                     notCompiled.add(testDir.relativize(src).toString());

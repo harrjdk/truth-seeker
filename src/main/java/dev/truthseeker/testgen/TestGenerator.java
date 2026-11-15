@@ -417,6 +417,8 @@ public final class TestGenerator {
         final Map<Integer, String> paramVars = new HashMap<>();
         final Map<Integer, Type> paramTypes = new HashMap<>();
         final List<String> arrange = new ArrayList<>();
+        /** Statements right after the call under test (clearing the interrupt flag a test set). */
+        final List<String> afterAct = new ArrayList<>();
         final LinkedHashMap<String, String> stubs = new LinkedHashMap<>();
         final List<String> todos = new ArrayList<>();
         final Map<String, String> ensured = new HashMap<>();
@@ -519,18 +521,22 @@ public final class TestGenerator {
                     });
                 }
             }
-            if (candidates.isEmpty()) return;
-            // getClass() != o.getClass() on this path: the argument must be of another class altogether
+            // getClass() != o.getClass(): the argument must be of another class altogether; == : another instance of this one
             for (Cond c : p.conds()) {
                 if (c.kind() == Cond.Kind.CMP && isGetClass(c.left()) && isGetClass(c.right())) {
                     boolean same = c.isTrue() == c.op().equals("==");
                     Expr other = c.left().target.kind == Expr.Kind.PARAM ? c.left().target : c.right().target;
-                    if (!same && other.kind == Expr.Kind.PARAM) {
+                    if (other.kind != Expr.Kind.PARAM || "subject".equals(paramValues.get(other.index))) continue;
+                    classArranged = true;
+                    if (!same) {
                         candidates.remove(other.index);
                         paramValues.put(other.index, "new Object()");
+                    } else {
+                        candidates.add(other.index);
                     }
                 }
             }
+            if (candidates.isEmpty()) return;
             String peer = peerInstance();
             if (peer == null) return;
             for (int i : candidates) {
@@ -541,7 +547,11 @@ public final class TestGenerator {
         }
 
         /** {@code this.f} vs {@code o.f} (and getClass() of both) on a peer: decided by values the test sets. */
+        /** A getClass() comparison with an argument was arranged by choosing the argument's class. */
+        boolean classArranged;
+
         boolean collectPeerComparison(Cond c) {
+            if (classArranged && c.kind() == Cond.Kind.CMP && isGetClass(c.left()) && isGetClass(c.right())) return true;
             if (peers.isEmpty()) return false;
             if (c.kind() == Cond.Kind.CMP && isGetClass(c.left()) && isGetClass(c.right())) return true; // same class by construction
             if (c.kind() == Cond.Kind.CMP && (c.op().equals("==") || c.op().equals("!="))
@@ -745,6 +755,47 @@ public final class TestGenerator {
             return new Cond(c.kind(), left, c.op(), right, c.value(), c.valueExpr(), c.otherCases());
         }
 
+        /**
+         * A call on a mock decided again in later loop iterations with a different outcome
+         * ({@code while (!future.isDone()) Thread.sleep(..)}, {@code while ((n = in.read()) != -1)}): one stub answering
+         * each iteration in turn, {@code when(future.isDone()).thenReturn(false, true)}. Returns the decisions it covers.
+         */
+        Set<Cond> arrangeSequences() {
+            Set<Cond> covered = Collections.newSetFromMap(new IdentityHashMap<>());
+            LinkedHashMap<String, List<Cond>> groups = new LinkedHashMap<>();
+            for (Cond c : p.conds()) {
+                Expr l = c.left();
+                if (l == null || l.kind != Expr.Kind.CALL || l.target == null || l.target.kind == Expr.Kind.THIS || isObjectMethod(l)) continue;
+                if (c.kind() != Cond.Kind.BOOL && !(c.kind() == Cond.Kind.CMP && c.right() != null && c.right().kind == Expr.Kind.CONST)) continue;
+                if (Set.of("hasNext", "next", "iterator").contains(l.name) || loops.stream().anyMatch(lp -> lp.isHasNext(l))) continue;
+                groups.computeIfAbsent(stripIteration(c.key()), k -> new ArrayList<>()).add(c);
+            }
+            for (List<Cond> g : groups.values()) {
+                if (g.size() < 2 || g.stream().map(Cond::value).distinct().count() < 2) continue;
+                Expr call = g.get(0).left();
+                Type t = call.desc == null ? null : Type.getType(call.desc);
+                if (t == null || Type.getReturnType(call.memberDesc).getSort() == Type.VOID) continue;
+                List<String> answers = new ArrayList<>();
+                for (Cond c : g) {
+                    String a;
+                    if (c.kind() == Cond.Kind.BOOL) a = c.isTrue() ? "true" : "false";
+                    else {
+                        String op = c.isTrue() ? c.op() : Cond.negate(c.op());
+                        Number n = c.right().value instanceof Number num ? num : null;
+                        a = n == null ? null : solveNumeric(t, List.of(new Constraint(op, c.right(), n)));
+                    }
+                    if (a == null) { answers = null; break; }
+                    answers.add(a);
+                }
+                if (answers == null) continue;
+                String tv = ensure(call.target);
+                if (tv == null) continue;
+                stubs.put(stubKey(tv, call), "when(" + tv + "." + call.name + "(" + matchers(call) + ")).thenReturn(" + String.join(", ", answers) + ");");
+                covered.addAll(g);
+            }
+            return covered;
+        }
+
         String stripIteration(String text) {
             return text.replaceAll(" \\[iteration \\d+\\]", "");
         }
@@ -752,7 +803,9 @@ public final class TestGenerator {
         void collect() {
             arrangePeers();
             arrangeLoops();
+            Set<Cond> sequenced = arrangeSequences();
             for (Cond c0 : p.conds()) {
+                if (sequenced.contains(c0)) continue;
                 Cond c = c0;
                 if (c0.kind() == Cond.Kind.BOOL && c0.left().kind == Expr.Kind.CALL && "contains".equals(c0.left().name)
                         && c0.left().target != null && arrangedCollections.contains(c0.left().target.text)) continue;
@@ -821,6 +874,19 @@ public final class TestGenerator {
                         } else todos.add("arrange so that `" + c.describe() + "`");
                     }
                     case SWITCH -> {
+                        if (stringSwitchHash(c)) {
+                            // switch (s.hashCode()): the case is chosen by the s.equals("..") decision that follows;
+                            // the default branch needs a string hashing to none of the cases
+                            if (c.value().contains("default")) {
+                                Set<String> hashes = new HashSet<>();
+                                for (Expr o : c.otherCases()) hashes.add(o.text);
+                                for (Cond o : p.conds()) if (o.kind() == Cond.Kind.SWITCH && o.left() == c.left()) hashes.addAll(Arrays.asList(o.value().split(" \\| ")));
+                                String pick = "value";
+                                for (int k = 0; hashes.contains(String.valueOf(pick.hashCode())); k++) pick = "value" + k;
+                                constrain(c.left().target, "==", Expr.constant(pick, "Ljava/lang/String;"));
+                            }
+                            break;
+                        }
                         if (c.value().contains("default")) {
                             if (!c.otherCases().isEmpty() && c.otherCases().stream().allMatch(TestGenerator.this::isEnumConst)) {
                                 for (Expr other : c.otherCases()) constrain(c.left(), "!=", other);
@@ -1008,7 +1074,25 @@ public final class TestGenerator {
                 constrain(call.args.get(0), "==", Expr.constant("not-a-valid-value", "Ljava/lang/String;"));
                 return;
             }
+            if (interruptible(call) && exception.equals("java/lang/InterruptedException") && firstInterruptible(call)) {
+                // a blocking call throws at once when the thread is already interrupted
+                arrange.add("Thread.currentThread().interrupt(); // makes `" + call.text + "` throw InterruptedException");
+                afterAct.add("Thread.interrupted(); // clear the flag the test set");
+                return;
+            }
             todos.add("make `" + call.text + "` throw " + simple);
+        }
+
+        /** Thread.sleep / TimeUnit.sleep / Thread.join: throw InterruptedException when the thread is interrupted. */
+        static boolean interruptible(Expr call) {
+            if (call.kind != Expr.Kind.CALL || call.owner == null) return false;
+            return (call.owner.equals("java/lang/Thread") && (call.name.equals("sleep") || call.name.equals("join")))
+                    || (call.owner.equals("java/util/concurrent/TimeUnit") && call.name.equals("sleep"));
+        }
+
+        /** No interruptible call on this path is required to complete normally (the flag would make it throw instead). */
+        boolean firstInterruptible(Expr call) {
+            return p.conds().stream().noneMatch(c -> c.kind() == Cond.Kind.THROWS && !c.isTrue() && c.left() != null && interruptible(c.left()));
         }
 
         /**
@@ -1143,7 +1227,9 @@ public final class TestGenerator {
          * call must be a mock rather than null.
          */
         void ensureImplicit() {
-            if (p.outcome().kind() == Path.OutcomeKind.THROW) return;
+            requireDereferencedParams();
+            // everything recorded on a throwing path happened before the throw; only an NPE path may rely on a null
+            if (p.outcome().kind() == Path.OutcomeKind.THROW && "java/lang/NullPointerException".equals(p.outcome().exceptionType())) return;
             List<Expr> roots = new ArrayList<>();
             for (Effect ef : p.effects()) {
                 if (ef.target() != null) roots.add(ef.target());
@@ -1197,6 +1283,12 @@ public final class TestGenerator {
         /** Makes a collaborator-produced value non-null: a mock for collaborator types, a sample for value types. */
         void requireNonNull(Expr a) {
             if (boundLiteral.containsKey(a.text) || ensured.containsKey(a.text)) return;
+            // a collaborator field set by a lifecycle method rather than injected (this.handler from initialize(..))
+            if (a.kind == Expr.Kind.FIELD && a.target != null && a.target.kind == Expr.Kind.THIS && !isStatic && !deps.containsKey(a.name)
+                    && a.desc != null && a.desc.startsWith("L") && !ClassInspector.isValueType(a.desc) && isMockable(Type.getType(a.desc))) {
+                ensure(a);
+                return;
+            }
             if (a.kind != Expr.Kind.CALL || a.target == null || a.target.kind == Expr.Kind.THIS) return;
             if (a.desc == null || !a.desc.startsWith("L") || isOptional(a)) return;
             if (!ClassInspector.isValueType(a.desc)) {
@@ -1204,6 +1296,40 @@ public final class TestGenerator {
             } else {
                 String lit = nonNullSample(Type.getType(a.desc), a);
                 if (lit != null) bindLiteral(a, lit);
+            }
+        }
+
+        /**
+         * Parameters the path calls methods on ({@code e.getMessage()}) or casts ({@code (TextMessage) message}) need a
+         * value of that type: an instance for JDK types such as exceptions, a mock of the cast type otherwise.
+         */
+        void requireDereferencedParams() {
+            List<Expr> roots = new ArrayList<>(p.dereferenced());
+            for (Cond c : p.conds()) { roots.add(c.left()); if (c.right() != null) roots.add(c.right()); }
+            for (Effect ef : p.effects()) { if (ef.target() != null) roots.add(ef.target()); roots.addAll(ef.args()); if (ef.value() != null) roots.add(ef.value()); }
+            if (p.outcome().kind() != Path.OutcomeKind.THROW && p.outcome().value() != null) roots.add(p.outcome().value());
+            Map<Integer, Expr> used = new LinkedHashMap<>();
+            for (Expr d : p.dereferenced()) if (d.kind == Expr.Kind.PARAM) used.put(d.index, d);
+            for (Expr root : roots) {
+                root.mentions(x -> {
+                    if ((x.kind == Expr.Kind.CALL || x.kind == Expr.Kind.FIELD) && x.target != null && x.target.kind == Expr.Kind.PARAM) {
+                        used.putIfAbsent(x.target.index, x.target);
+                    }
+                    return false;
+                });
+            }
+            for (Expr param : used.values()) {
+                Expr declared = r.params().stream().filter(q -> q.index == param.index).findFirst().orElse(null);
+                if (declared == null || param.desc == null || !param.desc.startsWith("L")) continue;
+                if (p.conds().stream().anyMatch(c -> c.describe().contains(declared.text + " == null"))) continue;
+                String current = paramValues.get(param.index);
+                boolean narrowed = !param.desc.equals(declared.desc);
+                if (current != null && !current.equals("null") && !(narrowed && current.equals(defaultFor(Type.getType(declared.desc))))) continue;
+                Type t = Type.getType(param.desc);
+                String value = !ClassInspector.isValueType(param.desc) && isMockable(t) ? mockOf(t) : nonNullSample(t, param);
+                if (value == null) continue;
+                paramValues.put(param.index, value);
+                if (narrowed) paramTypes.put(param.index, t);
             }
         }
 
@@ -1797,7 +1923,7 @@ public final class TestGenerator {
                     String tv = ensure(e.target);
                     if (tv == null) break;
                     v = newVar(t);
-                    stubs.put(stubKey(tv, e), "when(" + tv + "." + e.name + "(" + matchers(e) + ")).thenReturn(" + v + ");");
+                    stubs.put(claimStubKey(tv, e), "when(" + tv + "." + e.name + "(" + matchers(e) + ")).thenReturn(" + v + ");");
                 }
                 default -> v = null;
             }
@@ -1879,7 +2005,7 @@ public final class TestGenerator {
                     String tv = ensure(e.target);
                     if (tv == null) return false;
                     if (Type.getReturnType(e.memberDesc).getSort() == Type.VOID) return false;
-                    stubs.put(stubKey(tv, e), "when(" + tv + "." + e.name + "(" + matchers(e) + ")).thenReturn(" + literal + ");");
+                    stubs.put(claimStubKey(tv, e), "when(" + tv + "." + e.name + "(" + matchers(e) + ")).thenReturn(" + literal + ");");
                     return true;
                 }
                 default -> {
@@ -1980,8 +2106,33 @@ public final class TestGenerator {
 
         String stubKey(String tv, Expr call) {
             StringBuilder k = new StringBuilder(tv + "." + call.name + call.memberDesc);
-            for (Expr a : call.args) if ((a.kind == Expr.Kind.CONST && a.value != null) || isEnumConst(a)) k.append('|').append(a.text);
+            for (Expr a : call.args) if ((a.kind == Expr.Kind.CONST && a.value != null) || isEnumConst(a) || exactParam(call, a)) k.append('|').append(a.text);
             return k.toString();
+        }
+
+        /** Calls stubbed with their exact parameter arguments, because another call shares their any() stub. */
+        final Set<String> preciseCalls = new HashSet<>();
+        /** Which call each stub key answers. */
+        final Map<String, String> stubCalls = new HashMap<>();
+
+        boolean exactParam(Expr call, Expr a) {
+            return preciseCalls.contains(call.text) && a.kind == Expr.Kind.PARAM && paramVars.containsKey(a.index);
+        }
+
+        /**
+         * The stub key for {@code call}; when another call already owns that key ({@code find(origin)} and
+         * {@code find(destination)} both being {@code find(any())}), this one matches its parameter arguments exactly.
+         */
+        String claimStubKey(String tv, Expr call) {
+            String key = stubKey(tv, call);
+            String owner = stubCalls.get(key);
+            if (owner != null && !owner.equals(call.text) && stubs.containsKey(key)
+                    && call.args.stream().anyMatch(a -> a.kind == Expr.Kind.PARAM && paramVars.containsKey(a.index))) {
+                preciseCalls.add(call.text);
+                key = stubKey(tv, call);
+            }
+            stubCalls.putIfAbsent(key, call.text);
+            return key;
         }
 
         String matchers(Expr call) {
@@ -1995,6 +2146,8 @@ public final class TestGenerator {
                     String lit = literalOf(a);
                     if (ats[i].getSort() == Type.LONG && !lit.endsWith("L")) lit += "L";
                     ms.add("eq(" + lit + ")");
+                } else if (a != null && exactParam(call, a)) {
+                    ms.add("eq(" + paramVars.get(a.index) + ")");
                 } else ms.add(anyMatcher(ats[i], overloaded));
             }
             return String.join(", ", ms);
@@ -2030,7 +2183,11 @@ public final class TestGenerator {
                 act = invoke + ";";
             } else {
                 act = "var result = " + invoke + ";";
-                asserts.addAll(expectReturn(o.value(), ret));
+                for (String a : expectReturn(o.value(), ret)) {
+                    // arrays compare by identity in assertEquals
+                    asserts.add(ret.getSort() == Type.ARRAY && a.startsWith("assertEquals(") && a.endsWith(", result);")
+                            ? "assertArrayEquals(" + a.substring("assertEquals(".length()) : a);
+                }
             }
             asserts.addAll(expectEffects());
 
@@ -2068,6 +2225,7 @@ public final class TestGenerator {
             }
             sb.append("\n        // Act").append(o.kind() == Path.OutcomeKind.THROW ? " + Assert" : "").append("\n");
             sb.append("        ").append(act).append("\n");
+            for (String a : afterAct) sb.append("        ").append(a).append("\n");
             if (!asserts.isEmpty()) {
                 sb.append("\n        // Assert\n");
                 for (String a : asserts) sb.append("        ").append(a).append("\n");
@@ -2146,6 +2304,17 @@ public final class TestGenerator {
                     }
                 } else {
                     String lit = nonNullSample(t, v);
+                    if (lit != null && lit.startsWith("new ") && !lit.contains("<>") && ret.getSort() == Type.OBJECT) {
+                        // an instance compares by identity (new Object(), an exception): name it and expect that very one
+                        String var = "object";
+                        for (int k = 1; usedNames.contains(var); k++) var = "object" + k;
+                        if (bindLiteral(v, var)) {
+                            usedNames.add(var);
+                            arrange.add(0, imports.ref(t) + " " + var + " = " + lit + ";");
+                            out.add("assertSame(" + var + ", result);");
+                            return out;
+                        }
+                    }
                     if (lit != null && bindLiteral(v, lit)) {
                         out.add(ret.getSort() == Type.BOOLEAN ? (lit.equals("true") ? "assertTrue(result);" : "assertFalse(result);") : "assertEquals(" + lit + ", result);");
                         return out;
@@ -2309,7 +2478,9 @@ public final class TestGenerator {
                     if (out.size() >= MAX_FIELD_ASSERTS) break;
                     String field = getterField(g);
                     Type t = Type.getReturnType(g.desc);
-                    String actual = "result." + g.name + "()";
+                    // declared wider than what it builds (Object processItem(..) returning new MyOutputRecord(..)): cast
+                    boolean wider = !Type.getReturnType(r.method().desc).getDescriptor().equals("L" + v.owner + ";");
+                    String actual = (wider ? "((" + imports.ref(Type.getObjectType(v.owner)) + ") result)" : "result") + "." + g.name + "()";
                     Expr fv = p.returnedFields().get(field);
                     if (fv == null && lazyGetter(g)) continue; // would create the value on first call
                     List<String> lines;
@@ -2351,6 +2522,7 @@ public final class TestGenerator {
                 boolean visibleClass = (node.access & Opcodes.ACC_PUBLIC) != 0 || Names.packageOf(node.name).equals(pkg);
                 for (MethodNode m : node.methods) {
                     if (!visibleClass || !m.desc.startsWith("()") || m.name.startsWith("<") || !seen.add(m.name)) continue;
+                    if (m.name.equals("hashCode") || m.name.equals("toString")) continue;
                     if ((m.access & (Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC | Opcodes.ACC_BRIDGE)) != 0) continue;
                     boolean visible = (m.access & Opcodes.ACC_PUBLIC) != 0
                             || (m.access & Opcodes.ACC_PRIVATE) == 0 && Names.packageOf(node.name).equals(pkg);
@@ -2404,6 +2576,7 @@ public final class TestGenerator {
 
         String assertEqualsTo(String expected, Type ret) {
             if (ret.getSort() == Type.DOUBLE || ret.getSort() == Type.FLOAT) return "assertEquals(" + expected + ", result, 1e-9);";
+            if (ret.getSort() == Type.ARRAY) return "assertArrayEquals(" + expected + ", result);";
             return "assertEquals(" + expected + ", result);";
         }
 
@@ -2856,6 +3029,7 @@ public final class TestGenerator {
             if (o.equals("java/lang/String") || o.startsWith("java/time/") || o.startsWith("java/math/")
                     || Set.of("java/lang/Integer", "java/lang/Long", "java/lang/Boolean", "java/lang/Double").contains(o)) return true;
             if (o.equals("java/lang/Class")) return Set.of("isAssignableFrom", "isInstance", "getSimpleName", "getName").contains(e.name);
+            if (o.startsWith("java/lang/") && (e.name.equals("getMessage") || e.name.equals("getLocalizedMessage")) && e.args.isEmpty()) return true;
             if (o.startsWith("java/util/") && Set.of("size", "isEmpty", "contains", "containsKey", "get").contains(e.name)) return true;
             return false;
         }
@@ -2926,6 +3100,19 @@ public final class TestGenerator {
                     String a = renderExpected(e.args.get(0), depth + 1), b = renderExpected(e.args.get(1), depth + 1);
                     return a == null || b == null ? null : "(" + a + " " + e.name + " " + b + ")";
                 }
+                case ARRAY_NEW -> {
+                    // new Class[]{String.class, Integer.class}: the same literal, element by element
+                    List<Expr> elems = e.arrayElements();
+                    if (elems == null || e.desc == null || !e.desc.startsWith("[")) return null;
+                    List<String> parts = new ArrayList<>();
+                    for (Expr el : elems) {
+                        String r = renderExpected(el, depth + 1);
+                        if (r == null) return null;
+                        parts.add(r);
+                    }
+                    return "new " + imports.ref(Type.getType(e.desc).getElementType()) + "[]".repeat(Type.getType(e.desc).getDimensions())
+                            + "{" + String.join(", ", parts) + "}";
+                }
                 case NEW -> {
                     // an empty collection only if nothing on the path added to it (List<OrderLine> lines = new ArrayList<>(); lines.add(..))
                     // (stored as is into a field nothing else on the path touches, like a lazy getter's `specialties = new HashSet<>()`, is not a change)
@@ -2959,6 +3146,9 @@ public final class TestGenerator {
                         String recv = renderExpected(e.target, depth + 1);
                         List<String> args = renderArgs(e, ats, depth);
                         if (recv == null || args == null) return null;
+                        if (recv.matches("-?\\d[\\w.]*|'.'|true|false") && e.target.desc != null && e.target.desc.startsWith("L")) {
+                            recv = "((" + imports.ref(Type.getType(e.target.desc)) + ") " + recv + ")"; // 1.hashCode() is not Java
+                        }
                         if (recv.matches("new \\w+<>\\(\\)") && args.isEmpty()) { // queries on an empty collection
                             boolean list = recv.contains("List") || recv.contains("Deque");
                             switch (e.name) {
@@ -3119,6 +3309,18 @@ public final class TestGenerator {
         if (type.getSort() == Type.OBJECT && !type.getInternalName().startsWith("java/lang/")) {
             return mockOf(type);
         }
+        if (type.getSort() == Type.OBJECT && type.getInternalName().startsWith("java/lang/")) {
+            // an exception handed to a listener or handler (onSkipReadItem(Exception e)): a real one with a message
+            try {
+                Class<?> c = Class.forName(type.getClassName(), false, ClassLoader.getPlatformClassLoader());
+                if (Throwable.class.isAssignableFrom(c) && !java.lang.reflect.Modifier.isAbstract(c.getModifiers())) {
+                    c.getConstructor(String.class);
+                    return "new " + imports.ref(type) + "(\"value\")";
+                }
+            } catch (ReflectiveOperationException | LinkageError ignored) {
+                // no public (String) constructor
+            }
+        }
         return null;
     }
 
@@ -3167,6 +3369,13 @@ public final class TestGenerator {
     private String mockOf(Type t) {
         needsEnumSafe = true;
         return "mock(" + imports.ref(t) + ".class, ENUM_SAFE)";
+    }
+
+    /** A switch on {@code s.hashCode()} of a String: how javac compiles {@code switch (s)}. */
+    static boolean stringSwitchHash(Cond c) {
+        Expr l = c.left();
+        return l != null && l.kind == Expr.Kind.CALL && "hashCode".equals(l.name) && l.args.isEmpty() && l.target != null
+                && "Ljava/lang/String;".equals(l.target.desc);
     }
 
     /** equals/hashCode cannot be stubbed with Mockito (and stubbing toString hides bugs). */

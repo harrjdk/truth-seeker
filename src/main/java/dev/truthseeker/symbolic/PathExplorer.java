@@ -118,7 +118,8 @@ public final class PathExplorer {
         Expr[] locals;
         HashMap<String, Expr> thisFields;
         /** Values dereferenced on this path (call receivers, field targets, checked non-null): cannot be null afterwards. */
-        HashSet<String> nonNull;
+        /** Values known non-null, with the pc where that was learned (MAX_VALUE inside inlined code). */
+        HashMap<String, Integer> nonNull;
         /** Collaborator results dereferenced on this path, in order (kept across loop iterations, unlike nonNull). */
         ArrayList<Expr> derefs;
         /** Local-variable display names bound on this path: name → (method that bound it, full expression). */
@@ -141,7 +142,7 @@ public final class PathExplorer {
             f.stack = new ArrayList<>(stack);
             f.locals = locals.clone();
             f.thisFields = new HashMap<>(thisFields);
-            f.nonNull = new HashSet<>(nonNull);
+            f.nonNull = new HashMap<>(nonNull);
             f.derefs = new ArrayList<>(derefs);
             f.aliases = new HashMap<>(aliases);
             f.conds = new ArrayList<>(conds);
@@ -179,7 +180,7 @@ public final class PathExplorer {
         init.stack = new ArrayList<>();
         init.locals = new Expr[Math.max(mn.maxLocals, 1 + argTypes.length * 2)];
         init.thisFields = new HashMap<>(seedFields);
-        init.nonNull = new HashSet<>();
+        init.nonNull = new HashMap<>();
         init.derefs = new ArrayList<>();
         init.aliases = new HashMap<>();
         init.conds = new ArrayList<>();
@@ -386,7 +387,8 @@ public final class PathExplorer {
                         for (int k = 0; k < size; k++) elems.add(dflt);
                     }
                     elems.set(i, v);
-                    replace(f, arr, Expr.arrayLiteral(arr.name, arr.args.get(0), elems));
+                    Expr literal = Expr.arrayLiteral(arr.name, arr.args.get(0), elems);
+                    replace(f, arr, arr.desc == null ? literal : literal.withDesc(arr.desc));
                 }
             }
             case POP -> f.pop();
@@ -506,7 +508,7 @@ public final class PathExplorer {
             }
             case GOTO -> {
                 int target = insns.indexOf(((JumpInsnNode) in).label);
-                if (target < f.pc) f.nonNull.clear(); // back-edge: loop variables will hold the next element
+                if (target < f.pc) forgetInLoop(f, target); // back-edge: loop variables will hold the next element
                 f.pc = target;
                 return true;
             }
@@ -613,7 +615,9 @@ public final class PathExplorer {
             }
             case ANEWARRAY -> {
                 Expr size = f.pop();
-                f.push(Expr.newArray(Names.simple(((TypeInsnNode) in).desc), size));
+                String elem = ((TypeInsnNode) in).desc;
+                Expr created = Expr.newArray(Names.simple(elem), size);
+                f.push(created.withDesc("[" + (elem.startsWith("[") ? elem : "L" + elem + ";")));
             }
             case MULTIANEWARRAY -> {
                 MultiANewArrayInsnNode m = (MultiANewArrayInsnNode) in;
@@ -628,7 +632,11 @@ public final class PathExplorer {
             case CHECKCAST -> {
                 Expr v = f.pop();
                 String t = ((TypeInsnNode) in).desc;
-                f.push(v.withDesc(t.startsWith("[") ? t : "L" + t + ";"));
+                Expr cast = v.withDesc(t.startsWith("[") ? t : "L" + t + ";");
+                // a parameter cast to a narrower type ((TextMessage) message): the test must pass one of those
+                if (v.kind == Expr.Kind.PARAM && !java.util.Objects.equals(v.desc, cast.desc)
+                        && f.derefs.stream().noneMatch(d -> d.kind == Expr.Kind.PARAM && d.index == v.index)) f.derefs.add(cast);
+                f.push(cast);
             }
             case INSTANCEOF -> f.push(Expr.instanceOf(f.pop(), ((TypeInsnNode) in).desc));
             case MONITORENTER, MONITOREXIT -> f.pop();
@@ -653,16 +661,19 @@ public final class PathExplorer {
         boolean canTake = feasible(f, taken);
         boolean canFall = feasible(f, fall);
         int target = insns.indexOf(j.label);
+        // a string switch's s.equals("de") is still the decision that picks the case: keep it on the path
+        if (canTake && !canFall && stringSwitchCollision(f, fall)) add(f, taken);
+        if (canFall && !canTake && stringSwitchCollision(f, taken)) add(f, fall);
         if (canTake && canFall) {
             Frame g = f.copy();
             add(g, taken);
             g.pc = target;
-            if (target < f.pc) g.nonNull.clear();
+            if (target < f.pc) forgetInLoop(g, target);
             work.push(g);
             add(f, fall);
             f.pc++;
         } else if (canTake) {
-            if (target < f.pc) f.nonNull.clear();
+            if (target < f.pc) forgetInLoop(f, target);
             f.pc = target;
         } else if (canFall) {
             f.pc++;
@@ -740,6 +751,7 @@ public final class PathExplorer {
     private boolean feasible(Frame f, Cond c) {
         Boolean k = known(f, c);
         if (k != null) return k;
+        if (stringSwitchCollision(f, c)) return false;
         for (Cond e : f.conds) {
             if (e.key().equals(c.key())) return e.value().equals(c.value());
         }
@@ -768,8 +780,28 @@ public final class PathExplorer {
         return e.expansion() != null ? e.expansion() : e.text;
     }
 
+    /**
+     * A loop's back-edge: what was learned inside the loop body may name a different value next time round; what was
+     * dereferenced before the loop (the response's writer) stays non-null.
+     */
+    private static void forgetInLoop(Frame f, int loopStart) {
+        int depth = inlineDepth(f);
+        f.nonNull.values().removeIf(at -> at / 1_000_000 > depth || (at / 1_000_000 == depth && at % 1_000_000 >= loopStart));
+    }
+
+    /** Where a non-null fact was learned: inlining depth and pc, so a loop inside inlined code forgets only its own. */
+    private static int learnedAt(Frame f) {
+        return inlineDepth(f) * 1_000_000 + Math.max(f.pc, 0);
+    }
+
+    private static int inlineDepth(Frame f) {
+        int d = 0;
+        for (Caller c = f.caller; c != null; c = c.parent()) d++;
+        return d;
+    }
+
     private static void dereferenced(Frame f, Expr e) {
-        if (e.kind != Expr.Kind.THIS && e.kind != Expr.Kind.STATIC && f.nonNull.add(valueKey(e)) && e.kind == Expr.Kind.CALL
+        if (e.kind != Expr.Kind.THIS && e.kind != Expr.Kind.STATIC && f.nonNull.putIfAbsent(valueKey(e), learnedAt(f)) == null && e.kind == Expr.Kind.CALL
                 && f.derefs.stream().noneMatch(d -> d.text.equals(e.text))) f.derefs.add(e);
     }
 
@@ -777,7 +809,7 @@ public final class PathExplorer {
     private Boolean known(Frame f, Cond c) {
         Boolean k = isConstant(c);
         if (k != null) return k;
-        if (c.kind() == Cond.Kind.CMP && c.right().kind == Expr.Kind.NULL && f.nonNull.contains(valueKey(c.left()))) {
+        if (c.kind() == Cond.Kind.CMP && c.right().kind == Expr.Kind.NULL && f.nonNull.containsKey(valueKey(c.left()))) {
             return "!=".equals(c.op()) == c.isTrue();
         }
         return null;
@@ -868,7 +900,29 @@ public final class PathExplorer {
         };
     }
 
+    /**
+     * javac's string switch: {@code switch (s.hashCode()) { case 3241: if (s.equals("en")) ..}}. Under a hash case,
+     * {@code s.equals("en")} failing needs another string with the same hash: not a path worth testing.
+     */
+    private static boolean stringSwitchCollision(Frame f, Cond c) {
+        Expr l = c.left();
+        if (c.kind() != Cond.Kind.BOOL || c.isTrue() || l == null || l.kind != Expr.Kind.CALL || !"equals".equals(l.name)
+                || l.target == null || !"Ljava/lang/String;".equals(l.target.desc) || l.args.size() != 1
+                || l.args.get(0).kind != Expr.Kind.CONST || !(l.args.get(0).value instanceof String lit)) return false;
+        String hashText = l.target.text + ".hashCode()";
+        for (Cond e : f.conds) {
+            if (e.kind() == Cond.Kind.SWITCH && e.left() != null && e.left().text.equals(hashText)
+                    && Arrays.asList(e.value().split(" \\| ")).contains(String.valueOf(lit.hashCode()))) return true;
+        }
+        return false;
+    }
+
     private boolean doSwitch(Frame f, Expr key, Map<Integer, LabelNode> cases, LabelNode dflt, Deque<Frame> work) {
+        if (key.kind == Expr.Kind.CONST && key.value instanceof Number n) {
+            // a known value takes one branch (javac's string switch: `int tmp = -1; .. switch (tmp)`)
+            f.pc = insns.indexOf(cases.getOrDefault(n.intValue(), dflt));
+            return true;
+        }
         Expr selector = key;
         Map<Integer, Expr> labelExprs = new HashMap<>();
         Map<Integer, String> labelNames = new HashMap<>();
@@ -1259,6 +1313,9 @@ public final class PathExplorer {
         if (hs.isEmpty()) return;
         boolean jdk = m.owner.startsWith("java/") || m.owner.startsWith("javax/") || m.owner.startsWith("jdk/");
         if (!m.name.equals("<init>") && Type.getArgumentTypes(m.desc).length == 0 && isQuery(m.name) && !jdk && declaredExceptions(m).isEmpty()) return;
+        // a JDK object the method built itself (new BufferedWriter(..), new URL(..)): no test can make it throw
+        if (jdk && !m.name.equals("<init>") && call.target != null && call.target.kind == Expr.Kind.NEW && !call.target.isUninitialized()
+                && call.target.owner != null && call.target.owner.startsWith("java/")) return;
         List<String> declared = declaredExceptions(m);
         Set<Integer> seen = new HashSet<>();
         for (Handler h : hs) {

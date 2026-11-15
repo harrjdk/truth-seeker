@@ -41,7 +41,7 @@ verify_tests         path=app.war  testDir=build/gen-tests
 
 `verify_tests` derives the classpath from the archive: Spring Boot `BOOT-INF/classes` + `BOOT-INF/lib`, WAR `WEB-INF/classes` + `WEB-INF/lib`, or EAR modules.
 Files that don't compile are reported, and the rest still run.
-`provided` container APIs (`javax.servlet`, `jakarta.persistence`, ...) are never inside a WAR. When the generated tests need one, `verify_tests` takes it from the local Maven repository (`~/.m2`) and says so; otherwise pass it with `extraClasspath`.
+`provided` container APIs (`javax.servlet`, `jakarta.persistence`, ...) are never inside a WAR. When the generated tests need one (a missing package, or a supertype such as `javax.batch.api.chunk.ItemProcessor` that cannot be accessed), `verify_tests` takes a jar that really holds that package from the local Maven repository (`~/.m2`, the specific API or the `javaee-api`/`jakartaee-api` umbrella) and says so; otherwise pass it with `extraClasspath`.
 It needs a JDK, not a JRE, and extracts to `java.io.tmpdir/truth-seeker` (override with `-Dtruthseeker.cache=…`).
 
 ### What it looks like
@@ -96,6 +96,12 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 | [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 187 (12 classes) | 187 | 0 | 0 |
 | [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 |
 | [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 |
+| [Java EE 7 samples](https://github.com/javaee-samples/javaee7-samples), 10 modules (Batch, JAX-RS, JPA, JMS, Concurrency, WebSocket, Servlet, JACC, JASPIC; Java 8 bytecode) | 10 WARs, 76 app classes | 306 (72 classes) | 251 | 46 | 9 |
+
+The Java EE 7 failures need a running container or network: static `PolicyContext`/`AuthConfigFactory` lookups, a
+servlet that opens an HTTP connection, and a JSON decoder handed `"value"`. Most disabled tests there wait on a
+container-provided object (`PolicyContext` results), a second `Thread.sleep` in a loop that must throw while the first
+must not, or a `StringTokenizer` field.
 
 Every generated test arranges its path. Expected values are rebuilt from what the test controls (see below); 3
 PetClinic and 2 Cargo Tracker tests (none in JPetStore) still end with `assertNotNull(result)` (or no assertion) and a
@@ -187,6 +193,12 @@ What it recognizes:
 - local variable names from debug info
 - enum switches (javac `$SwitchMap$`, ECJ `$SWITCH_TABLE$`, direct ordinal switches, Java 21 `enumSwitch`/`typeSwitch`)
 - legacy `StringBuilder` and modern `indy` string concatenation, including a `StringBuilder` kept in a local and appended to again after a branch
+- Java 7 string switches (`switch (code) { case "en": .. }`, compiled to `hashCode()` plus `equals`): the case's string is passed, the default gets one hashing to no case, and hash collisions are not explored
+- polling loops on a mock (`while (!future.isDone()) Thread.sleep(..)`, `while ((n = in.read()) != -1)`): one stub answering each iteration in turn, `thenReturn(false, true)`
+- `Thread.sleep`/`TimeUnit.sleep`/`join` throwing `InterruptedException`: the test interrupts its own thread first and clears the flag afterwards
+- parameters a path casts (`(TextMessage) message`) are mocks of the cast type; exceptions handed to listeners are real ones (`new Exception("value")`); collaborators a lifecycle method sets (`initialize(handler)`) are mocks put in the field
+- `getClass() != o.getClass()` in `equals`: an argument of another class, or another instance of the subject's
+- calls on JDK objects the method builds itself (`new BufferedWriter(..).write(..)`) are not assumed to throw, since no test could make them
 - boxing and unboxing
 - pre-Java 5 `class$` literals
 - `assert` statements
