@@ -2134,6 +2134,8 @@ public final class TestGenerator {
             } else if (v.kind == Expr.Kind.BINARY && evaluate(v) != null && ret.getSort() >= Type.CHAR && ret.getSort() <= Type.LONG) {
                 Number n = evaluate(v);
                 out.add("assertEquals(" + (ret.getSort() == Type.LONG ? n.longValue() + "L" : String.valueOf(n.longValue())) + ", result);");
+            } else if (v.kind == Expr.Kind.CALL && v.target != null && pipeline(v) != null) {
+                out.addAll(expectPipeline(v, ret));
             } else if (v.kind == Expr.Kind.CALL && v.target != null) {
                 Type t = Type.getType(v.desc);
                 if (t.getSort() == Type.OBJECT && !ClassInspector.isValueType(v.desc)) {
@@ -2415,6 +2417,240 @@ public final class TestGenerator {
                 "java/lang/Boolean.valueOf", "java/lang/Integer.toString", "java/lang/Long.toString", "java/lang/Math.max",
                 "java/lang/Math.min", "java/lang/Math.abs");
 
+        /** A call on a stream (or size/emptiness query) of {@code e}: reads the collection, never changes it. */
+        boolean onlyReads(Effect ef, Expr e) {
+            if (ef.kind() != Effect.Kind.CALL || ef.target() == null) return false;
+            if (ef.args().stream().anyMatch(a -> a.mentions(x -> x.text.equals(e.text)))) return false;
+            Expr t = ef.target();
+            while (t.kind == Expr.Kind.CALL && t.target != null && !t.target.text.equals(e.text)) {
+                if (t.args.stream().anyMatch(a -> a.mentions(x -> x.text.equals(e.text)))) return false;
+                t = t.target;
+            }
+            return t.kind == Expr.Kind.CALL && t.target != null && t.target.text.equals(e.text)
+                    && Set.of("stream", "parallelStream", "size", "isEmpty", "contains").contains(t.name);
+        }
+
+        /** {@code this.f = e} where nothing else on the path calls methods on or passes along {@code this.f}. */
+        boolean storedUntouched(Effect ef, Expr e) {
+            if (ef.kind() != Effect.Kind.FIELD_WRITE || ef.value() == null || !ef.value().text.equals(e.text)
+                    || ef.target() == null || ef.target().kind != Expr.Kind.THIS) return false;
+            String field = "this." + ef.name();
+            return p.effects().stream().filter(o -> o != ef).noneMatch(o -> (o.target() != null && o.target().mentions(x -> x.text.equals(field)))
+                    || o.args().stream().anyMatch(a -> a.mentions(x -> x.text.equals(field))));
+        }
+
+        /** What a stream pipeline or iterator over a collection the test controls yields. */
+        record Pipeline(String expected, boolean iterator) {}
+
+        /** Pipelines already evaluated, by expression text (evaluation may arrange the source field once). */
+        final Map<String, Pipeline> pipelines = new HashMap<>();
+
+        List<String> expectPipeline(Expr v, Type ret) {
+            Pipeline pl = pipeline(v);
+            if (pl == null) return List.of();
+            if (!pl.iterator()) return List.of(assertEqualsTo(pl.expected(), ret));
+            imports.add("java.util.ArrayList");
+            imports.add("java.util.List");
+            String var = "remaining";
+            for (int i = 1; usedNames.contains(var); i++) var = "remaining" + i;
+            usedNames.add(var);
+            return List.of("List<Object> " + var + " = new ArrayList<>();", "result.forEachRemaining(" + var + "::add);",
+                    "assertEquals(" + pl.expected() + ", " + var + ");");
+        }
+
+        /**
+         * {@code this.items.iterator()}, {@code this.specialties.stream().sorted(..).collect(Collectors.toList())},
+         * {@code this.lines.stream().map(..).reduce(BigDecimal.ZERO, BigDecimal::add)}: evaluated on the elements the
+         * test puts in the collection. Steps that call a lambda per element are only evaluated on an empty collection,
+         * sorting and distinct on at most one element. An unarranged source field gets one mock element when every step
+         * allows it, else none. Null when a step is not understood.
+         */
+        Pipeline pipeline(Expr e) {
+            if (pipelines.containsKey(e.text)) return pipelines.get(e.text);
+            List<Expr> steps = new ArrayList<>();
+            Expr src = e;
+            while (src.kind == Expr.Kind.CALL && src.target != null && steps.size() < 8) {
+                steps.add(0, src);
+                src = src.target;
+            }
+            if (steps.isEmpty() || !steps.get(0).owner.startsWith("java/util/")) return null;
+            if (!Set.of("stream", "iterator").contains(steps.get(0).name) || !steps.get(0).args.isEmpty()) return null;
+            Pipeline result = null;
+            if (src.kind == Expr.Kind.NEW && src.args.isEmpty() && src.owner != null && src.owner.startsWith("java/util/")
+                    && renderExpected(src, 1) != null) { // created empty, untouched
+                result = evaluate(steps, List.of());
+            } else if (src.kind == Expr.Kind.FIELD && src.target != null && src.target.kind == Expr.Kind.THIS && !isStatic && src.desc != null) {
+                result = pipelineOverField(src, steps);
+            }
+            pipelines.put(e.text, result);
+            return result;
+        }
+
+        Pipeline pipelineOverField(Expr field, List<Expr> steps) {
+            if (deps.containsKey(field.name) || ensured.containsKey(field.text)) return null;
+            Type ft = Type.getType(field.desc);
+            String bound = boundLiteral.get(field.text);
+            if (bound != null) {
+                List<String> elems = elementsOf(bound);
+                if (elems == null) return null;
+                boolean onlyNullChecked = elems.isEmpty() && p.conds().stream()
+                        .noneMatch(c -> c.describe().contains(field.text + ".") || c.describe().contains(field.text + " ="));
+                Pipeline one = onlyNullChecked ? withOneElement(field, ft, steps, bound) : null;
+                return one != null ? one : evaluate(steps, elems);
+            }
+            Pipeline one = withOneElement(field, ft, steps, null);
+            if (one != null) return one;
+            String empty = iterableLiteral(ft, List.of());
+            Pipeline none = evaluate(steps, List.of());
+            if (empty == null || none == null || empty.contains("Iterator")) return null;
+            needsSetField = true;
+            arrange.add("setField(subject, \"" + field.name + "\", " + empty + ");");
+            boundLiteral.put(field.text, empty);
+            return none;
+        }
+
+        /** Arranges the field with one mock element if the steps can be evaluated on it (replacing an empty non-null literal). */
+        Pipeline withOneElement(Expr field, Type ft, List<Expr> steps, String replacing) {
+            Type et = declaredElementType(field);
+            if (et == null || !isMockable(et) || evaluate(steps, List.of("x")) == null) return null;
+            if (iterableLiteral(ft, List.of("x")) == null || ft.getInternalName().equals("java/util/Iterator")) return null;
+            String setLine = replacing == null ? null : "setField(subject, \"" + field.name + "\", " + replacing + ");";
+            if (replacing != null && !arrange.contains(setLine)) return null;
+            String v = newVar(et);
+            String lit = iterableLiteral(ft, List.of(v));
+            needsSetField = true;
+            if (setLine != null) arrange.remove(setLine);
+            arrange.add("setField(subject, \"" + field.name + "\", " + lit + ");");
+            boundLiteral.put(field.text, lit);
+            return evaluate(steps, List.of(v));
+        }
+
+        /** Elements of a collection literal this generator wrote ({@code new ArrayList<>(List.of(leg))}), or null. */
+        List<String> elementsOf(String literal) {
+            var m = Pattern.compile("new \\w+<>\\((?:List\\.of\\(([^()]*)\\))?\\)").matcher(literal);
+            if (!m.matches()) return null;
+            if (m.group(1) == null || m.group(1).isBlank()) return List.of();
+            List<String> out = new ArrayList<>();
+            for (String part : m.group(1).split(",")) {
+                if (!part.trim().matches("[a-z][A-Za-z0-9_$]*")) return null;
+                out.add(part.trim());
+            }
+            return out;
+        }
+
+        /** Runs the steps over elements known by name. Null when a step cannot be decided. */
+        Pipeline evaluate(List<Expr> steps, List<String> elems) {
+            boolean stream = false;
+            List<String> cur = elems;
+            for (int i = 0; i < steps.size(); i++) {
+                Expr st = steps.get(i);
+                boolean last = i == steps.size() - 1;
+                String n = st.name;
+                if (i == 0) {
+                    if (n.equals("iterator")) return last ? new Pipeline(listOf(cur), true) : null;
+                    stream = true;
+                    continue;
+                }
+                if (!stream || st.owner == null || !st.owner.equals("java/util/stream/Stream")) return null;
+                switch (n) {
+                    case "sorted", "distinct" -> { if (cur.size() > 1) return null; }
+                    case "filter", "map", "flatMap", "peek", "mapToInt", "mapToLong", "mapToDouble" -> {
+                        if (!cur.isEmpty() || !st.owner.equals("java/util/stream/Stream")) return null;
+                        if (!n.equals("filter") && !n.equals("map") && !n.equals("flatMap") && !n.equals("peek")) return null;
+                    }
+                    case "limit", "skip" -> { if (!cur.isEmpty()) return null; }
+                    case "toList" -> { return last ? new Pipeline(listOf(cur), false) : null; }
+                    case "collect" -> {
+                        if (!last || st.args.size() != 1) return null;
+                        Expr c = st.args.get(0);
+                        if (c.kind != Expr.Kind.CALL || !"java/util/stream/Collectors".equals(c.owner) || !c.args.isEmpty()) return null;
+                        return switch (c.name) {
+                            case "toList", "toUnmodifiableList" -> new Pipeline(listOf(cur), false);
+                            case "toSet", "toUnmodifiableSet" -> {
+                                imports.add("java.util.Set");
+                                yield new Pipeline("Set.of(" + String.join(", ", cur) + ")", false);
+                            }
+                            default -> null;
+                        };
+                    }
+                    case "count" -> { return last ? new Pipeline(cur.size() + "L", false) : null; }
+                    case "anyMatch" -> { return last && cur.isEmpty() ? new Pipeline("false", false) : null; }
+                    case "allMatch", "noneMatch" -> { return last && cur.isEmpty() ? new Pipeline("true", false) : null; }
+                    case "findFirst", "findAny" -> {
+                        if (!last) return null;
+                        imports.add("java.util.Optional");
+                        return new Pipeline(cur.isEmpty() ? "Optional.empty()" : "Optional.of(" + cur.get(0) + ")", false);
+                    }
+                    case "reduce" -> {
+                        if (!last || st.args.size() != 2 || !cur.isEmpty()) return null;
+                        String identity = renderExpected(st.args.get(0), 1);
+                        return identity == null ? null : new Pipeline(identity, false);
+                    }
+                    default -> { return null; }
+                }
+            }
+            return null;
+        }
+
+        String listOf(List<String> elems) {
+            imports.add("java.util.List");
+            return "List.of(" + String.join(", ", elems) + ")";
+        }
+
+        /**
+         * A static constant the test can name: an accessible {@code static final} field ({@code BigDecimal.ZERO},
+         * {@code Order.MAX_ITEMS}), or a private one initialised from literals by a pure JDK factory
+         * ({@code DateTimeFormatter.ofPattern("yyyy/MM/dd")}), re-created in the test. Else null.
+         */
+        String staticConstant(Expr e) {
+            if (e.owner == null || e.name == null) return null;
+            if (e.owner.startsWith("java/")) {
+                try {
+                    Class<?> c = Class.forName(e.owner.replace('/', '.'), false, ClassLoader.getPlatformClassLoader());
+                    int mod = c.getField(e.name).getModifiers();
+                    if (java.lang.reflect.Modifier.isPublic(c.getModifiers()) && java.lang.reflect.Modifier.isStatic(mod)
+                            && java.lang.reflect.Modifier.isFinal(mod)) return imports.ref(Type.getObjectType(e.owner)) + "." + e.name;
+                } catch (ReflectiveOperationException | LinkageError ex) {
+                    return null;
+                }
+                return null;
+            }
+            ClassNode node = e.owner.equals(cn.name) ? cn : repo.node(e.owner);
+            if (node == null) return null;
+            FieldNode fn = node.fields.stream().filter(f -> f.name.equals(e.name)).findFirst().orElse(null);
+            if (fn == null || (fn.access & (Opcodes.ACC_STATIC | Opcodes.ACC_FINAL)) != (Opcodes.ACC_STATIC | Opcodes.ACC_FINAL)) return null;
+            boolean samePackage = Names.packageOf(node.name).equals(Names.packageOf(cn.name));
+            boolean visibleClass = (node.access & Opcodes.ACC_PUBLIC) != 0 || samePackage;
+            boolean visibleField = (fn.access & Opcodes.ACC_PUBLIC) != 0 || ((fn.access & Opcodes.ACC_PRIVATE) == 0 && samePackage);
+            if (visibleClass && visibleField && !node.name.contains("$")) return imports.ref(Type.getObjectType(node.name)) + "." + e.name;
+            return constantInitializer(node, fn);
+        }
+
+        /** {@code static final X F = Factory.of("literal", ..);} in the class initializer, as test source; else null. */
+        String constantInitializer(ClassNode node, FieldNode fn) {
+            MethodNode clinit = node.methods.stream().filter(m -> m.name.equals("<clinit>")).findFirst().orElse(null);
+            if (clinit == null) return null;
+            List<AbstractInsnNode> code = new ArrayList<>();
+            for (AbstractInsnNode in : clinit.instructions) if (in.getOpcode() >= 0) code.add(in);
+            for (int i = 0; i < code.size(); i++) {
+                if (code.get(i).getOpcode() != Opcodes.PUTSTATIC || !((FieldInsnNode) code.get(i)).name.equals(fn.name) || i < 1) continue;
+                if (!(code.get(i - 1) instanceof org.objectweb.asm.tree.MethodInsnNode call) || call.getOpcode() != Opcodes.INVOKESTATIC) return null;
+                if (!CONSTANT_FACTORIES.contains(call.owner + "." + call.name)) return null;
+                int argc = Type.getArgumentTypes(call.desc).length;
+                if (i - 1 - argc < 0) return null;
+                List<String> args = new ArrayList<>();
+                for (int k = i - 1 - argc; k < i - 1; k++) {
+                    if (!(code.get(k) instanceof org.objectweb.asm.tree.LdcInsnNode ldc) || !(ldc.cst instanceof String str)) return null;
+                    args.add(Expr.constant(str, "Ljava/lang/String;").text);
+                }
+                return imports.ref(Type.getObjectType(call.owner)) + "." + call.name + "(" + String.join(", ", args) + ")";
+            }
+            return null;
+        }
+
+        private static final Set<String> CONSTANT_FACTORIES = Set.of("java/time/format/DateTimeFormatter.ofPattern",
+                "java/util/regex/Pattern.compile", "java/math/BigDecimal.valueOf", "java/time/Duration.parse", "java/time/ZoneId.of");
+
         /** Instance methods that only read their receiver: safe to re-evaluate in the assertion. */
         boolean isPureInstanceCall(Expr e) {
             String o = e.owner == null ? "" : e.owner;
@@ -2438,10 +2674,14 @@ public final class TestGenerator {
                 case NULL: return "null";
                 case CONST: return literalOf(e);
                 case PARAM: return paramVars.get(e.index);
-                case STATIC: return isEnumConst(e) ? literalOf(e) : null;
+                case STATIC: return isEnumConst(e) ? literalOf(e) : staticConstant(e);
                 default: break;
             }
             if (e.expansion() == null && ensured.containsKey(e.text)) return ensured.get(e.text);
+            if (e.kind == Expr.Kind.CALL && e.target != null) {
+                Pipeline pl = pipeline(e);
+                if (pl != null && !pl.iterator()) return pl.expected();
+            }
             if (ensured.containsKey(canon(e))) return ensured.get(canon(e));
             String bound = boundLiteral.get(e.text);
             if (bound != null && !bound.startsWith("mock(") && !bound.contains("new ")) return bound;
@@ -2490,8 +2730,11 @@ public final class TestGenerator {
                 }
                 case NEW -> {
                     // an empty collection only if nothing on the path added to it (List<OrderLine> lines = new ArrayList<>(); lines.add(..))
-                    boolean touched = p.effects().stream().anyMatch(ef -> (ef.target() != null && ef.target().mentions(x -> x.text.equals(e.text)))
-                            || ef.args().stream().anyMatch(a -> a.mentions(x -> x.text.equals(e.text))));
+                    // (stored as is into a field nothing else on the path touches, like a lazy getter's `specialties = new HashSet<>()`, is not a change)
+                    boolean touched = p.effects().stream().anyMatch(ef -> !storedUntouched(ef, e) && !onlyReads(ef, e)
+                            && ((ef.target() != null && ef.target().mentions(x -> x.text.equals(e.text)))
+                            || ef.args().stream().anyMatch(a -> a.mentions(x -> x.text.equals(e.text)))
+                            || (ef.value() != null && ef.value().mentions(x -> x.text.equals(e.text)))));
                     if (!touched && e.args.isEmpty() && e.owner != null && e.owner.startsWith("java/util/") && collectionFactory(Type.getObjectType(e.owner)) != null) {
                         return "new " + imports.ref(Type.getObjectType(e.owner)) + "<>()";
                     }
@@ -2508,6 +2751,15 @@ public final class TestGenerator {
                         String recv = renderExpected(e.target, depth + 1);
                         List<String> args = renderArgs(e, ats, depth);
                         if (recv == null || args == null) return null;
+                        if (recv.matches("new \\w+<>\\(\\)") && args.isEmpty()) { // queries on an empty collection
+                            boolean list = recv.contains("List") || recv.contains("Deque");
+                            switch (e.name) {
+                                case "size": return "0";
+                                case "isEmpty": return "true";
+                                case "hashCode": return list ? "1" : "0";
+                                default: break;
+                            }
+                        }
                         return recv + "." + e.name + "(" + String.join(", ", args) + ")";
                     }
                     // a collaborator's answer: stub it (or reuse the stub) and expect that value

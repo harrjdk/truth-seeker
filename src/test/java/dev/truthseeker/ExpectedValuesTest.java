@@ -70,4 +70,18 @@ class ExpectedValuesTest {
         assertTrue(code.contains("result.getCustomers());"), code);
         assertTrue(!code.contains("TODO: expected"), code);
     }
+
+    @Test
+    void pipelinesOverTheSubjectsCollectionsAreEvaluated() throws Exception {
+        String code = generate("fixtures.legacy.Roster");
+        // an iterator over one arranged element yields exactly it
+        assertTrue(code.contains("result.forEachRemaining(remaining::add);") && code.contains("assertEquals(List.of(member), remaining);"), code);
+        // a per-element lambda is only decided on an empty list: the reduction's identity
+        assertTrue(code.contains("assertEquals(BigDecimal.ZERO, result);"), code);
+        // sorting one element, and the lazily created empty set
+        assertTrue(code.contains("assertEquals(List.of(member), result);") && code.contains("assertEquals(List.of(), result);"), code);
+        // a private formatter constant re-created from its initializer
+        assertTrue(code.contains(".format(DateTimeFormatter.ofPattern(\"yyyy/MM/dd\")), result);"), code);
+        assertTrue(!code.contains("TODO: assert"), code);
+    }
 }
