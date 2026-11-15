@@ -47,6 +47,15 @@ class VerifyTestsTest {
     }
 
     @Test
+    void mutationTestingScoresTheGeneratedTests(@TempDir Path tmp) throws Exception {
+        TestSupport.run("generate_unit_tests", "className", "fixtures.rules.ShippingFee", "outputDir", tmp.toString());
+        String out = TestSupport.run("verify_tests", "testDir", tmp.toString(), "timeoutSeconds", 240, "mutate", true, "maxMutants", 6);
+        assertTrue(out.contains("## Mutation testing"), out);
+        assertTrue(out.matches("(?s).*\\*\\*Mutation score: \\d+%\\*\\* — \\d+ of 6 changes caught.*"), out);
+        assertTrue(out.contains("| `ShippingFee` |"), out);
+    }
+
+    @Test
     void missingTestDirIsAClearError() {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> TestSupport.run("verify_tests", "testDir", "does/not/exist"));

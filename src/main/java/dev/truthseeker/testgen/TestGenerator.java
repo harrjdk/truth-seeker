@@ -893,7 +893,31 @@ public final class TestGenerator {
             return text.replaceAll(" \\[iteration \\d+\\]", "");
         }
 
+        /**
+         * The path opens a real network connection (new URL(..).openConnection(), a Socket, a JAX-RS client): a unit
+         * test cannot answer it, so the test is left disabled rather than passing or failing by accident.
+         */
+        String networkCall() {
+            List<Expr> all = new ArrayList<>();
+            for (Cond c : p.conds()) { all.add(c.left()); if (c.right() != null) all.add(c.right()); }
+            for (Effect ef : p.effects()) { if (ef.target() != null) all.add(ef.target()); all.addAll(ef.args()); }
+            all.addAll(p.dereferenced());
+            if (p.outcome().value() != null) all.add(p.outcome().value());
+            String[] found = new String[1];
+            for (Expr root : all) {
+                root.mentions(x -> {
+                    if (found[0] != null) return true;
+                    if (x.kind == Expr.Kind.NEW && x.owner != null && (x.owner.startsWith("java/net/") || x.owner.equals("java/net/Socket"))) found[0] = "new " + Names.simple(x.owner) + "(..)";
+                    else if (x.kind == Expr.Kind.CALL && x.target == null && x.owner != null && x.owner.endsWith("/ws/rs/client/ClientBuilder")) found[0] = "ClientBuilder." + x.name + "()";
+                    return found[0] != null;
+                });
+            }
+            return found[0];
+        }
+
         void collect() {
+            String net = networkCall();
+            if (net != null) todos.add("this path opens a real network connection (`" + net + "`): run it against a server, or move the connection behind a collaborator the test can mock");
             arrangePeers();
             arrangeLoops();
             Set<Cond> sequenced = arrangeSequences();
@@ -3386,7 +3410,8 @@ public final class TestGenerator {
                 Expr t = e.target();
                 String mockVar = null;
                 if (t.kind == Expr.Kind.FIELD && t.target != null && t.target.kind == Expr.Kind.THIS && deps.containsKey(t.name)) mockVar = t.name;
-                else if (ensured.containsKey(t.text)) mockVar = ensured.get(t.text);
+                else if (t.expansion() == null && ensured.containsKey(t.text)) mockVar = ensured.get(t.text);
+                else if (ensured.containsKey(canon(t))) mockVar = ensured.get(canon(t)); // a local alias: Cargo cargo = repo.find(id)
                 else if (t.kind == Expr.Kind.PARAM && String.valueOf(paramValues.get(t.index)).startsWith("mock(")) mockVar = paramVars.get(t.index);
                 if (mockVar == null) continue;
                 boolean isVoid = Type.getReturnType(e.desc()).getSort() == Type.VOID;

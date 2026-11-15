@@ -238,15 +238,18 @@ public final class Tools {
                         + "grouped by unresolved precondition. The classpath is derived from the archive (Spring Boot BOOT-INF, WAR "
                         + "WEB-INF, EAR modules); JUnit and Mockito are bundled. Files that do not compile are reported and the rest still "
                         + "run. Use extraClasspath for `provided` APIs (jakarta.*/javax.*) missing from the archive. "
+                        + "With mutate: true it also measures how well the tests catch changes (mutation testing). "
                         + "NOTE: this executes the application's code in a child JVM.",
                 schema(PATH_PROP + """
                         ,"testDir": {"type": "string", "description": "Directory containing the test .java sources (searched recursively)."},
                         "extraClasspath": {"type": "string", "description": "Additional classpath entries joined with the OS path separator, e.g. provided container APIs."},
-                        "timeoutSeconds": {"type": "integer", "description": "Kill the test JVM after this many seconds (default 300)."}""",
+                        "timeoutSeconds": {"type": "integer", "description": "Kill the test JVM after this many seconds (default 300)."},
+                        "mutate": {"type": "boolean", "description": "Afterwards run mutation testing: change each tested class's bytecode in small ways (negated or off-by-one conditions, swapped arithmetic, changed return values, removed calls), rerun its generated tests per change, and report the score and the changes no test notices. Slower: one JVM per change."},
+                        "maxMutants": {"type": "integer", "description": "With mutate: cap on changes run, spread over the classes (default 200)."}""",
                         "path", "testDir"),
                 a -> {
                     TestVerifier.Options o = new TestVerifier.Options(str(a, "path"), str(a, "testDir"), str(a, "extraClasspath"),
-                            integer(a, "timeoutSeconds", 300));
+                            integer(a, "timeoutSeconds", 300), Boolean.TRUE.equals(a.get("mutate")), integer(a, "maxMutants", 200));
                     try {
                         TestVerifier.Result r = TestVerifier.verify(o);
                         return new Output(TestVerifier.markdown(o, r), TestVerifier.structured(r));

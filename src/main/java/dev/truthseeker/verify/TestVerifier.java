@@ -25,13 +25,21 @@ import java.util.stream.Stream;
  */
 public final class TestVerifier {
 
-    public record Options(String archive, String testDir, String extraClasspath, int timeoutSeconds) {}
+    /**
+     * @param mutate     afterwards, change each tested class's bytecode in small ways and rerun its tests (mutation testing)
+     * @param maxMutants cap on mutants run, spread over the classes
+     */
+    public record Options(String archive, String testDir, String extraClasspath, int timeoutSeconds, boolean mutate, int maxMutants) {
+        public Options(String archive, String testDir, String extraClasspath, int timeoutSeconds) {
+            this(archive, testDir, extraClasspath, timeoutSeconds, false, 0);
+        }
+    }
 
     public record Failure(String test, String cause, String at) {}
 
     public record Result(int compiledFiles, List<String> notCompiled, Map<String, List<String>> compileErrors, int total,
                          int passed, int failed, int disabled, List<Failure> failures, List<TestGenerator.Issue> disabledTests,
-                         List<String> containerFailures, List<String> notes, boolean timedOut) {}
+                         List<String> containerFailures, List<String> notes, boolean timedOut, MutationTesting.Report mutation) {}
 
     private TestVerifier() {}
 
@@ -115,6 +123,8 @@ public final class TestVerifier {
         List<String> containerFailures = new ArrayList<>();
         Map<String, String> skippedTests = new LinkedHashMap<>();
         boolean timedOut = false;
+        Set<String> passedTests = new HashSet<>();
+        MutationTesting.Launcher launcher = null;
         if (compiled > 0) {
             Path runnerClasses = Files.createDirectories(work.resolve("runner"));
             Path runnerSrc = work.resolve("TruthSeekerTestRunner.java");
@@ -128,24 +138,13 @@ public final class TestVerifier {
             runCp.add(classes.toString());
             runCp.add(runnerClasses.toString());
             runCp.addAll(cp);
-            Path argFile = work.resolve("java.args");
-            List<String> jvm = new ArrayList<>();
-            jvm.add("-cp");
-            jvm.add(quote(String.join(File.pathSeparator, runCp.stream().map(s -> s.replace('\\', '/')).toList())));
-            jvm.add("-Dfile.encoding=UTF-8");
-            jvm.add("-Xshare:off");
-            if (Runtime.version().feature() >= 21) jvm.add("-XX:+EnableDynamicAgentLoading"); // Mockito's inline mock maker
-            jvm.add("TruthSeekerTestRunner");
-            jvm.add(quote(classes.toString().replace('\\', '/')));
-            jvm.add(quote(results.toString().replace('\\', '/')));
-            Files.write(argFile, jvm, StandardCharsets.UTF_8);
-
-            String javaExe = Path.of(System.getProperty("java.home"), "bin", isWindows() ? "java.exe" : "java").toString();
-            Process proc = new ProcessBuilder(javaExe, "@" + argFile).redirectErrorStream(true).redirectOutput(log.toFile()).start();
-            if (!proc.waitFor(opt.timeoutSeconds(), TimeUnit.SECONDS)) {
-                proc.descendants().forEach(ProcessHandle::destroyForcibly);
-                proc.destroyForcibly();
-                timedOut = true;
+            launcher = (front, select, res, lg, timeout) -> {
+                List<String> full = new ArrayList<>(front);
+                full.addAll(runCp);
+                return launch(full, classes, select, res, lg, timeout);
+            };
+            timedOut = launcher.run(List.of(), List.of(), results, log, opt.timeoutSeconds());
+            if (timedOut) {
                 notes.add("Test run timed out after " + opt.timeoutSeconds() + "s (an infinite loop, or a test waiting on I/O). Partial results below.");
             }
             if (Files.exists(results)) {
@@ -154,7 +153,7 @@ public final class TestVerifier {
                     if (f.length < 5) continue;
                     String test = simple(f[1]) + "." + f[2];
                     switch (f[0]) {
-                        case "PASS" -> { total++; passed++; }
+                        case "PASS" -> { total++; passed++; passedTests.add(f[1] + "#" + f[2]); }
                         case "FAIL" -> { total++; failed++; failures.add(new Failure(test, f[3], f[4])); }
                         case "SKIP" -> { total++; disabled++; skippedTests.put(test, f[3]); }
                         case "CFAIL" -> containerFailures.add(simple(f[1]) + ": " + f[3]);
@@ -163,12 +162,42 @@ public final class TestVerifier {
                 }
             } else if (!timedOut) {
                 String tail = Files.exists(log) ? tail(Files.readString(log, StandardCharsets.UTF_8), 1500) : "";
-                containerFailures.add("Test JVM produced no results (exit " + proc.exitValue() + "): " + tail);
+                containerFailures.add("Test JVM produced no results: " + tail);
             }
+        }
+        MutationTesting.Report mutation = null;
+        if (opt.mutate() && launcher != null && !timedOut && !passedTests.isEmpty()) {
+            mutation = MutationTesting.run(classes, passedTests, app.entries(), opt.maxMutants() > 0 ? opt.maxMutants() : 200,
+                    Math.max(20, Math.min(120, opt.timeoutSeconds() / 5)), Files.createDirectories(work.resolve("mutants")), launcher);
         }
         List<TestGenerator.Issue> disabledTests = disabledReasons(sources, skippedTests.keySet());
         return new Result(compiled, notCompiled, compileErrors, total, passed, failed, disabled, failures, disabledTests,
-                containerFailures, notes, timedOut);
+                containerFailures, notes, timedOut, mutation);
+    }
+
+    /** Runs the tests in a child JVM (all of them, or only {@code select}); true when it was killed for taking too long. */
+    private static boolean launch(List<String> runCp, Path classes, List<String> select, Path results, Path log, int timeoutSeconds)
+            throws IOException, InterruptedException {
+        Path argFile = results.resolveSibling(results.getFileName() + ".args");
+        List<String> jvm = new ArrayList<>();
+        jvm.add("-cp");
+        jvm.add(quote(String.join(File.pathSeparator, runCp.stream().map(s -> s.replace('\\', '/')).toList())));
+        jvm.add("-Dfile.encoding=UTF-8");
+        jvm.add("-Xshare:off");
+        if (Runtime.version().feature() >= 21) jvm.add("-XX:+EnableDynamicAgentLoading"); // Mockito's inline mock maker
+        jvm.add("TruthSeekerTestRunner");
+        jvm.add(quote(classes.toString().replace('\\', '/')));
+        jvm.add(quote(results.toString().replace('\\', '/')));
+        if (!select.isEmpty()) jvm.add(quote(String.join(",", select)));
+        Files.write(argFile, jvm, StandardCharsets.UTF_8);
+        String javaExe = Path.of(System.getProperty("java.home"), "bin", isWindows() ? "java.exe" : "java").toString();
+        Process proc = new ProcessBuilder(javaExe, "@" + argFile).redirectErrorStream(true).redirectOutput(log.toFile()).start();
+        if (!proc.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+            proc.descendants().forEach(ProcessHandle::destroyForcibly);
+            proc.destroyForcibly();
+            return true;
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -270,7 +299,42 @@ public final class TestVerifier {
         if (r.failed() == 0 && r.notCompiled().isEmpty() && r.containerFailures().isEmpty()) {
             sb.append("\nAll active tests pass. They characterize current behaviour; review expected values before treating them as a spec.\n");
         }
+        if (r.mutation() != null) mutationMarkdown(sb, r.mutation());
         return sb.toString();
+    }
+
+    private static void mutationMarkdown(StringBuilder sb, MutationTesting.Report m) {
+        sb.append("\n## Mutation testing\n\n");
+        sb.append("Each tested class was changed in small ways (negated or off-by-one conditions, swapped arithmetic, changed return ")
+                .append("values, removed calls), one change at a time, and its tests rerun. A change no test notices survives.\n\n");
+        sb.append("- **Mutation score: ").append(m.score()).append("%** — ").append(m.killed()).append(" of ")
+                .append(m.killed() + m.survived()).append(" changes caught");
+        if (m.timedOut() > 0) sb.append(" (").append(m.timedOut()).append(" by timing out)");
+        sb.append("\n");
+        if (m.invalid() > 0) sb.append("- ").append(m.invalid()).append(" change(s) the JVM rejected were left out.\n");
+        if (m.skippedOverCap() > 0) sb.append("- ").append(m.skippedOverCap()).append(" more change(s) not run (maxMutants cap).\n");
+        if (!m.classes().isEmpty()) {
+            sb.append("\n| Class | Caught | Score |\n|---|---|---|\n");
+            m.classes().stream().sorted(Comparator.comparingDouble(c -> c.mutants() == 0 ? 1.0 : (double) c.killed() / c.mutants()))
+                    .forEach(c -> sb.append("| `").append(simple(c.className())).append("` | ").append(c.killed()).append("/").append(c.mutants())
+                            .append(" | ").append(c.mutants() == 0 ? 0 : Math.round(100f * c.killed() / c.mutants())).append("% |\n"));
+        }
+        if (!m.survivors().isEmpty()) {
+            sb.append("\n### Surviving changes (behaviour no test pins down)\n\n");
+            Map<String, List<MutationTesting.Survivor>> byMethod = new LinkedHashMap<>();
+            for (MutationTesting.Survivor s : m.survivors()) byMethod.computeIfAbsent(simple(s.className()) + "." + s.method(), k -> new ArrayList<>()).add(s);
+            int shown = 0;
+            for (var e : byMethod.entrySet()) {
+                if (shown++ >= 25) {
+                    sb.append("- … ").append(byMethod.size() - 25).append(" more methods\n");
+                    break;
+                }
+                sb.append("- `").append(e.getKey()).append("`: ")
+                        .append(e.getValue().stream().limit(4).map(s -> (s.line() > 0 ? "line " + s.line() + " " : "") + s.description())
+                                .collect(Collectors.joining("; ")))
+                        .append(e.getValue().size() > 4 ? "; …" : "").append("\n");
+            }
+        }
     }
 
     public static Map<String, Object> structured(Result r) {
@@ -284,6 +348,21 @@ public final class TestVerifier {
         m.put("timedOut", r.timedOut());
         m.put("failures", r.failures().stream().map(f -> Map.of("test", f.test(), "cause", f.cause(), "at", f.at())).toList());
         m.put("containerFailures", r.containerFailures());
+        if (r.mutation() != null) {
+            MutationTesting.Report mr = r.mutation();
+            Map<String, Object> mm = new LinkedHashMap<>();
+            mm.put("score", mr.score());
+            mm.put("mutants", mr.mutants());
+            mm.put("killed", mr.killed());
+            mm.put("survived", mr.survived());
+            mm.put("timedOut", mr.timedOut());
+            mm.put("invalid", mr.invalid());
+            mm.put("notRun", mr.skippedOverCap());
+            mm.put("classes", mr.classes().stream().map(c -> Map.of("class", c.className(), "mutants", c.mutants(), "killed", c.killed())).toList());
+            mm.put("survivors", mr.survivors().stream().map(sv -> Map.of("class", sv.className(), "method", sv.method(), "line", sv.line(),
+                    "change", sv.description())).toList());
+            m.put("mutation", mm);
+        }
         return m;
     }
 
@@ -327,13 +406,19 @@ public final class TestVerifier {
             import java.nio.file.Paths;
             import java.util.Collections;
 
+            import static org.junit.platform.engine.discovery.DiscoverySelectors.selectClass;
             import static org.junit.platform.engine.discovery.DiscoverySelectors.selectClasspathRoots;
 
             public class TruthSeekerTestRunner {
                 public static void main(String[] args) throws Exception {
                     PrintStream out = new PrintStream(new FileOutputStream(args[1]), true, "UTF-8");
-                    LauncherDiscoveryRequest request = LauncherDiscoveryRequestBuilder.request()
-                            .selectors(selectClasspathRoots(Collections.singleton(Paths.get(args[0])))).build();
+                    LauncherDiscoveryRequestBuilder builder = LauncherDiscoveryRequestBuilder.request();
+                    if (args.length > 2 && !args[2].isEmpty()) {
+                        for (String c : args[2].split(",")) builder.selectors(selectClass(c));
+                    } else {
+                        builder.selectors(selectClasspathRoots(Collections.singleton(Paths.get(args[0]))));
+                    }
+                    LauncherDiscoveryRequest request = builder.build();
                     Launcher launcher = LauncherFactory.create();
                     launcher.execute(request, new TestExecutionListener() {
                         @Override

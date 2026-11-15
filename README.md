@@ -24,7 +24,7 @@ An MCP server that lets an LLM client (Claude Code, Claude Desktop, Codex, or a 
 | `truth_table` | A method's decisions and the **simplified boolean logic per outcome**. The summary (default) gives one row per outcome, with path counts and side effects listed once. `detail: "full"` gives one row per path, and `expand` adds the 2ⁿ table |
 | `state_machine` | Mermaid / PlantUML state diagrams inferred from enum state. Also reports **derived state** (a status computed from other facts, e.g. from the last event). Flags unguarded transitions, never-entered or never-produced states, and state-guard rejections |
 | `generate_unit_tests` | JUnit 5 + Mockito test classes (one class or `classNames`): one test per path, with solved inputs, stubs, assertions and `verify()` calls. Tests whose preconditions can't be arranged are `@Disabled` with exact `TODO`s. With `outputDir`, it writes the files and returns only a compact summary |
-| `verify_tests` | Compiles test sources against the archive and runs them on JUnit 5 in a **separate JVM**. Reports passed / failed / disabled, with failures grouped by cause and disabled tests grouped by unresolved precondition. JUnit and Mockito are bundled, so it works offline. **Runs the application's code** |
+| `verify_tests` | Compiles test sources against the archive and runs them on JUnit 5 in a **separate JVM**. Reports passed / failed / disabled, with failures grouped by cause and disabled tests grouped by unresolved precondition. With `mutate: true` it also runs **mutation testing** (below). JUnit and Mockito are bundled, so it works offline. **Runs the application's code** |
 
 All tools take `path`. The archive index is cached per path, so follow-up calls are fast.
 
@@ -43,6 +43,27 @@ verify_tests         path=app.war  testDir=build/gen-tests
 Files that don't compile are reported, and the rest still run.
 `provided` container APIs (`javax.servlet`, `jakarta.persistence`, ...) are never inside a WAR. When the generated tests need one (a missing package, or a supertype such as `javax.batch.api.chunk.ItemProcessor` that cannot be accessed), `verify_tests` takes a jar that really holds that package from the local Maven repository (`~/.m2`, the specific API or the `javaee-api`/`jakartaee-api` umbrella) and says so; otherwise pass it with `extraClasspath`.
 It needs a JDK, not a JRE, and extracts to `java.io.tmpdir/truth-seeker` (override with `-Dtruthseeker.cache=…`).
+
+### Do the tests catch changes? (mutation testing)
+
+```text
+verify_tests  path=app.war  testDir=build/gen-tests  mutate=true  maxMutants=200
+```
+
+A passing test only proves the code does what the test expects; it does not prove the test would notice a change. With
+`mutate: true`, every class that has passing generated tests (`XGeneratedTest`) gets small changes to its bytecode, one at
+a time, the kind a refactoring slip makes:
+
+- a negated condition (`==` ↔ `!=`, `== null` ↔ `!= null`, `<` ↔ `>=`) or a moved boundary (`<` ↔ `<=`)
+- swapped arithmetic (`+` ↔ `-`, `*` ↔ `/`)
+- a changed return value (the opposite boolean, a number + 1, `null` for an object)
+- a removed call to a collaborator's void method (`repository.save(..)`, `mav.addObject(..)`; not logging or `close()`)
+
+Only methods some passing test calls are changed, lambda bodies included. Each change runs that class's tests in a
+fresh JVM, several in parallel. A change is *caught* when a test that passed before fails (or the run hangs, e.g. a
+negated loop condition), and *survives* otherwise. The report gives the score per class and lists the surviving changes
+by method and line: behaviour the tests do not pin down, either because an assertion is missing or because the change
+makes no observable difference. It works on the archive's bytecode, so it needs neither the sources nor a build plugin.
 
 ### What it looks like
 
@@ -91,17 +112,22 @@ The tool also notes that `UNKNOWN` is declared but never produced: its only path
 The generated tests are compiled against each application and run with `verify_tests`, over MCP, on a Java 17 runtime.
 A test whose preconditions can't all be arranged automatically is emitted as `@Disabled`, with `TODO`s saying exactly what to arrange.
 
-| Application | Archive | Generated tests | Pass | Disabled (TODOs) | Fail |
-|---|---|---|---|---|---|
-| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 187 (12 classes) | 187 | 0 | 0 |
-| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 |
-| [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 |
-| [Java EE 7 samples](https://github.com/javaee-samples/javaee7-samples), 10 modules (Batch, JAX-RS, JPA, JMS, Concurrency, WebSocket, Servlet, JACC, JASPIC; Java 8 bytecode) | 10 WARs, 76 app classes | 306 (72 classes) | 257 | 40 | 9 |
+| Application | Archive | Generated tests | Pass | Disabled (TODOs) | Fail | Mutation score |
+|---|---|---|---|---|---|---|
+| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 187 (12 classes) | 187 | 0 | 0 | 74% (107/144) |
+| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 | 99% (207/209) |
+| [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 | 89% (220/247) |
+| [Java EE 7 samples](https://github.com/javaee-samples/javaee7-samples), 10 modules (Batch, JAX-RS, JPA, JMS, Concurrency, WebSocket, Servlet, JACC, JASPIC; Java 8 bytecode) | 10 WARs, 76 app classes | 306 (72 classes) | 251 | 49 | 6 | 89% (237/265) |
 
-The Java EE 7 failures need a running container or network: static `PolicyContext`/`AuthConfigFactory` lookups, a
-servlet that opens an HTTP connection, and a JSON decoder handed `"value"`. Most disabled tests there wait on a
-container-provided object (`PolicyContext` results), a second `Thread.sleep` in a loop that must throw while the first
-must not, or a `StringTokenizer` field.
+Mutation score: the share of small bytecode changes in tested methods that some generated test catches (see
+[mutation testing](#do-the-tests-catch-changes-mutation-testing)). PetClinic's survivors are mostly Spring MVC plumbing
+the tests do not observe (`WebDataBinder.setDisallowedFields`, `BindingResult.rejectValue` in a catch block) and
+negated validation conditions whose two branches end the same way.
+
+The Java EE 7 failures need a running container: static `PolicyContext`/`AuthConfigFactory` lookups and a JSON decoder
+handed `"value"`. Paths that open a real network connection (`new URL(..)`, a JAX-RS `ClientBuilder`) are disabled with
+a TODO saying so. The other disabled tests there wait on a container-provided object (`PolicyContext` results), a second
+`Thread.sleep` in a loop that must throw while the first must not, or a `StringTokenizer` field.
 
 Every generated test arranges its path. Expected values are rebuilt from what the test controls (see below); 3
 PetClinic and 2 Cargo Tracker tests (none in JPetStore) still end with `assertNotNull(result)` (or no assertion) and a
