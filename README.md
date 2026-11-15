@@ -94,10 +94,10 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 | Application | Archive | Generated tests | Pass | Disabled (TODOs) | Fail |
 |---|---|---|---|---|---|
 | [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 190 (12 classes) | 174 | 16 | 0 |
-| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 245 (18 classes) | 234 | 10 | 1 |
+| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 256 | 8 | 0 |
 
-The remaining failure is a documented limitation: a constructor of *another* class rejects the sample arguments
-(`new HandlingEvent(.., LOAD, ..)` requires a voyage), and other classes' constructors are not explored.
+The disabled tests are preconditions the generator can't arrange yet, such as a date comparison between two
+collaborators or a list the method builds itself. Each one carries a `TODO` that names what to arrange.
 
 ## Build
 
@@ -191,6 +191,8 @@ What it recognizes:
 - calls on the class's own methods (`this.helper(..)`, private/static helpers, getters, `super.m(..)`), **inlined** up to 2 levels so their decisions join the caller's paths (`inlineSelfCalls=false` on `truth_table` for the method-local view)
 - precondition helpers as branches to the exception they throw: `Objects.requireNonNull`, Spring `Assert`, Guava `Preconditions`, commons-lang `Validate`
 - null checks on values the path already dereferenced (pruned as infeasible)
+- **constructors of other application classes** (`new HandlingEvent(..)`), inlined so their validation (guards, `throw`s) becomes decisions on the arguments; their field writes stay inside
+- **rules held by enum constants**: a no-argument query on an application enum value (`type.requiresVoyage()`) is evaluated per constant from the enum's bytecode, and the path splits into groups such as `type in {LOAD, UNLOAD}`, which tests arrange by passing a matching constant
 - **typed `catch` blocks**: a call inside `try` that can throw a caught type gets a path into the handler, as a `call throws X` decision (checked exceptions when the callee declares them; JDK calls only for specific types such as `NumberFormatException` around `Integer.parseInt`). `throw`s and failing guards inside `try` jump to their handler too, also across inlined helpers
 
 What the test generator arranges:
@@ -202,7 +204,7 @@ What the test generator arranges:
 These are deliberate approximations, and the tool output says so:
 - `finally` and catch-all handlers are not entered; exceptions are only followed into typed `catch` blocks.
 - Loops are unrolled `loopBound` times (default 1). Paths are capped by `maxPaths` (default 256).
-- Bodies of *other* classes' methods and constructors are not explored. Those calls stay symbolic, e.g. `this.repo.findById(id)`.
+- Bodies of *other* classes' methods are not explored (their constructors and enum queries are). Those calls stay symbolic, e.g. `this.repo.findById(id)`.
 - State machines are inferred without inlining, so derived state (`calculateTransportStatus()`) stays distinct from transitions.
 - State machines match state by holder type and property name (`Order.status`), not by object identity.
 - Pre-Java 6 `JSR`/`RET` subroutines truncate the affected path.

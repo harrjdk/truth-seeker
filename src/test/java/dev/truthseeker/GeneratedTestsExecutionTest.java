@@ -45,7 +45,9 @@ class GeneratedTestsExecutionTest {
                 // self-call inlining, for-each loops driven with real collections, precondition helpers
                 "fixtures.rules.ShippingFee",
                 // try/catch: thenThrow/doThrow on collaborators, parser input, throws inside inlined helpers
-                "fixtures.legacy.AccountService"));
+                "fixtures.legacy.AccountService",
+                // constructors of other classes and rules held by enum constants
+                "fixtures.legacy.ShipmentEventFactory"));
         if (TestSupport.hasJava21Fixtures()) classes.add("fixtures.modern.Shapes");
 
         Path src = tmp.resolve("src");

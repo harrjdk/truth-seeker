@@ -269,7 +269,7 @@ public final class Tools {
                 compile and run them and see what still needs arranging. Use call_graph to follow a request
                 through layers and disassemble when you need ground truth. Every tool takes `path` (jar/war/ear/classes dir); indexes are
                 cached per path, so repeated calls are fast. Analyses are static approximations: only typed catch blocks are explored, loops are
-                bounded, calls on the class's own methods are inlined 2 levels deep and other classes' code is not followed — state these limits when presenting results.
+                bounded, calls on the class's own methods and other classes' constructors are inlined 2 levels deep, and other classes' methods are not followed — state these limits when presenting results.
                 """;
     }
 

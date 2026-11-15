@@ -73,6 +73,8 @@ public final class PathExplorer {
     private final List<Path> paths = new ArrayList<>();
     private final List<Expr> params = new ArrayList<>();
     private int pathIds;
+    /** Field values of {@code this} known up front (an enum constant evaluated by {@link #enumRule}). */
+    private Map<String, Expr> seedFields = Map.of();
 
     private PathExplorer(ClassRepository repo, ClassNode cn, MethodNode mn, Options opt) {
         this.repo = repo;
@@ -92,7 +94,13 @@ public final class PathExplorer {
     // ---------------------------------------------------------------------------------------------
 
     /** Caller state saved while an inlined self-call executes; immutable, shared between path copies. */
-    private record Caller(MethodNode method, int pc, List<Expr> stack, Expr[] locals, int[] visits, Caller parent) {
+    /**
+     * @param constructing for an inlined constructor of another class: the object being built (its field writes stay
+     *                     inside the call); null otherwise
+     * @param effectMark   for an inlined constructor: effects recorded before it, the rest are dropped on return; else -1
+     */
+    private record Caller(MethodNode method, int pc, List<Expr> stack, Expr[] locals, int[] visits, Caller parent,
+                          Expr constructing, int effectMark) {
         int depth() {
             return parent == null ? 1 : parent.depth() + 1;
         }
@@ -167,7 +175,7 @@ public final class PathExplorer {
         init.pc = 0;
         init.stack = new ArrayList<>();
         init.locals = new Expr[Math.max(mn.maxLocals, 1 + argTypes.length * 2)];
-        init.thisFields = new HashMap<>();
+        init.thisFields = new HashMap<>(seedFields);
         init.nonNull = new HashSet<>();
         init.aliases = new HashMap<>();
         init.conds = new ArrayList<>();
@@ -539,7 +547,9 @@ public final class PathExplorer {
                 FieldInsnNode fi = (FieldInsnNode) in;
                 Expr target = f.pop();
                 dereferenced(f, target);
-                if (target.kind == Expr.Kind.THIS && f.thisFields.containsKey(fi.name)) f.push(f.thisFields.get(fi.name));
+                String built = constructedKey(f, target, fi.name);
+                if (built != null && f.thisFields.containsKey(built)) f.push(f.thisFields.get(built));
+                else if (target.kind == Expr.Kind.THIS && f.thisFields.containsKey(fi.name)) f.push(f.thisFields.get(fi.name));
                 else f.push(Expr.field(target, fi.owner, fi.name, fi.desc));
             }
             case PUTFIELD -> {
@@ -547,8 +557,13 @@ public final class PathExplorer {
                 Expr v = coerce(f.pop(), fi.desc);
                 Expr target = f.pop();
                 dereferenced(f, target);
-                if (target.kind == Expr.Kind.THIS) f.thisFields.put(fi.name, v);
-                f.effects.add(new Effect(Effect.Kind.FIELD_WRITE, target, fi.owner, fi.name, fi.desc, List.of(), v));
+                String built = constructedKey(f, target, fi.name);
+                if (built != null) {
+                    f.thisFields.put(built, v); // initialising the object an inlined constructor builds
+                } else {
+                    if (target.kind == Expr.Kind.THIS) f.thisFields.put(fi.name, v);
+                    f.effects.add(new Effect(Effect.Kind.FIELD_WRITE, target, fi.owner, fi.name, fi.desc, List.of(), v));
+                }
             }
             case INVOKEVIRTUAL, INVOKESPECIAL, INVOKESTATIC, INVOKEINTERFACE -> {
                 if (!invoke(f, (MethodInsnNode) in, work)) return false;
@@ -901,6 +916,7 @@ public final class PathExplorer {
                     created = markConcat(created, args.length == 1 ? List.of(args[0]) : List.of());
                 }
                 replace(f, recv, created);
+                if (inlineConstructor(f, m, created, args)) return true;
                 if (repo != null && !repo.entry(m.owner).map(ClassRepository.ClassEntry::library).orElse(true)) {
                     forkThrows(f, created, m, work);
                 }
@@ -944,6 +960,7 @@ public final class PathExplorer {
         if (inline(f, m, recv, args)) return true;
         Boolean guarded = guard(f, m, args, work);
         if (guarded != null) return guarded;
+        if (enumRule(f, m, recv, args, work)) return true;
         Expr call = Expr.call(recv, m.owner, m.name, m.desc, argList);
         boolean loggerCall = opt.ignoreLogging() && LOGGER_TYPES.contains(m.owner);
         if (!loggerCall && !isPureLibraryCall(m) && !(ret.getSort() != Type.VOID && isQuery(m.name))) {
@@ -1131,7 +1148,10 @@ public final class PathExplorer {
             }
             if (thrown == null && isUnchecked(h.type())) {
                 if (jdk && GENERIC_EXCEPTIONS.contains(h.type())) continue;
-                if (jdk && isPureLibraryCall(m) && !m.name.startsWith("parse") && !m.name.equals("valueOf")) continue;
+                boolean parser = m.name.startsWith("parse") || m.name.equals("valueOf");
+                if (jdk && isPureLibraryCall(m) && !parser) continue;
+                // value types (dates, decimals, UUIDs) only fail on bad input when parsed or converted
+                if (jdk && isJdkValueType(m.owner) && !parser && !m.name.equals("of") && !m.name.startsWith("from")) continue;
                 thrown = h.type();
             }
             if (thrown == null && !jdk && (h.type().equals("java/lang/Exception") || h.type().equals("java/lang/Throwable"))) {
@@ -1234,7 +1254,7 @@ public final class PathExplorer {
         if (target == null || target.instructions.size() == 0 || target.instructions.size() > MAX_INLINE_INSNS
                 || (target.access & (ACC_ABSTRACT | ACC_NATIVE)) != 0) return false;
         if (target == f.method || (f.caller != null && f.caller.contains(target))) return false; // recursion
-        f.caller = new Caller(f.method, f.pc, List.copyOf(f.stack), f.locals, f.visits, f.caller);
+        f.caller = new Caller(f.method, f.pc, List.copyOf(f.stack), f.locals, f.visits, f.caller, null, -1);
         Expr[] locals = new Expr[Math.max(target.maxLocals, 1 + args.length * 2)];
         int slot = 0;
         if ((target.access & ACC_STATIC) == 0) locals[slot++] = recv;
@@ -1254,6 +1274,11 @@ public final class PathExplorer {
 
     private void returnToCaller(Frame f, Expr value) {
         Caller c = f.caller;
+        if (c.effectMark() >= 0) {
+            while (f.effects.size() > c.effectMark()) f.effects.remove(f.effects.size() - 1);
+            String prefix = constructedPrefix(c.constructing());
+            f.thisFields.keySet().removeIf(k -> k.startsWith(prefix));
+        }
         f.caller = c.parent();
         f.method = c.method();
         f.stack = new ArrayList<>(c.stack());
@@ -1261,6 +1286,247 @@ public final class PathExplorer {
         f.visits = c.visits().clone();
         f.pc = c.pc() + 1;
         if (value != null) f.push(value);
+    }
+
+    // ---- constructors of other application classes ---------------------------------------------
+
+    /**
+     * Inlines the constructor of an application class ({@code new HandlingEvent(..)}) so its validation becomes part
+     * of the path: guards, {@code throw}s and decisions on the arguments. Its field writes and calls stay inside it.
+     */
+    private boolean inlineConstructor(Frame f, MethodInsnNode m, Expr created, Expr[] args) {
+        if (!opt.inlineSelfCalls() || repo == null) return false;
+        if (repo.entry(m.owner).map(ClassRepository.ClassEntry::library).orElse(true)) return false;
+        ClassNode node = repo.node(m.owner);
+        if (node == null || (node.access & (ACC_ENUM | ACC_ABSTRACT | ACC_INTERFACE)) != 0) return false;
+        if (f.caller != null && f.caller.depth() >= MAX_INLINE_DEPTH) return false;
+        MethodNode target = null;
+        for (MethodNode c : node.methods) if (c.name.equals("<init>") && c.desc.equals(m.desc)) target = c;
+        if (target == null || target.instructions.size() == 0 || target.instructions.size() > MAX_INLINE_INSNS) return false;
+        if (target == f.method || (f.caller != null && f.caller.contains(target))) return false;
+        f.caller = new Caller(f.method, f.pc, List.copyOf(f.stack), f.locals, f.visits, f.caller, created, f.effects.size());
+        Expr[] locals = new Expr[Math.max(target.maxLocals, 1 + args.length * 2)];
+        int slot = 0;
+        locals[slot++] = created;
+        Type[] ats = Type.getArgumentTypes(target.desc);
+        for (int i = 0; i < args.length; i++) {
+            locals[slot] = args[i];
+            slot += ats[i].getSize();
+        }
+        f.method = target;
+        f.stack = new ArrayList<>();
+        f.locals = locals;
+        f.visits = new int[target.instructions.size()];
+        f.pc = -1;
+        notes.add("Constructors of other application classes are inlined: their validation appears as decisions on the arguments.");
+        return true;
+    }
+
+    private static String constructedPrefix(Expr built) {
+        return "\u0000" + System.identityHashCode(built) + ".";
+    }
+
+    /** thisFields key for a field of the object the current inlined constructor builds, or null. */
+    private static String constructedKey(Frame f, Expr target, String field) {
+        Expr built = f.caller == null ? null : f.caller.constructing();
+        return built != null && target == built ? constructedPrefix(built) + field : null;
+    }
+
+    // ---- rules held by enum constants -----------------------------------------------------------
+
+    /** One constant of an application enum: its name, the class holding its methods, its final field values. */
+    private record EnumConst(String name, String type, Map<String, Expr> fields) {}
+
+    private static final Map<String, List<EnumConst>> ENUM_CONSTS = new java.util.concurrent.ConcurrentHashMap<>();
+    private int nesting;
+
+    /**
+     * A no-argument query on an application enum value ({@code type.requiresVoyage()}): evaluated for every constant
+     * from the enum's own bytecode. When the answer differs between constants, the path forks into groups of
+     * constants ({@code type in {LOAD, UNLOAD}}); a constant receiver just yields its answer.
+     */
+    private boolean enumRule(Frame f, MethodInsnNode m, Expr recv, Expr[] args, Deque<Frame> work) {
+        if (!opt.inlineSelfCalls() || repo == null || recv == null || args.length != 0 || nesting > 1) return false;
+        if (m.getOpcode() != INVOKEVIRTUAL && m.getOpcode() != INVOKEINTERFACE) return false;
+        String enumType = recv.desc != null && recv.desc.startsWith("L") ? Type.getType(recv.desc).getInternalName() : m.owner;
+        ClassNode en = repo.node(enumType);
+        if (en == null || (en.access & ACC_ENUM) == 0) return false;
+        if (repo.entry(enumType).map(ClassRepository.ClassEntry::library).orElse(true)) return false;
+        List<EnumConst> all = enumConstants(en);
+        if (all.isEmpty()) return false;
+
+        List<EnumConst> candidates = new ArrayList<>();
+        Cond prior = null;
+        int priorAt = -1;
+        if (recv.kind == Expr.Kind.STATIC && enumType.equals(recv.owner)) {
+            for (EnumConst c : all) if (c.name().equals(recv.name)) candidates.add(c);
+        } else {
+            for (int i = 0; i < f.conds.size(); i++) {
+                Cond c = f.conds.get(i);
+                if (c.kind() == Cond.Kind.SWITCH && c.left().equals(recv)) { prior = c; priorAt = i; }
+            }
+            for (EnumConst c : all) {
+                String label = Expr.staticField(enumType, c.name(), "L" + enumType + ";").text;
+                if (prior != null) {
+                    List<String> taken = Arrays.asList(prior.value().split(" \\| "));
+                    if (taken.contains("default")) {
+                        if (prior.otherCases().stream().anyMatch(o -> o.text.equals(label))) continue;
+                    } else if (!taken.contains(label)) continue;
+                }
+                candidates.add(c);
+            }
+        }
+        if (candidates.isEmpty()) return false;
+        Map<String, List<EnumConst>> byValue = new LinkedHashMap<>();
+        Map<String, Expr> values = new HashMap<>();
+        for (EnumConst c : candidates) {
+            Expr v = evaluateOn(c, m);
+            if (v == null) return false;
+            byValue.computeIfAbsent(v.text, k -> new ArrayList<>()).add(c);
+            values.put(v.text, v);
+        }
+        notes.add("Queries on enum values are evaluated per constant from the enum's bytecode (`type in {..}` decisions).");
+        if (byValue.size() == 1) {
+            f.push(values.values().iterator().next());
+            return true;
+        }
+        List<Frame> branches = new ArrayList<>();
+        for (int i = 0; i < byValue.size(); i++) {
+            Frame g = i == 0 ? f : f.copy();
+            if (i > 0) g.pc++; // resumes after the call (the current frame's pc advances when the step returns)
+            branches.add(g);
+        }
+        int b = 0;
+        for (var e : byValue.entrySet()) {
+            Frame g = branches.get(b++);
+            List<String> labels = e.getValue().stream().map(c -> Expr.staticField(enumType, c.name(), "L" + enumType + ";").text).toList();
+            EnumConst first = e.getValue().get(0);
+            Cond c = Cond.switchCase(recv, String.join(" | ", labels), Expr.staticField(enumType, first.name(), "L" + enumType + ";"), List.of());
+            if (prior != null) g.conds.set(priorAt, c);
+            else g.conds.add(c);
+            g.push(values.get(e.getKey()));
+        }
+        for (int i = branches.size() - 1; i >= 1; i--) work.push(branches.get(i));
+        return true;
+    }
+
+    /** The constant result of the enum method {@code m} on constant {@code c}, or null when it is not one. */
+    private Expr evaluateOn(EnumConst c, MethodInsnNode m) {
+        MethodNode target = null;
+        ClassNode owner = null;
+        for (String t = c.type(); t != null && target == null; ) {
+            ClassNode node = repo.node(t);
+            if (node == null) break;
+            for (MethodNode mm : node.methods) if (mm.name.equals(m.name) && mm.desc.equals(m.desc)) { target = mm; owner = node; }
+            t = node.superName;
+        }
+        if (target == null || (target.access & (ACC_STATIC | ACC_ABSTRACT | ACC_NATIVE)) != 0 || target.instructions.size() > 200) return null;
+        PathExplorer sub = new PathExplorer(repo, owner, target, new Options(16, 1, 2_000, opt.maxExprLength(), true, true));
+        sub.nesting = nesting + 1;
+        sub.seedFields = c.fields();
+        Result r = sub.run();
+        Expr value = null;
+        for (Path p : r.paths()) {
+            Path.Outcome o = p.outcome();
+            if (o.kind() != Path.OutcomeKind.RETURN || o.value() == null) return null;
+            Expr v = o.value();
+            boolean constant = v.isConst() || v.kind == Expr.Kind.NULL || (v.kind == Expr.Kind.STATIC && v.desc != null && v.desc.equals("L" + v.owner + ";"));
+            if (!constant || (value != null && !value.text.equals(v.text))) return null;
+            value = v;
+        }
+        return value;
+    }
+
+    /**
+     * Constants of an application enum with the final field values its {@code <clinit>} passes to the constructor,
+     * e.g. {@code LOAD(true)} with {@code this.voyageRequired = voyageRequired}. Non-constant arguments are left out.
+     */
+    private List<EnumConst> enumConstants(ClassNode en) {
+        return ENUM_CONSTS.computeIfAbsent(en.name, k -> {
+            List<EnumConst> out = new ArrayList<>();
+            MethodNode clinit = null;
+            for (MethodNode mm : en.methods) if (mm.name.equals("<clinit>")) clinit = mm;
+            if (clinit == null) return out;
+            List<Object> pending = null;
+            String newType = null;
+            int depth = 0;
+            for (AbstractInsnNode in = clinit.instructions.getFirst(); in != null; in = in.getNext()) {
+                int op = in.getOpcode();
+                if (op < 0) continue;
+                if (pending == null) {
+                    if (op == NEW) {
+                        String t = ((TypeInsnNode) in).desc;
+                        ClassNode tn = repo.node(t);
+                        if (t.equals(en.name) || (tn != null && en.name.equals(tn.superName))) { pending = new ArrayList<>(); newType = t; depth = 0; }
+                    }
+                    continue;
+                }
+                if (op == DUP && pending.isEmpty() && depth == 0) continue;
+                if (op == NEW) { depth++; pending.add(UNKNOWN_ARG); continue; }
+                if (op == INVOKESPECIAL && ((MethodInsnNode) in).name.equals("<init>")) {
+                    MethodInsnNode init = (MethodInsnNode) in;
+                    if (depth > 0) { depth--; continue; }
+                    AbstractInsnNode next = init.getNext();
+                    while (next != null && next.getOpcode() < 0) next = next.getNext();
+                    if (next != null && next.getOpcode() == PUTSTATIC && ((FieldInsnNode) next).owner.equals(en.name)) {
+                        String name = ((FieldInsnNode) next).name;
+                        out.add(new EnumConst(name, newType, constructorFields(newType.equals(en.name) ? en : repo.node(newType), init.desc, pending)));
+                    }
+                    pending = null;
+                    continue;
+                }
+                if (depth > 0) continue;
+                Object v = constantPushed(in);
+                pending.add(v != null ? v : UNKNOWN_ARG);
+            }
+            return out;
+        });
+    }
+
+    private static final Object UNKNOWN_ARG = new Object();
+    private static final Object NULL_ARG = new Object();
+
+    private static Object constantPushed(AbstractInsnNode in) {
+        int op = in.getOpcode();
+        if (op >= ICONST_M1 && op <= ICONST_5) return op - ICONST_0;
+        if (op == LCONST_0 || op == LCONST_1) return (long) (op - LCONST_0);
+        if (op == BIPUSH || op == SIPUSH) return ((IntInsnNode) in).operand;
+        if (op == LDC) return ((LdcInsnNode) in).cst instanceof Type ? null : ((LdcInsnNode) in).cst;
+        if (op == ACONST_NULL) return NULL_ARG;
+        if (op == GETSTATIC) {
+            FieldInsnNode fi = (FieldInsnNode) in;
+            if (fi.desc.equals("L" + fi.owner + ";")) return Expr.staticField(fi.owner, fi.name, fi.desc);
+        }
+        return null;
+    }
+
+    /** Fields the enum constructor sets straight from its arguments or constants ({@code this.f = arg}). */
+    private static Map<String, Expr> constructorFields(ClassNode owner, String desc, List<Object> argValues) {
+        Map<String, Expr> fields = new HashMap<>();
+        if (owner == null) return fields;
+        MethodNode ctor = null;
+        for (MethodNode mm : owner.methods) if (mm.name.equals("<init>") && mm.desc.equals(desc)) ctor = mm;
+        if (ctor == null) return fields;
+        Type[] ats = Type.getArgumentTypes(desc);
+        Map<Integer, Integer> argAtSlot = new HashMap<>();
+        for (int i = 0, slot = 1; i < ats.length; slot += ats[i].getSize(), i++) argAtSlot.put(slot, i);
+        List<AbstractInsnNode> real = new ArrayList<>();
+        for (AbstractInsnNode in = ctor.instructions.getFirst(); in != null; in = in.getNext()) if (in.getOpcode() >= 0) real.add(in);
+        for (int i = 2; i < real.size(); i++) {
+            AbstractInsnNode a = real.get(i - 2), b = real.get(i - 1), put = real.get(i);
+            if (put.getOpcode() != PUTFIELD || a.getOpcode() != ALOAD || ((VarInsnNode) a).var != 0) continue;
+            FieldInsnNode fi = (FieldInsnNode) put;
+            Object v = null;
+            if (b instanceof VarInsnNode load && load.getOpcode() >= ILOAD && load.getOpcode() <= ALOAD && argAtSlot.containsKey(load.var)) {
+                int idx = argAtSlot.get(load.var);
+                if (idx < argValues.size()) v = argValues.get(idx);
+            } else v = constantPushed(b);
+            if (v == null || v == UNKNOWN_ARG) continue;
+            if (v == NULL_ARG) fields.put(fi.name, Expr.nul());
+            else if (v instanceof Expr e) fields.put(fi.name, e);
+            else fields.put(fi.name, Expr.constant(v, fi.desc));
+        }
+        return fields;
     }
 
     /** Method declared by {@code owner} or its application superclasses (library classes are never inlined). */
@@ -1357,6 +1623,12 @@ public final class PathExplorer {
     }
 
     /** Calls we never report as side effects (pure JDK helpers). */
+    private static boolean isJdkValueType(String owner) {
+        return owner.startsWith("java/time/") || owner.startsWith("java/math/") || owner.equals("java/util/UUID")
+                || owner.equals("java/lang/Double") || owner.equals("java/lang/Float") || owner.equals("java/lang/Short")
+                || owner.equals("java/lang/Byte") || owner.equals("java/lang/Character") || owner.equals("java/util/Date");
+    }
+
     private static boolean isPureLibraryCall(MethodInsnNode m) {
         String o = m.owner;
         if (o.equals("java/lang/String") || o.equals("java/lang/Math") || o.equals("java/lang/Integer")

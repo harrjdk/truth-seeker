@@ -172,4 +172,23 @@ class TruthTableTest {
                 && p.conds().stream().anyMatch(c -> c.key().equals("account.getBalance() != 0") && c.isTrue())), outcomes.toString());
         assertTrue(close.paths().stream().anyMatch(p -> p.conds().stream().anyMatch(c -> c.key().equals("this.dao.find(id) throws IllegalStateException"))), outcomes.toString());
     }
+
+    @Test
+    void constructorValidationAndEnumRulesAreFollowed() throws Exception {
+        PathExplorer.Result r = explore("fixtures.legacy.ShipmentEventFactory", "create");
+        String all = r.paths().stream().map(p -> p.conds().stream().map(c -> c.describe()).toList() + " -> " + p.outcome().describe())
+                .collect(Collectors.joining("\n"));
+        // the enum rule is evaluated per constant: LOAD/UNLOAD require a carrier, RECEIVE/CLAIM prohibit one
+        assertTrue(r.paths().stream().anyMatch(p -> p.outcome().describe().startsWith("return new ShipmentEvent(trackingId, type)")
+                && p.conds().stream().anyMatch(c -> c.describe().equals("type in {Type.RECEIVE, Type.CLAIM}"))), all);
+        assertTrue(r.paths().stream().anyMatch(p -> p.outcome().describe().startsWith("return new ShipmentEvent(trackingId, type, carrier)")
+                && p.conds().stream().anyMatch(c -> c.describe().equals("type in {Type.LOAD, Type.UNLOAD}"))), all);
+        // the constructor's guards and its throw reach the factory's catch (Exception) handler
+        long wrapped = r.paths().stream().filter(p -> p.outcome().describe().startsWith("throw new InvalidEventException")).count();
+        assertTrue(wrapped >= 6, all);
+        // the constructor's own field writes are not effects of the factory
+        assertTrue(r.paths().stream().allMatch(p -> p.effects().isEmpty()), all);
+        // no generic "constructor throws RuntimeException" guess once the body is followed
+        assertTrue(r.paths().stream().noneMatch(p -> p.conds().stream().anyMatch(c -> c.kind() == dev.truthseeker.symbolic.Cond.Kind.THROWS)), all);
+    }
 }
