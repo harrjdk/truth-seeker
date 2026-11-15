@@ -73,4 +73,15 @@ class JeeSamplesTest {
         // a varargs call is matched element by element
         assertTrue(code.contains("verify(binder, atLeastOnce()).setDisallowedFields(eq(\"id\"), eq(\"*.id\"));"), code);
     }
+
+    @Test
+    void errorPathsAreTaken() throws Exception {
+        String code = generate("fixtures.legacy.AccountDesk");
+        // orElseThrow(supplier): a test where the lookup finds nothing and the supplier's exception is thrown
+        assertTrue(code.contains("thenReturn(Optional.empty());"), code);
+        assertTrue(code.contains("assertThrows(NotFoundException.class, () -> subject.load(id));"), code);
+        assertTrue(code.contains("assertThrows(IllegalStateException.class, () -> subject.loadOrFail(id));"), code);
+        // the same rejection made before the save and again in its catch block is counted
+        assertTrue(code.contains("verify(errors, times(2)).rejectValue(eq(\"name\"), eq(\"required\"));"), code);
+    }
 }

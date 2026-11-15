@@ -1119,6 +1119,8 @@ public final class PathExplorer {
         }
         Boolean guarded = guard(f, m, args, work);
         if (guarded != null) return guarded;
+        Boolean unwrapped = orElseThrow(f, m, recv, args, work);
+        if (unwrapped != null) return unwrapped;
         if (enumRule(f, m, recv, args, work)) return true;
         Expr call = Expr.call(recv, m.owner, m.name, m.desc, argList);
         boolean loggerCall = opt.ignoreLogging() && LOGGER_TYPES.contains(m.owner);
@@ -1183,6 +1185,53 @@ public final class PathExplorer {
      * commons-lang {@code Validate}) throw instead of returning: modelled as a branch to the exception they raise.
      * Returns null when {@code m} is not one of them, otherwise whether the path continues.
      */
+    /**
+     * {@code opt.orElseThrow(() -> new NotFound(..))}: two paths, one where the Optional holds a value ({@code opt.get()})
+     * and one where it is empty and the supplier's exception is thrown. Only when the exception type is known.
+     */
+    private Boolean orElseThrow(Frame f, MethodInsnNode m, Expr recv, Expr[] args, Deque<Frame> work) {
+        if (recv == null || !m.owner.equals("java/util/Optional") || !m.name.equals("orElseThrow") || args.length != 1) return null;
+        String exception = supplierException(args[0]);
+        if (exception == null) return null;
+        Expr present = Expr.call(recv, "java/util/Optional", "isPresent", "()Z", List.of());
+        Cond empty = Cond.bool(present, false), held = Cond.bool(present, true);
+        boolean canEmpty = feasible(f, empty), canHold = feasible(f, held);
+        Expr thrown = Expr.newObject(exception, "()V", List.of());
+        if (canEmpty && !canHold) {
+            add(f, empty);
+            if (raise(f, thrown, exception, -1)) return true;
+            finish(f, new Path.Outcome(Path.OutcomeKind.THROW, thrown, exception, null));
+            return false;
+        }
+        if (canEmpty) {
+            Frame g = f.copy();
+            add(g, empty);
+            if (raise(g, thrown, exception, 0)) work.push(g);
+            else finish(g, new Path.Outcome(Path.OutcomeKind.THROW, thrown, exception, null));
+        }
+        if (!canHold) return false;
+        add(f, held);
+        f.push(Expr.call(recv, "java/util/Optional", "get", "()Ljava/lang/Object;", List.of()));
+        return true;
+    }
+
+    /** The exception a supplier lambda or constructor reference makes, or null when it cannot be told. */
+    private String supplierException(Expr lam) {
+        if (lam.kind != Expr.Kind.LAMBDA || lam.owner == null || lam.name == null) return null;
+        if (lam.index == Opcodes.H_NEWINVOKESPECIAL) return lam.owner;
+        if (!lam.owner.equals(cn.name)) return null;
+        for (MethodNode mn : cn.methods) {
+            if (!mn.name.equals(lam.name) || !mn.desc.equals(lam.memberDesc)) continue;
+            String made = null;
+            for (AbstractInsnNode in = mn.instructions.getFirst(); in != null; in = in.getNext()) {
+                if (in.getOpcode() == NEW) made = made == null ? ((TypeInsnNode) in).desc : made;
+                else if (in.getOpcode() == ARETURN) return made;
+                else if (in instanceof MethodInsnNode mi && !mi.name.equals("<init>") && made == null) return null;
+            }
+        }
+        return null;
+    }
+
     private Boolean guard(Frame f, MethodInsnNode m, Expr[] args, Deque<Frame> work) {
         if (m.getOpcode() != INVOKESTATIC || args.length == 0) return null;
         String check = null, exception = null;

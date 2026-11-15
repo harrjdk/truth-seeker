@@ -2513,6 +2513,9 @@ public final class TestGenerator {
                 }
                 String rendered = renderExpected(v, 0);
                 if (rendered != null) out.add(assertEqualsTo(rendered, ret));
+                else if (v.owner != null && v.owner.startsWith("java/time/") && ret.getSort() == Type.OBJECT)
+                    // java.time arithmetic never answers null; the exact value depends on the clock
+                    out.add("assertNotNull(result); // TODO: expected `" + v.text + "`");
                 else out.add("// TODO: assert result equals `" + v.text + "`");
             } else {
                 String rendered = renderExpected(v, 0);
@@ -3540,6 +3543,7 @@ public final class TestGenerator {
             }
             // collaborator interactions: @Mock dependencies and mocks created for this test (e.g. entities)
             Set<String> verified = new LinkedHashSet<>();
+            Map<String, Integer> repeats = new HashMap<>();
             List<Effect> all = new ArrayList<>(p.effects());
             if (p.outcome().kind() != Path.OutcomeKind.THROW) {
                 for (Effect e : p.effects()) all.addAll(lambdaBodyEffects(e)); // coll.forEach(x -> repo.save(x))
@@ -3559,9 +3563,17 @@ public final class TestGenerator {
                 boolean overloaded = isOverloaded(e.owner(), e.name(), ats.length);
                 List<String> ms = new ArrayList<>();
                 for (int i = 0; i < e.args().size(); i++) ms.add(argMatcher(e.args().get(i), ats[i], overloaded));
-                verified.add("verify(" + mockVar + ", atLeastOnce())." + e.name() + "(" + String.join(", ", spreadVarargs(e, ms)) + ");");
+                String call = "." + e.name() + "(" + String.join(", ", spreadVarargs(e, ms)) + ");";
+                verified.add(mockVar + " " + call);
+                // the same call made twice on a straight path (rejected before the save and again in its catch): count it
+                if (constantArgs(e) && loops.isEmpty() && p.conds().stream().noneMatch(c -> c.key().contains("[iteration"))
+                        && p.effects().contains(e)) repeats.merge(mockVar + " " + call, 1, Integer::sum);
             }
-            out.addAll(verified);
+            for (String v : verified) {
+                int n = repeats.getOrDefault(v, 0);
+                String[] parts = v.split(" ", 2);
+                out.add("verify(" + parts[0] + (n >= 2 ? ", times(" + n + "))" : ", atLeastOnce())") + parts[1]);
+            }
             if (p.outcome().kind() != Path.OutcomeKind.THROW) out.addAll(expectAbsent());
             return out;
         }
