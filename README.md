@@ -96,7 +96,7 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 | [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 187 (12 classes) | 187 | 0 | 0 |
 | [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 |
 | [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 |
-| [Java EE 7 samples](https://github.com/javaee-samples/javaee7-samples), 10 modules (Batch, JAX-RS, JPA, JMS, Concurrency, WebSocket, Servlet, JACC, JASPIC; Java 8 bytecode) | 10 WARs, 76 app classes | 306 (72 classes) | 251 | 46 | 9 |
+| [Java EE 7 samples](https://github.com/javaee-samples/javaee7-samples), 10 modules (Batch, JAX-RS, JPA, JMS, Concurrency, WebSocket, Servlet, JACC, JASPIC; Java 8 bytecode) | 10 WARs, 76 app classes | 306 (72 classes) | 257 | 40 | 9 |
 
 The Java EE 7 failures need a running container or network: static `PolicyContext`/`AuthConfigFactory` lookups, a
 servlet that opens an HTTP connection, and a JSON decoder handed `"value"`. Most disabled tests there wait on a
@@ -199,6 +199,11 @@ What it recognizes:
 - parameters a path casts (`(TextMessage) message`) are mocks of the cast type; exceptions handed to listeners are real ones (`new Exception("value")`); collaborators a lifecycle method sets (`initialize(handler)`) are mocks put in the field
 - `getClass() != o.getClass()` in `equals`: an argument of another class, or another instance of the subject's
 - calls on JDK objects the method builds itself (`new BufferedWriter(..).write(..)`) are not assumed to throw, since no test could make them
+- pre-collections code: `Enumeration` loops over a collaborator's result get `Collections.enumeration(List.of(..))`, also when copied with `Collections.list(..)`; a cursor the loop only polls (`while (browser.getEnumeration().hasMoreElements())`) is a mock answering `true, false`
+- String and number elements of a driven loop take the value each decision needs (`""` for `m.isEmpty()`, `"grant"` for `p.startsWith("grant")`)
+- mutable statics of the application (`static int retries`) are set by reflection for the test and restored right after the call
+- `java.util.Date` `before`/`after` between values the test sets, and Date fields a path calls methods on get a sample date
+- id-based `equals` (`id.equals(other.id)`) with a second instance given the same id
 - boxing and unboxing
 - pre-Java 5 `class$` literals
 - `assert` statements

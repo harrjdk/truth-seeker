@@ -43,4 +43,22 @@ class JeeSamplesTest {
         assertTrue(code.contains("assertArrayEquals(new Class[]{String.class, Integer.class}, result);"), code);
         assertFalse(code.contains("writer.write(text) throws"), code);
     }
+
+    @Test
+    void preCollectionsAndSharedStateAreArranged() throws Exception {
+        String code = generate("fixtures.legacy.MessageBoard");
+        assertFalse(code.contains("@Disabled("), code);
+        // an Enumeration the loop takes elements from is a real one
+        assertTrue(code.contains("Collections.enumeration(List.of("), code);
+        // one that is only polled answers in turn, so the loop ends
+        assertTrue(code.contains(".hasMoreElements()).thenReturn(true, false);"), code);
+        // a mutable static is set for the test and restored right after the call
+        assertTrue(code.contains("setStaticField(MessageBoard.class, \"retries\", 3);") && code.contains("// restore shared state"), code);
+        // java.util.Date ordering
+        assertTrue(code.contains("new Date(1705314600000L)") && code.contains("new Date(1705401000000L)") && code.contains("new Date(1705228200000L)"), code);
+        // id-based equals with a second instance holding the same id
+        assertTrue(code.contains("setField(o, \"id\", 1L);"), code);
+        // a String element of a driven Enumeration loop gets the value each decision needs
+        assertTrue(code.contains("Collections.enumeration(List.of(\"grant\"))") && code.contains("Collections.enumeration(List.of(\"\"))"), code);
+    }
 }

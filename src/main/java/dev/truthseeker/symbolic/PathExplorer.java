@@ -727,7 +727,9 @@ public final class PathExplorer {
             if (root.target == null || !root.args.isEmpty() || root.expansion() != null) return false;
             String n = root.name;
             boolean getter = (n.startsWith("get") && n.length() > 3) || (n.startsWith("is") && n.length() > 2) || (n.startsWith("has") && n.length() > 3);
-            if (!getter || n.equals("hasNext")) return false;
+            // cursors and polled state move on by themselves: it.hasNext(), en.hasMoreElements(), future.isDone()
+            if (!getter || Set.of("hasNext", "hasMoreElements", "hasMoreTokens", "isDone", "isCancelled", "isReady", "isAlive",
+                    "isInterrupted").contains(n)) return false;
             root = root.target;
         }
         if (root.kind != Expr.Kind.PARAM) return false;
