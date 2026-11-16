@@ -113,4 +113,17 @@ class JeeSamplesTest {
         // values stored as they are get something other than the type's default
         assertTrue(code.contains("boolean credit = true;") && code.contains("int amount = 1;") && code.contains("boolean frozen = true;"), code);
     }
+
+    @Test
+    void equalsAndOptionalChainsTakeTheirPaths() throws Exception {
+        String code = generate("fixtures.legacy.Profile");
+        // !(o instanceof Profile) once o != null: an object of another type, not null
+        String notProfile = code.substring(code.indexOf("!(o instanceof Profile)"));
+        assertTrue(notProfile.substring(0, notProfile.indexOf("@Test")).contains("Object o = new Object();"), code);
+        // return login.equals(that.login): a real second Profile with the same login
+        assertTrue(code.contains("Profile o = new Profile(") && code.contains("setField(o, \"login\", \"other\");"), code);
+        // ofNullable(..).filter(..).ifPresent(..): the value passes the filter and the consumer's call is verified
+        assertTrue(code.contains("when(form.getPassword()).thenReturn(\"value\");"), code);
+        assertTrue(code.contains("verify(store, atLeastOnce()).savePassword(eq(\"value\"));"), code);
+    }
 }

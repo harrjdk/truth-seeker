@@ -539,8 +539,12 @@ public final class TestGenerator {
         void arrangePeers() {
             if (isStatic) return;
             Set<Integer> candidates = new LinkedHashSet<>();
-            for (Cond c : p.conds()) {
-                for (Expr root : c.right() == null ? List.of(c.left()) : List.of(c.left(), c.right())) {
+            List<List<Expr>> rootsOf = new ArrayList<>();
+            for (Cond c : p.conds()) rootsOf.add(c.right() == null ? List.of(c.left()) : List.of(c.left(), c.right()));
+            // return id.equals(that.id): the comparison is the result itself
+            if (p.outcome().value() != null && p.outcome().kind() == Path.OutcomeKind.RETURN) rootsOf.add(List.of(p.outcome().value()));
+            for (List<Expr> roots : rootsOf) {
+                for (Expr root : roots) {
                     root.mentions(x -> {
                         if (x.kind == Expr.Kind.FIELD && x.target != null && x.target.kind == Expr.Kind.PARAM
                                 && (x.owner.equals(cn.name) || ("L" + cn.name + ";").equals(x.target.desc))) candidates.add(x.target.index);
@@ -1737,6 +1741,7 @@ public final class TestGenerator {
             String eqConst = null;
             Set<String> neqConsts = new LinkedHashSet<>();
             String instanceType = null;
+            boolean notInstance = false;
             List<Constraint> numeric = new ArrayList<>();
             for (Constraint c : t.cs) {
                 switch (c.op()) {
@@ -1745,7 +1750,7 @@ public final class TestGenerator {
                     case "empty" -> empty = ((Integer) c.number()) == 1;
                     case "instanceof" -> {
                         if (((Integer) c.number()) == 1) instanceType = c.other().owner != null ? c.other().owner : c.other().text;
-                        else nullWanted = Boolean.TRUE;
+                        else notInstance = true;
                     }
                     default -> {
                         Expr o = c.other();
@@ -1764,6 +1769,11 @@ public final class TestGenerator {
                 }
             }
             if (Boolean.TRUE.equals(nullWanted)) return "null";
+            if (notInstance) {
+                // !(o instanceof Voyage) once o != null is known: an object of another type; with nothing else said, null
+                if (nullWanted == null) return "null";
+                if (type != null && type.getDescriptor().equals("Ljava/lang/Object;")) return "new Object()";
+            }
             if (bool != null) return bool ? "true" : "false";
             if (eqConst != null) return eqConst;
             if (present != null) {
@@ -3174,6 +3184,12 @@ public final class TestGenerator {
             return null;
         }
 
+        /** {@code s.isEmpty()} / {@code s.isBlank()} on a String: decided by the string, not by a stub. */
+        static boolean stringEmptiness(Expr d) {
+            return d.kind == Expr.Kind.CALL && d.target != null && "Ljava/lang/String;".equals(d.target.desc) && d.args.isEmpty()
+                    && Set.of("isEmpty", "isBlank").contains(d.name);
+        }
+
         static boolean isFalse(Expr e) {
             return e.kind == Expr.Kind.CONST && e.value instanceof Number n && n.intValue() == 0;
         }
@@ -3184,12 +3200,14 @@ public final class TestGenerator {
 
         boolean canSatisfy(Expr decision, boolean want) {
             if (decision.kind != Expr.Kind.CALL || decision.target == null) return false;
+            if (stringEmptiness(decision)) return arrangeable(decision.target) && !boundLiteral.containsKey(decision.target.text);
             if (isObjectEquals(decision)) return want && decision.target.kind == Expr.Kind.CALL;
             return !isObjectMethod(decision);
         }
 
         /** Arranges a boolean call on a mock to give {@code want}; equals by making the receiver return the other value. */
         boolean satisfy(Expr decision, boolean want) {
+            if (stringEmptiness(decision)) return bindLiteral(decision.target, want ? "\"\"" : "\"value\"");
             if (isObjectEquals(decision)) {
                 // Mockito cannot stub equals: the receiver returns the very value it is compared with
                 String other = renderExpected(decision.args.get(0), 1);
@@ -3820,6 +3838,8 @@ public final class TestGenerator {
          * non-null, and return the calls the body makes on it, so they can be verified.
          */
         List<Effect> lambdaBodyEffects(Effect ef) {
+            if (ef.kind() == Effect.Kind.CALL && "ifPresent".equals(ef.name()) && ef.target() != null && isOptional(ef.target())
+                    && ef.args().size() == 1 && ef.args().get(0).kind == Expr.Kind.LAMBDA) return presentBodyEffects(ef);
             if (ef.kind() != Effect.Kind.CALL || ef.target() == null || !"forEach".equals(ef.name()) || ef.args().size() != 1
                     || ef.args().get(0).kind != Expr.Kind.LAMBDA || !"(Ljava/util/function/Consumer;)V".equals(ef.desc())) return List.of();
             Expr coll = ef.target();
@@ -3854,6 +3874,36 @@ public final class TestGenerator {
             return body;
         }
 
+        /**
+         * {@code Optional.ofNullable(account.getPassword()).filter(p -> !p.isEmpty()).ifPresent(p -> mapper.updateSignon(account))}:
+         * the value is arranged to be there and pass every filter, and the consumer's calls are expected. Empty when
+         * the chain is anything else.
+         */
+        List<Effect> presentBodyEffects(Effect ef) {
+            List<Expr> filters = new ArrayList<>();
+            Expr cur = ef.target();
+            while (cur.kind == Expr.Kind.CALL && cur.target != null && isOptional(cur.target) && "filter".equals(cur.name)
+                    && cur.args.size() == 1 && cur.args.get(0).kind == Expr.Kind.LAMBDA) {
+                filters.add(0, cur.args.get(0));
+                cur = cur.target;
+            }
+            if (cur.kind != Expr.Kind.CALL || cur.target != null || !"java/util/Optional".equals(cur.owner)
+                    || !Set.of("ofNullable", "of").contains(cur.name) || cur.args.size() != 1) return List.of();
+            Expr x = cur.args.get(0);
+            if (!(x.kind == Expr.Kind.CALL && arrangeable(x))) return List.of();
+            Elem el = new Elem(x, x.text);
+            for (Expr f : filters) {
+                if (!Boolean.TRUE.equals(holds(f, el, true)) || !Boolean.TRUE.equals(holds(f, el, false))) return List.of();
+            }
+            requireNonNull(x);
+            if (!boundLiteral.containsKey(x.text) && !ensured.containsKey(x.text)) return List.of();
+            List<Applied> paths = applyLambdaPaths(ef.args().get(0), List.of(x), true);
+            if (paths == null || paths.size() != 1 || !paths.get(0).conds().isEmpty()) return List.of();
+            List<Effect> body = paths.get(0).effects();
+            for (Effect b : body) if (b.kind() == Effect.Kind.CALL && b.target() != null) requireNonNull(b.target());
+            return body;
+        }
+
         /** {@code eq(value)} when the argument's value is known in the test, otherwise a typed any-matcher. */
         String argMatcher(Expr a, Type t, boolean overloaded) {
             String known = null;
@@ -3861,6 +3911,8 @@ public final class TestGenerator {
             else if (a.kind == Expr.Kind.PARAM) known = paramVars.get(a.index);
             else if (ensured.containsKey(canon(a))) known = ensured.get(canon(a));
             else if (a.expansion() == null && ensured.containsKey(a.text)) known = ensured.get(a.text); // not a reassigned parameter's name
+            else if (a.kind == Expr.Kind.CALL && a.expansion() == null && boundLiteral.containsKey(a.text)
+                    && boundLiteral.get(a.text).matches("\"[^\"\\\\]*\"|-?\\d+L?|true|false")) known = boundLiteral.get(a.text); // a stubbed answer
             if (known != null && !known.equals("null")) {
                 if (t.getSort() == Type.LONG && a.kind == Expr.Kind.CONST && !known.endsWith("L")) known += "L";
                 return "eq(" + known + ")";
