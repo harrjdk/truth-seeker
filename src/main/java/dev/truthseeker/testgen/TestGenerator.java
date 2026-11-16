@@ -674,6 +674,14 @@ public final class TestGenerator {
                     bindTo = coll.args.get(0);
                     collType = Type.getType("Ljava/util/Enumeration;");
                 }
+                // for (Iterator it = services.keySet().iterator(); ..) services.get(name): fill the map itself
+                String mapView = null;
+                if (coll.kind == Expr.Kind.CALL && coll.target != null && coll.args.isEmpty()
+                        && ("keySet".equals(coll.name) || "values".equals(coll.name)) && coll.target.desc != null
+                        && isMapType(Type.getType(coll.target.desc))) {
+                    mapView = coll.name;
+                    bindTo = coll.target;
+                }
                 if (!(bindTo.kind == Expr.Kind.PARAM || arrangeable(bindTo)) || collType == null) continue;
                 Expr iterator = iterators.get(e.getKey());
                 Loop loop = iterator == null ? null : new Loop(iterator);
@@ -729,7 +737,7 @@ public final class TestGenerator {
                     else if (!elems.contains(v)) elems.add(v);
                 }
                 if (unresolvedContains) continue;
-                String literal = iterableLiteral(collType, elems);
+                String literal = mapView == null ? iterableLiteral(collType, elems) : mapLiteral(bindTo, mapView, loop, elems);
                 if (literal == null) continue;
                 if (bindTo.kind == Expr.Kind.PARAM) paramValues.put(bindTo.index, literal);
                 else if (!bindLiteral(bindTo, literal)) continue;
@@ -744,6 +752,53 @@ public final class TestGenerator {
                 }
                 loops.add(loop);
             }
+        }
+
+        /**
+         * A map whose keySet()/values() a loop walks (at most one entry, so iteration order does not matter): for keys,
+         * each value is a mock of what the loop body casts {@code map.get(key)} to, and that lookup answers with it.
+         */
+        String mapLiteral(Expr map, String view, Loop loop, List<String> elems) {
+            if (elems.size() > 1 || loop == null) return null;
+            imports.add("java.util.HashMap");
+            if (elems.isEmpty()) return "new HashMap<>()";
+            imports.add("java.util.Map");
+            String elem = elems.get(0);
+            if (view.equals("values")) return "new HashMap<>(Map.of(\"key\", " + elem + "))";
+            // the value: what map.get(key) is taken as
+            Expr[] lookup = new Expr[1];
+            List<Expr> all = new ArrayList<>();
+            for (Cond c : p.conds()) { all.add(c.left()); if (c.right() != null) all.add(c.right()); }
+            for (Effect ef : p.effects()) { if (ef.target() != null) all.add(ef.target()); all.addAll(ef.args()); if (ef.value() != null) all.add(ef.value()); }
+            if (p.outcome().value() != null) all.add(p.outcome().value());
+            all.addAll(p.dereferenced());
+            for (Expr root : all) root.mentions(x -> {
+                if (lookup[0] == null && x.kind == Expr.Kind.CALL && "get".equals(x.name) && x.args.size() == 1 && x.target != null
+                        && canon(x.target).equals(canon(map)) && x.args.get(0).mentions(loop::isElement)) lookup[0] = x;
+                return false;
+            });
+            String value = null; // never read on this path: a null value casts to whatever the code expects
+            if (lookup[0] != null && lookup[0].desc != null && lookup[0].desc.startsWith("L") && !lookup[0].desc.equals("Ljava/lang/Object;")) {
+                Type vt = Type.getType(lookup[0].desc);
+                if (isMockable(vt) && !ClassInspector.isValueType(lookup[0].desc)) {
+                    value = newVar(vt);
+                    ensured.put(lookup[0].text, value);
+                    ensured.put(canon(lookup[0]), value);
+                    // decisions are rewritten onto the element (services.get("value")): that lookup is the same one
+                    Expr onElement = lookup[0].substitute(loop::isElement, Expr.unknown(elem, elementTypes.get(elem)));
+                    ensured.put(onElement.text, value);
+                    ensured.put(canon(onElement), value);
+                } else {
+                    String sample = nonNullSample(vt, null);
+                    if (sample != null) value = sample;
+                }
+            }
+            if (value == null && lookup[0] != null) value = "new Object()";
+            if (value == null) {
+                imports.add("java.util.Collections");
+                return "new HashMap<>(Collections.singletonMap(" + elem + ", null))";
+            }
+            return "new HashMap<>(Map.of(" + elem + ", " + value + "))";
         }
 
         /** Collections (by expression text) this test filled with real elements: their contains(..) is decided. */
@@ -789,11 +844,14 @@ public final class TestGenerator {
          * (a decision first evaluated in a later iteration carries no "[iteration k]" suffix, so the suffix cannot tell).
          */
         Cond onElement(Cond c) {
+            // an inner loop's hasNext() may mention the outer element (a list queried by vet.getId()): its own loop decides it
             for (Loop loop : loops) {
                 if (loop.isHasNext(c.left())) {
                     if (c.isTrue()) loop.current++;
                     return c; // consumed: the collection's size decides it
                 }
+            }
+            for (Loop loop : loops) {
                 boolean mentions = c.left().mentions(loop::isElement) || (c.right() != null && c.right().mentions(loop::isElement));
                 if (!mentions) continue;
                 int k = Math.max(loop.current, 1);
@@ -914,6 +972,8 @@ public final class TestGenerator {
                     if (found[0] != null) return true;
                     if (x.kind == Expr.Kind.NEW && x.owner != null && (x.owner.startsWith("java/net/") || x.owner.equals("java/net/Socket"))) found[0] = "new " + Names.simple(x.owner) + "(..)";
                     else if (x.kind == Expr.Kind.CALL && x.target == null && x.owner != null && x.owner.endsWith("/ws/rs/client/ClientBuilder")) found[0] = "ClientBuilder." + x.name + "()";
+                    else if (x.kind == Expr.Kind.NEW && x.owner != null && x.owner.startsWith("org/springframework/")
+                            && (x.owner.endsWith("XmlApplicationContext") || x.owner.endsWith("/XmlBeanFactory"))) found[0] = "new " + Names.simple(x.owner) + "(..)";
                     return found[0] != null;
                 });
             }
@@ -922,14 +982,18 @@ public final class TestGenerator {
 
         void collect() {
             String net = networkCall();
-            if (net != null) todos.add("this path opens a real network connection (`" + net + "`): run it against a server, or move the connection behind a collaborator the test can mock");
+            if (net != null && net.endsWith("XmlApplicationContext(..)") || net != null && net.endsWith("XmlBeanFactory(..)"))
+                todos.add("this path loads a Spring context from XML files (`" + net + "`): cover it with an integration test, or pass the bean factory in");
+            else if (net != null) todos.add("this path opens a real network connection (`" + net + "`): run it against a server, or move the connection behind a collaborator the test can mock");
             arrangePeers();
             arrangeLoops();
             Set<Cond> sequenced = arrangeSequences();
             Set<Cond> charDecided = arrangeCharStrings();
+            Set<Cond> sized = arrangeArrays();
+            sized.addAll(arrangeTokenizers());
             for (Cond c0 : p.conds()) {
-                if (sequenced.contains(c0) || charDecided.contains(c0)) continue;
-                Cond c = c0;
+                if (sequenced.contains(c0) || charDecided.contains(c0) || sized.contains(c0)) continue;
+                Cond c = onArrayElement(c0);
                 if (c0.kind() == Cond.Kind.BOOL && c0.left().kind == Expr.Kind.CALL && "contains".equals(c0.left().name)
                         && c0.left().target != null && arrangedCollections.contains(c0.left().target.text)) continue;
                 if (!loops.isEmpty()) {
@@ -985,6 +1049,7 @@ public final class TestGenerator {
                             }
                         }
                         if (splitCount(l, op, rgt)) break;
+                        if (collectionSize(l, op, rgt)) break;
                         if (rgt.isConst() || isEnumConst(rgt)) constrain(l, op, rgt, rgt.value instanceof Number num ? num : null);
                         else if (l.isConst() || isEnumConst(l)) constrain(rgt, op, l, l.value instanceof Number num ? num : null);
                         else if (isAssignableNumber(rgt) && isAssignableNumber(l)) {
@@ -1040,6 +1105,7 @@ public final class TestGenerator {
                     }
                 }
             }
+            materializeSizes();
         }
 
         /**
@@ -1359,6 +1425,21 @@ public final class TestGenerator {
          */
         void ensureImplicit() {
             requireDereferencedParams();
+            // WebUtils.getOrCreateSessionAttribute(request.getSession(), ..) asserts the session is there
+            List<Expr> sessionRoots = new ArrayList<>();
+            for (Cond c : p.conds()) { sessionRoots.add(c.left()); if (c.right() != null) sessionRoots.add(c.right()); }
+            for (Effect ef : p.effects()) { if (ef.target() != null) sessionRoots.add(ef.target()); sessionRoots.addAll(ef.args()); }
+            if (p.outcome().value() != null) sessionRoots.add(p.outcome().value());
+            sessionRoots.addAll(p.dereferenced());
+            Set<String> sessions = new LinkedHashSet<>();
+            Map<String, Expr> sessionExprs = new HashMap<>();
+            for (Expr root : sessionRoots) root.mentions(x -> {
+                if (isSessionAttributeLookup(x) && x.name.equals("getOrCreateSessionAttribute") && sessions.add(x.args.get(0).text)) {
+                    sessionExprs.put(x.args.get(0).text, x.args.get(0));
+                }
+                return false;
+            });
+            for (String k : sessions) ensure(sessionExprs.get(k));
             // everything recorded on a throwing path happened before the throw; only an NPE path may rely on a null
             if (p.outcome().kind() == Path.OutcomeKind.THROW && "java/lang/NullPointerException".equals(p.outcome().exceptionType())) {
                 // but what it dereferenced before the throw was there (cargo.getRouteSpecification() in
@@ -1598,6 +1679,162 @@ public final class TestGenerator {
             return out;
         }
 
+        /** {@code args[k]} of an array parameter the test builds → the placeholder of that element. */
+        final Map<String, Expr> arrayElements = new HashMap<>();
+
+        boolean isParamArrayElement(Expr x) {
+            return x.kind == Expr.Kind.ARRAY_ELEM && x.args.size() == 2 && x.args.get(0).kind == Expr.Kind.PARAM
+                    && x.args.get(1).kind == Expr.Kind.CONST && x.args.get(1).value instanceof Number;
+        }
+
+        /**
+         * {@code while (splitter.hasMoreTokens())} over {@code new StringTokenizer(keywords, " ")}: a string with as many
+         * tokens as the path takes ({@code "a b"}). Returns the decisions it settled.
+         */
+        Set<Cond> arrangeTokenizers() {
+            Map<String, Expr> tokenizers = new LinkedHashMap<>();
+            Map<String, int[]> taken = new HashMap<>();
+            Map<String, List<Cond>> settles = new HashMap<>();
+            for (Cond c : p.conds()) {
+                Expr l = c.left();
+                if (c.kind() != Cond.Kind.BOOL || l.kind != Expr.Kind.CALL || !l.args.isEmpty() || l.target == null
+                        || !("hasMoreTokens".equals(l.name) || "hasMoreElements".equals(l.name))) continue;
+                Expr t = l.target;
+                if (t.kind != Expr.Kind.NEW || !"java/util/StringTokenizer".equals(t.owner) || t.args.isEmpty()) continue;
+                String key = stripIterationTag(t.text);
+                tokenizers.putIfAbsent(key, t);
+                int[] n = taken.computeIfAbsent(key, k -> new int[1]);
+                if (c.isTrue()) n[0]++;
+                settles.computeIfAbsent(key, k -> new ArrayList<>()).add(c);
+            }
+            Set<Cond> out = new HashSet<>();
+            for (var en : tokenizers.entrySet()) {
+                Expr t = en.getValue();
+                Expr text = unwrapString(t.args.get(0));
+                String delims = t.args.size() >= 2 ? (t.args.get(1).value instanceof String d ? d : null) : " ";
+                if (delims == null || delims.isEmpty() || !arrangeable(text)) continue;
+                int n = taken.get(en.getKey())[0];
+                if (n > 20) continue;
+                List<String> tokens = new ArrayList<>();
+                for (int i = 0; i < n; i++) tokens.add(String.valueOf((char) ('a' + i)));
+                constrain(text, "==", Expr.constant(String.join(String.valueOf(delims.charAt(0)), tokens), "Ljava/lang/String;"));
+                out.addAll(settles.get(en.getKey()));
+            }
+            return out;
+        }
+
+        /** {@code args[0]} whatever local the code keeps it in ({@code Order order = (Order) args[0]}). */
+        static String elementKey(Expr x) {
+            return x.args.get(0).text + "[" + ((Number) x.args.get(1).value).intValue() + "]";
+        }
+
+        /** The decision with each element of an arranged array parameter replaced by its placeholder. */
+        Cond onArrayElement(Cond c) {
+            if (arrayElements.isEmpty()) return c;
+            java.util.function.Predicate<Expr> m = x -> isParamArrayElement(x) && arrayElements.containsKey(elementKey(x));
+            boolean hit = c.left().mentions(m) || (c.right() != null && c.right().mentions(m));
+            if (!hit) return c;
+            Expr left = c.left(), right = c.right();
+            for (var en : arrayElements.entrySet()) {
+                java.util.function.Predicate<Expr> one = x -> isParamArrayElement(x) && elementKey(x).equals(en.getKey());
+                left = left.substitute(one, en.getValue());
+                if (right != null) right = right.substitute(one, en.getValue());
+            }
+            return new Cond(c.kind(), left, c.op(), right, c.value(), c.valueExpr(), c.otherCases());
+        }
+
+        /**
+         * Array parameters ({@code main(String[] args)}, AOP advice's {@code Object[] args}) measured or indexed with
+         * constants: an array exactly as long as the path needs, {@code new String[]{"", "1"}}, whose String and number
+         * elements the solver decides like any value ({@code "".equals(args[0])}). Returns the length decisions it settled.
+         */
+        Set<Cond> arrangeArrays() {
+            Map<Integer, Expr> arrays = new LinkedHashMap<>();
+            Map<String, Expr> castElements = new HashMap<>(); // "args[0]" -> the element as the code casts it ((Order) args[0])
+            Map<Integer, int[]> bounds = new HashMap<>(); // param index -> {min length, max length}
+            Map<Integer, List<Cond>> settles = new HashMap<>();
+            List<Expr> all = new ArrayList<>();
+            for (Cond c : p.conds()) { all.add(c.left()); if (c.right() != null) all.add(c.right()); }
+            for (Effect ef : p.effects()) { if (ef.target() != null) all.add(ef.target()); all.addAll(ef.args()); if (ef.value() != null) all.add(ef.value()); }
+            if (p.outcome().value() != null) all.add(p.outcome().value());
+            all.addAll(p.dereferenced());
+            for (Expr root : all) root.mentions(x -> {
+                if (isParamArrayElement(x) && x.args.get(0).desc != null && x.args.get(0).desc.startsWith("[")) {
+                    int k = ((Number) x.args.get(1).value).intValue();
+                    if (k < 0 || k > 16) return false;
+                    Expr arr = x.args.get(0);
+                    arrays.putIfAbsent(arr.index, arr);
+                    String declared = arr.desc.substring(1);
+                    if (x.desc != null && !x.desc.equals(declared) && x.desc.startsWith("L")) castElements.putIfAbsent(elementKey(x), x);
+                    int[] b = bounds.computeIfAbsent(arr.index, i -> new int[]{0, Integer.MAX_VALUE});
+                    b[0] = Math.max(b[0], k + 1);
+                }
+                return false;
+            });
+            for (Cond c : p.conds()) {
+                if (c.kind() != Cond.Kind.CMP || c.right() == null) continue;
+                Expr len = null, other = null;
+                boolean lenLeft = false;
+                Expr ml = c.left().measuredArray(), mr = c.right().measuredArray();
+                if (ml != null && ml.kind == Expr.Kind.PARAM) { len = ml; other = c.right(); lenLeft = true; }
+                else if (mr != null && mr.kind == Expr.Kind.PARAM) { len = mr; other = c.left(); }
+                if (len == null || len.desc == null || !len.desc.startsWith("[")) continue;
+                Integer k = constInt(other);
+                if (k == null) continue;
+                arrays.putIfAbsent(len.index, len);
+                int[] b = bounds.computeIfAbsent(len.index, i -> new int[]{0, Integer.MAX_VALUE});
+                int lo = Integer.MAX_VALUE, hi = -1;
+                for (int n = 0; n <= 17; n++) {
+                    boolean holds = cmp(lenLeft ? n : k, c.op(), lenLeft ? k : n) == c.isTrue();
+                    if (holds) { lo = Math.min(lo, n); hi = Math.max(hi, n); }
+                }
+                if (hi < 0) { b[0] = 1; b[1] = 0; continue; }
+                b[0] = Math.max(b[0], lo);
+                if (hi < 17) b[1] = Math.min(b[1], hi);
+                settles.computeIfAbsent(len.index, i -> new ArrayList<>()).add(c);
+            }
+            Set<Cond> out = new HashSet<>();
+            for (var en : arrays.entrySet()) {
+                int[] b = bounds.get(en.getKey());
+                if (b[0] > b[1] || b[0] > 16) continue;
+                Type arrType = Type.getType(en.getValue().desc);
+                if (arrType.getDimensions() != 1) continue;
+                Type elemType = arrType.getElementType();
+                List<String> elems = new ArrayList<>();
+                Map<String, Expr> tokens = new HashMap<>();
+                boolean ok = true;
+                for (int i = 0; i < b[0] && ok; i++) {
+                    Expr cast = castElements.get(en.getValue().text + "[" + i + "]");
+                    Type et = cast != null ? Type.getType(cast.desc) : elemType;
+                    if (cast != null && isMockable(et) && !ClassInspector.isValueType(cast.desc)) {
+                        // (Order) args[0] in AOP advice: a mock of what the code takes the element to be
+                        String v = newVar(et);
+                        ensured.put(cast.text, v);
+                        ensured.put(canon(cast), v);
+                        elems.add(v);
+                        continue;
+                    }
+                    String v = et.getSort() == Type.OBJECT && et.getInternalName().equals("java/lang/Object")
+                            ? "new Object()" : nonNullSample(et, null);
+                    if (v == null) { ok = false; break; }
+                    if (et.getSort() != Type.OBJECT || ClassInspector.isValueType(et.getDescriptor())) {
+                        // decided by the solver like any value, defaulting to the sample
+                        String token = "\u0001el" + (++elementTokens) + "\u0001";
+                        elementDefaults.put(token, v);
+                        elementTypes.put(token, et.getDescriptor());
+                        tokens.put(en.getValue().text + "[" + i + "]", Expr.unknown(token, et.getDescriptor()));
+                        v = token;
+                    }
+                    elems.add(v);
+                }
+                if (!ok) continue;
+                paramValues.put(en.getKey(), "new " + imports.ref(elemType) + "[]{" + String.join(", ", elems) + "}");
+                arrayElements.putAll(tokens);
+                out.addAll(settles.getOrDefault(en.getKey(), List.of()));
+            }
+            return out;
+        }
+
         static final Map<String, java.util.function.Predicate<Character>> CHAR_PREDICATES = Map.of(
                 "isDigit", Character::isDigit, "isLetter", Character::isLetter, "isLetterOrDigit", Character::isLetterOrDigit,
                 "isWhitespace", Character::isWhitespace, "isUpperCase", Character::isUpperCase, "isLowerCase", Character::isLowerCase,
@@ -1768,6 +2005,113 @@ public final class TestGenerator {
             List<String> tokens = new ArrayList<>();
             for (int i = 0; i < k; i++) tokens.add(String.valueOf((char) ('a' + i)));
             constrain(s0, "==", Expr.constant(String.join(sep, tokens), "Ljava/lang/String;"));
+            return true;
+        }
+
+        /**
+         * {@code results.size() > 1}, {@code order.getLineItems().size() <= 0}: a real collection with as many elements as
+         * the comparison needs, less what the path itself adds to it first ({@code errors.add(..)} before
+         * {@code errors.size() > 0}).
+         */
+        boolean collectionSize(Expr l, String op, Expr rgt) {
+            if (l.kind != Expr.Kind.CALL || !"size".equals(l.name) || !l.args.isEmpty() || l.target == null || !"()I".equals(l.memberDesc)
+                    || !(rgt.value instanceof Number n)) return false;
+            Expr coll = l.target;
+            if (coll.desc == null || !coll.desc.startsWith("L") || !(coll.kind == Expr.Kind.PARAM || arrangeable(coll))) return false;
+            Type t = Type.getType(coll.desc);
+            if (iterableLiteral(t, List.of()) == null) return false;
+            if (arrangedCollections.contains(coll.text)) return false; // a driven loop already sized it
+            int added = 0;
+            for (Effect ef : p.effects()) {
+                if (ef.kind() == Effect.Kind.CALL && ef.target() != null && ef.target().text.equals(coll.text)
+                        && Set.of("add", "addElement", "push", "offer", "addFirst", "addLast").contains(ef.name())) added++;
+            }
+            // every size decision on this collection narrows what it may start with; built once they are all in
+            Object[] entry = sizeWanted.computeIfAbsent(coll.text, x -> {
+                boolean[] ok = new boolean[21];
+                Arrays.fill(ok, true);
+                return new Object[]{coll, ok};
+            });
+            boolean[] ok = (boolean[]) entry[1];
+            for (int i = 0; i <= 20; i++) ok[i] &= cmp(i + added, op, n.intValue());
+            return true;
+        }
+
+        /** Collection text → {collection, which starting sizes 0..20 satisfy every size decision so far}. */
+        final Map<String, Object[]> sizeWanted = new LinkedHashMap<>();
+
+        /** Builds the collections {@link #collectionSize} was asked for, at the smallest size every decision allows. */
+        void materializeSizes() {
+            for (var en : sizeWanted.entrySet()) {
+                Expr coll = (Expr) en.getValue()[0];
+                boolean[] ok = (boolean[]) en.getValue()[1];
+                int want = -1;
+                for (int i = 0; i <= 20 && want < 0; i++) if (ok[i]) want = i;
+                if (want < 0 || !sizedCollection(coll, want)) todos.add("arrange `" + coll.text + "` with the size the path needs");
+            }
+        }
+
+        boolean sizedCollection(Expr coll, int want) {
+            Type t = Type.getType(coll.desc);
+            Type elemType = declaredElementType(coll);
+            if (elemType == null) elemType = Type.getType(Object.class);
+            List<String> elems = new ArrayList<>();
+            for (int i = 0; i < want; i++) {
+                String v;
+                if (isMockable(elemType) && !elemType.getInternalName().equals("java/lang/Object")) v = newVar(elemType);
+                else {
+                    v = nonNullSample(elemType, null);
+                    if (v == null || elemType.getInternalName().equals("java/lang/Object")) v = "new Object()";
+                    else if (elemType.getSort() == Type.OBJECT && ClassInspector.isValueType(elemType.getDescriptor()) && i > 0) v = v + " + " + i;
+                }
+                elems.add(v);
+            }
+            String literal = iterableLiteral(t, elems);
+            if (literal == null) return false;
+            if (coll.kind == Expr.Kind.PARAM) paramValues.put(coll.index, literal);
+            else {
+                boundLiteral.remove(coll.text); // a placeholder "non-null" answer may already stand there
+                if (!bindLiteral(coll, literal)) return false;
+            }
+            arrangedCollections.add(coll.text);
+            return true;
+        }
+
+        /** Spring's {@code WebUtils} session lookups: what they read through the request's session. */
+        static boolean isSessionAttributeLookup(Expr e) {
+            return e.kind == Expr.Kind.CALL && e.target == null && "org/springframework/web/util/WebUtils".equals(e.owner)
+                    && (((e.name.equals("getSessionAttribute") || e.name.equals("getRequiredSessionAttribute")) && e.args.size() == 2)
+                    || (e.name.equals("getOrCreateSessionAttribute") && e.args.size() == 3));
+        }
+
+        final Map<String, String> sessionVars = new HashMap<>();
+
+        /**
+         * {@code (UserSession) WebUtils.getSessionAttribute(request, "userSession")}: the request's session (a mock from
+         * {@code request.getSession(false)}) answers the attribute with the value the path needs.
+         */
+        boolean arrangeSessionAttribute(Expr e, String value) {
+            String session;
+            if (e.name.equals("getOrCreateSessionAttribute")) {
+                session = ensure(e.args.get(0));
+            } else {
+                Expr req = e.args.get(0);
+                if (req.desc == null || !req.desc.endsWith("/http/HttpServletRequest;")) return false;
+                String rv = ensure(req);
+                if (rv == null) return false;
+                session = sessionVars.get(rv);
+                if (session == null) {
+                    if (value.equals("null")) return true; // no session at all: every attribute is null
+                    Type st = Type.getObjectType(Type.getType(req.desc).getInternalName().replace("HttpServletRequest", "HttpSession"));
+                    session = newVar(st);
+                    sessionVars.put(rv, session);
+                    stubs.put(rv + ".getSession(false)", "when(" + rv + ".getSession(false)).thenReturn(" + session + ");");
+                }
+            }
+            if (session == null) return false;
+            String name = renderExpected(e.args.get(1), 0);
+            if (name == null) return false;
+            stubs.put(session + ".getAttribute(" + name + ")", "when(" + session + ".getAttribute(" + name + ")).thenReturn(" + value + ");");
             return true;
         }
 
@@ -2252,6 +2596,12 @@ public final class TestGenerator {
                         stubs.put(stubKey(owner, e.target), "when(" + owner + ".iterator()).thenReturn(List.of(" + v + ").iterator());");
                         break;
                     }
+                    if (isSessionAttributeLookup(e)) {
+                        if (!isMockable(t)) break;
+                        v = newVar(t);
+                        if (!arrangeSessionAttribute(e, v)) v = null;
+                        break;
+                    }
                     if (e.target != null && e.target.kind == Expr.Kind.THIS) {
                         // getValidator() inherited from SimpleFormController: injected through its setter, as XML wiring does
                         String setter = inheritedSetter(e);
@@ -2425,6 +2775,10 @@ public final class TestGenerator {
                     if (e.target == null && isNumberParse(e) && !literal.equals("null")) {
                         // Integer.parseInt(request.getParameter(id)) < 1: hand the parser that number as text
                         return bindLiteral(e.args.get(0), "\"" + literal.replaceAll("[LlfFdD]$", "").replace(".0", "") + "\"");
+                    }
+                    if (isSessionAttributeLookup(e)) {
+                        if (literal.startsWith("mock(")) return ensure(e) != null;
+                        return arrangeSessionAttribute(e, literal);
                     }
                     if (e.target == null) return false; // static call: would need mockStatic
                     if (isMapLookup(e)) return arrangeMapLookup(e, literal);
@@ -3683,6 +4037,9 @@ public final class TestGenerator {
                 default: break;
             }
             if (e.expansion() == null && ensured.containsKey(e.text)) return ensured.get(e.text);
+            // args[0] of an array the test passes: read back from that same array
+            if (isParamArrayElement(e) && paramVars.containsKey(e.args.get(0).index) && !ensured.containsKey(canon(e)))
+                return paramVars.get(e.args.get(0).index) + "[" + ((Number) e.args.get(1).value).intValue() + "]";
             if (e.kind == Expr.Kind.CALL && e.target != null) {
                 Pipeline pl = pipeline(e);
                 if (pl != null && !pl.iterator()) return pl.expected();

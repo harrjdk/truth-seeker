@@ -168,4 +168,30 @@ class JeeSamplesTest {
         // an advice declaring Throwable
         assertTrue(code.contains("() throws Throwable {"), code);
     }
+
+    @Test
+    void sessionLookupsArraysAndHandWrittenLoopsAreArranged() throws Exception {
+        String code = generate("fixtures.legacy.SessionAndLoops");
+        assertFalse(code.contains("@Disabled("), code);
+        // main(String[] args): as long as the path needs, elements chosen by the decisions on them
+        assertTrue(code.contains("String[] args = new String[]{\"\"};") && code.contains("String[] args = new String[]{};"), code);
+        assertTrue(code.contains("String[] args = new String[]{\"other\", \"-v\"};"), code);
+        assertTrue(code.contains("assertEquals(\"verbose \" + args[0], result);"), code);
+        // advice: (Purchase) args[0] is a mock of Purchase
+        assertTrue(code.contains("Object[] args = new Object[]{purchase};"), code);
+        // an inner loop over a list queried with the outer element
+        assertTrue(code.contains("when(directory.findIds(any())).thenReturn(new ArrayList<>(List.of(new Object())));"), code);
+        // sizes of a collaborator's answer, every decision on it at once
+        assertTrue(code.contains("thenReturn(new ArrayList<>(List.of(new Object(), new Object())));"), code);
+        // errors added on the path, then counted: no test for "added but still empty"
+        assertTrue(code.split("void validate_", -1).length - 1 == 4, code);
+        // a loop over a map's keys, looking each one up
+        assertTrue(code.contains("when(directory.getServices()).thenReturn(new HashMap<>(Map.of(\"value\", service)));"), code);
+        // a StringTokenizer over a parameter
+        assertTrue(code.contains("String text = \"a\";"), code);
+        // WebUtils session lookups
+        assertTrue(code.contains("when(request.getSession(false)).thenReturn(httpSession);")
+                && code.contains("when(httpSession.getAttribute(\"userSession\")).thenReturn(userSession);"), code);
+        assertTrue(code.contains("when(request.getSession()).thenReturn(httpSession);"), code);
+    }
 }

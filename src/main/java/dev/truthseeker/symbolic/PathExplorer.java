@@ -793,6 +793,9 @@ public final class PathExplorer {
                 if (other != null && other[0].equals(empt[0]) && !other[1].equals(empt[1])) return false;
             }
         }
+        // errors.add(..) and then errors.size() == 0 / errors.isEmpty(): what the path added is there
+        String filled = collectionEmptied(c);
+        if (filled != null && addedTo(f, filled)) return false;
         // "next".equals(page) and then "nextCart".equals(page): one string cannot equal two different constants
         String[] mine = equalsConstant(c);
         if (mine != null) {
@@ -835,6 +838,49 @@ public final class PathExplorer {
         if (at0 && !at1) return new Object[]{len.target.text, Boolean.TRUE};
         if (!at0 && at1) return new Object[]{len.target.text, Boolean.FALSE};
         return null;
+    }
+
+    private static final Set<String> COLLECTION_ADDS = Set.of("add", "addElement", "put", "push", "offer", "addFirst", "addLast",
+            "offerFirst", "offerLast", "putIfAbsent", "setAttribute");
+
+    /**
+     * The collection a decision says is empty: {@code coll.isEmpty()} true, {@code coll.size()} compared so only 0
+     * holds, {@code coll.iterator().hasNext()} false. Null for anything else (strings included).
+     */
+    private static String collectionEmptied(Cond c) {
+        Expr l = c.left();
+        if (l == null || l.kind != Expr.Kind.CALL || l.target == null || !l.args.isEmpty()) return null;
+        if (isTextual(l.target.desc)) return null;
+        if (c.kind() == Cond.Kind.BOOL) {
+            if ("isEmpty".equals(l.name) && "()Z".equals(l.memberDesc) && c.isTrue()) return l.target.text;
+            if ("hasNext".equals(l.name) && !c.isTrue() && "iterator".equals(l.target.name) && l.target.kind == Expr.Kind.CALL
+                    && l.target.target != null && l.target.args.isEmpty() && !l.text.contains(" [iteration ")
+                    && !isTextual(l.target.target.desc)) return l.target.target.text;
+            return null;
+        }
+        if (c.kind() != Cond.Kind.CMP || !"size".equals(l.name) || !"()I".equals(l.memberDesc) || c.right() == null
+                || c.right().kind != Expr.Kind.CONST || !(c.right().value instanceof Number n)) return null;
+        int k = n.intValue();
+        boolean at0 = compare(0, c.op(), k) == c.isTrue();
+        for (int i = 1; i <= 3; i++) if (compare(i, c.op(), k) == c.isTrue()) return null;
+        return at0 ? l.target.text : null;
+    }
+
+    private static boolean isTextual(String desc) {
+        return desc == null || desc.equals("Ljava/lang/String;") || desc.equals("Ljava/lang/StringBuilder;")
+                || desc.equals("Ljava/lang/StringBuffer;") || desc.equals("Ljava/lang/CharSequence;");
+    }
+
+    /** Something was added to this collection on the path and nothing taken out since. */
+    private static boolean addedTo(Frame f, String text) {
+        boolean added = false;
+        for (Effect e : f.effects) {
+            if (e.kind() != Effect.Kind.CALL || e.target() == null || !e.target().text.equals(text)) continue;
+            if (COLLECTION_ADDS.contains(e.name()) && !"setAttribute".equals(e.name())) added = true;
+            else if (e.name().startsWith("remove") || e.name().equals("clear") || e.name().equals("retainAll") || e.name().startsWith("poll")
+                    || e.name().equals("pop") || e.name().equals("drainTo")) added = false;
+        }
+        return added;
     }
 
     private static boolean isStringLength(Expr e) {
@@ -905,7 +951,12 @@ public final class PathExplorer {
     private static void dereferenced(Frame f, Expr e) {
         boolean ownField = e.kind == Expr.Kind.FIELD && e.target != null && e.target.kind == Expr.Kind.THIS;
         if (e.kind != Expr.Kind.THIS && e.kind != Expr.Kind.STATIC && f.nonNull.putIfAbsent(valueKey(e), learnedAt(f)) == null
-                && (e.kind == Expr.Kind.CALL || ownField) && f.derefs.stream().noneMatch(d -> d.text.equals(e.text))) f.derefs.add(e);
+                && (e.kind == Expr.Kind.CALL || ownField || paramElement(e)) && f.derefs.stream().noneMatch(d -> d.text.equals(e.text))) f.derefs.add(e);
+    }
+
+    /** {@code args[0]} of an array parameter (AOP advice's {@code Object[] args}): the test must put something there. */
+    private static boolean paramElement(Expr e) {
+        return e.kind == Expr.Kind.ARRAY_ELEM && e.args.size() == 2 && e.args.get(0).kind == Expr.Kind.PARAM;
     }
 
     /** Statically known outcome, including null checks on values this path already dereferenced; else null. */
@@ -1183,6 +1234,23 @@ public final class PathExplorer {
         }
         if (inline(f, m, recv, args)) return true;
         if (inlineOnBuilt(f, m, recv, args)) return true;
+        if (recv != null && recv.kind == Expr.Kind.NEW && m.getOpcode() != INVOKESTATIC && FRESH_COLLECTIONS.contains(recv.owner)
+                && (COLLECTION_ADDS.contains(m.name) || m.name.startsWith("remove") || m.name.equals("clear") || m.name.startsWith("addAll")
+                || m.name.startsWith("putAll"))) {
+            // this.keywordList.add(..) in a built object's constructor: that field is no longer the empty list it started as
+            // (after construction the add is an effect like any other, and the generator rebuilds the list from it)
+            for (Object id : builtObjects) {
+                boolean constructing = false;
+                for (Caller c = f.caller; c != null; c = c.parent()) if (c.constructing() != null && Objects.equals(c.constructing().extra, id)) constructing = true;
+                if (!constructing) continue;
+                String prefix = " new" + id + ".";
+                f.thisFields.forEach((k, v) -> {
+                    if (k.startsWith(prefix) && v != null && v.kind == Expr.Kind.NEW && Objects.equals(v.extra, recv.extra) && v.text.equals(recv.text)) {
+                        unsureFields.computeIfAbsent(id, x -> new HashSet<>()).add(k.substring(prefix.length()));
+                    }
+                });
+            }
+        }
         if (recv != null && recv.kind == Expr.Kind.NEW && recv.extra != null && builtObjects.contains(recv.extra)
                 && m.getOpcode() != INVOKESTATIC && repo != null && !isLibrary(m.owner)) {
             // a method of the built object not followed (calculateTotal() inside its constructor) may set its fields:
