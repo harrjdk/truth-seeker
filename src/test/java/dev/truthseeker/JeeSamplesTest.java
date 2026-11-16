@@ -132,4 +132,17 @@ class JeeSamplesTest {
         assertTrue(code.contains("when(form.getPassword()).thenReturn(\"value\");"), code);
         assertTrue(code.contains("verify(store, atLeastOnce()).savePassword(eq(\"value\"));"), code);
     }
+
+    @Test
+    void fieldWritesAreCheckedSoThatDroppingThemShows() throws Exception {
+        String code = generate("fixtures.legacy.Shipment");
+        // a collaborator's answer: stubbed and expected in the field
+        assertTrue(code.contains("when(status.advance(any())).thenReturn(status1);") && code.contains("assertSame(status1, getField(subject, \"status\"));"), code);
+        // a value the test cannot name: the field no longer holds the mock put there first
+        assertTrue(code.contains("setField(subject, \"label\", label);") && code.contains("assertNotSame(label, getField(subject, \"label\"));"), code);
+        // a call on the argument, in the test's terms
+        assertTrue(code.contains("assertEquals(reference.trim(), getField(subject, \"reference\"));"), code);
+        // the constructor already set true: the field gets false first
+        assertTrue(code.contains("setField(subject, \"insured\", false);") && code.contains("assertEquals(insured, getField(subject, \"insured\"));"), code);
+    }
 }

@@ -3611,9 +3611,32 @@ public final class TestGenerator {
                     lit = renderExpected(v, 0);
                     if (lit != null && e.desc().equals("J") && !lit.contains("L")) lit = "(long) " + lit;
                 }
-                if (lit == null) continue;
+                else if (v.kind == Expr.Kind.CALL && v.target != null && v.desc != null) {
+                    Type vt = Type.getType(v.desc);
+                    if (vt.getSort() == Type.OBJECT && !ClassInspector.isValueType(v.desc) && isMockable(vt) && arrangeable(v)) {
+                        // this.delivery = delivery.updateOnRouting(..): the collaborator's answer is what the field holds
+                        String var = ensure(v);
+                        if (var != null) {
+                            needsGetField = true;
+                            out.add("assertSame(" + var + ", getField(subject, \"" + e.name() + "\"));");
+                        }
+                        continue;
+                    }
+                    lit = renderExpected(v, 0); // this.categoryId = categoryId.trim()
+                    if (lit != null && lit.equals("null")) lit = null;
+                }
+                if (lit == null) {
+                    // a value the test cannot name (Delivery.derivedFrom(..)): at least the field no longer holds what it did
+                    String before = replacedValue(e);
+                    if (before != null) {
+                        needsGetField = true;
+                        out.add("assertNotSame(" + before + ", getField(subject, \"" + e.name() + "\"));");
+                    }
+                    continue;
+                }
                 needsGetField = true;
                 if (Type.getType(e.desc()).getSort() == Type.LONG && v.kind == Expr.Kind.CONST && !lit.endsWith("L")) lit = lit + "L";
+                if (v.kind == Expr.Kind.PARAM || v.kind == Expr.Kind.CONST) presetOtherValue(e, v, lit);
                 out.add("assertEquals(" + lit + ", getField(subject, \"" + e.name() + "\"));");
             }
             // collaborator interactions: @Mock dependencies and mocks created for this test (e.g. entities)
@@ -3675,6 +3698,7 @@ public final class TestGenerator {
                     case "I" -> "1";
                     case "J" -> "1L";
                     case "D" -> "1.0";
+                    case "F" -> "1.0f";
                     default -> null;
                 };
                 if (sample == null) continue;
@@ -3713,6 +3737,68 @@ public final class TestGenerator {
                 return taken == 1 && Boolean.TRUE.equals(lastHasNext) && ensured.containsKey(v) ? v : null;
             }
             return null;
+        }
+
+        /**
+         * For a field written with a value the test cannot name: puts a mock of the field's type there first and
+         * returns its variable, or null when the path reads the field, the test already set it, or the type is not
+         * mockable.
+         */
+        String replacedValue(Effect write) {
+            if (isStatic || write.value() == null || !write.desc().startsWith("L")) return null;
+            Type ft = Type.getType(write.desc());
+            if (!isMockable(ft) || ClassInspector.isValueType(write.desc())) return null;
+            String name = write.name();
+            String prefix = "setField(subject, \"" + name + "\", ";
+            if (arrange.stream().anyMatch(a -> a.startsWith(prefix)) || readsField(name)) return null;
+            if (write.value().kind == Expr.Kind.NULL) return null;
+            String var = newVar(ft);
+            needsSetField = true;
+            arrange.add(prefix + var + ");");
+            return var;
+        }
+
+        /** The path reads this field of the subject: in a decision, its result or a side effect's operands. */
+        boolean readsField(String name) {
+            java.util.function.Predicate<Expr> readsIt = x -> x.kind == Expr.Kind.FIELD && name.equals(x.name)
+                    && x.target != null && x.target.kind == Expr.Kind.THIS;
+            for (Cond c : p.conds()) if (c.left().mentions(readsIt) || (c.right() != null && c.right().mentions(readsIt))) return true;
+            if (p.outcome().value() != null && p.outcome().value().mentions(readsIt)) return true;
+            for (Effect ef : p.effects()) {
+                if (ef.target() != null && ef.target().mentions(readsIt)) return true;
+                if (ef.args().stream().anyMatch(a -> a.mentions(readsIt))) return true;
+                if (ef.value() != null && ef.value().mentions(readsIt)) return true;
+            }
+            return false;
+        }
+
+        /**
+         * Before a field is written with a known value, give it a different one, so a write that is dropped shows
+         * (a constructor may already have put the same value there). Only for fields the path does not read.
+         */
+        void presetOtherValue(Effect write, Expr v, String lit) {
+            if (isStatic) return;
+            String name = write.name();
+            String prefix = "setField(subject, \"" + name + "\", ";
+            if (arrange.stream().anyMatch(a -> a.startsWith(prefix)) || readsField(name)) return;
+            String value = v.kind == Expr.Kind.PARAM ? paramValues.get(v.index) : lit;
+            if (value == null && v.kind == Expr.Kind.PARAM) {
+                Expr param = r.params().stream().filter(q -> q.index == v.index).findFirst().orElse(null);
+                value = param == null ? null : defaultFor(Type.getType(param.desc));
+            }
+            if (value == null) return;
+            String other = switch (write.desc()) {
+                case "Z" -> value.equals("true") ? "false" : "true";
+                case "I" -> value.equals("0") ? "1" : "0";
+                case "J" -> value.equals("0L") || value.equals("0") ? "1L" : "0L";
+                case "D" -> value.startsWith("0") ? "1.0" : "0.0";
+                case "F" -> value.startsWith("0") ? "1.0f" : "0.0f";
+                case "Ljava/lang/String;" -> value.equals("\"other\"") ? "\"value\"" : "\"other\"";
+                default -> write.desc().startsWith("L") && !value.equals("null") ? "null" : null;
+            };
+            if (other == null) return;
+            needsSetField = true;
+            arrange.add(prefix + other + ");");
         }
 
         /**
