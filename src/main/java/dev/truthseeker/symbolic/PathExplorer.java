@@ -275,6 +275,7 @@ public final class PathExplorer {
                         f.thisFields.forEach((k, e) -> {
                             if (k.startsWith(prefix) && e != null) fields.put(k.substring(prefix.length()), e);
                         });
+                        for (String u : unsureFields.getOrDefault(x.extra, Set.of())) fields.put(u, Expr.unknown("?", null));
                         out.put(x.extra, fields);
                     }
                     return false;
@@ -294,6 +295,7 @@ public final class PathExplorer {
         f.thisFields.forEach((k, e) -> {
             if (k.startsWith(prefix) && e != null) out.put(k.substring(prefix.length()), e);
         });
+        for (String u : unsureFields.getOrDefault(v.extra, Set.of())) out.put(u, Expr.unknown("?", null));
         return out;
     }
 
@@ -606,7 +608,8 @@ public final class PathExplorer {
                 dereferenced(f, target);
                 String built = constructedKey(f, target, fi.name);
                 if (built != null && f.thisFields.containsKey(built)) f.push(f.thisFields.get(built));
-                else if (built != null && !incompleteObjects.contains(target.extra) && !insideConstructorOf(f, target)) {
+                else if (built != null && !incompleteObjects.contains(target.extra) && !insideConstructorOf(f, target)
+                        && !unsureFields.getOrDefault(target.extra, Set.of()).contains(fi.name)) {
                     f.push(defaultValue(fi.desc)); // no constructor of the object set it (lazy init: if (vets == null))
                 }
                 else if (target.kind == Expr.Kind.THIS && f.thisFields.containsKey(fi.name)) f.push(f.thisFields.get(fi.name));
@@ -1109,8 +1112,15 @@ public final class PathExplorer {
         if (inlineOnBuilt(f, m, recv, args)) return true;
         if (recv != null && recv.kind == Expr.Kind.NEW && recv.extra != null && builtObjects.contains(recv.extra)
                 && m.getOpcode() != INVOKESTATIC && repo != null && !isLibrary(m.owner)) {
-            // a method of the built object not followed (calculateTotal() inside its constructor) may set its fields
-            incompleteObjects.add(recv.extra);
+            // a method of the built object not followed (calculateTotal() inside its constructor) may set its fields:
+            // those it can write are no longer known, the rest still are
+            Set<String> writes = fieldsWritten(recv.owner, m.name, m.desc, 0, new HashSet<>());
+            if (writes == null) incompleteObjects.add(recv.extra);
+            else {
+                unsureFields.computeIfAbsent(recv.extra, k -> new HashSet<>()).addAll(writes);
+                String prefix = constructedPrefix(recv);
+                for (String w : writes) f.thisFields.remove(prefix + w);
+            }
         }
         Expr fresh = freshCollectionAnswer(f, m, recv);
         if (fresh != null) {
@@ -1595,6 +1605,38 @@ public final class PathExplorer {
     private final Set<Object> builtObjects = new HashSet<>();
     /** Built objects with a superclass constructor that could not be followed: unset fields are not known to be default. */
     private final Set<Object> incompleteObjects = new HashSet<>();
+    /** Fields of a built object that a method not followed may have written (calculateTotal() sets total). */
+    private final Map<Object, Set<String>> unsureFields = new HashMap<>();
+
+    /**
+     * Fields of {@code owner} (or its superclasses) that a method of it can write, following its own methods and
+     * lambda bodies; null when that cannot be told (a library method, this handed elsewhere, too deep).
+     */
+    private Set<String> fieldsWritten(String owner, String name, String desc, int depth, Set<String> seen) {
+        if (depth > 3 || repo == null) return null;
+        if (!seen.add(name + desc)) return new HashSet<>();
+        MethodNode mn = resolveOwn(owner, name, desc);
+        if (mn == null || (mn.access & (ACC_ABSTRACT | ACC_NATIVE)) != 0) return null;
+        Set<String> out = new HashSet<>();
+        for (AbstractInsnNode in = mn.instructions.getFirst(); in != null; in = in.getNext()) {
+            if (in instanceof FieldInsnNode fi && in.getOpcode() == PUTFIELD) out.add(fi.name);
+            else if (in instanceof MethodInsnNode mi && !mi.name.equals("<init>") && !isLibrary(mi.owner)
+                    && resolveOwn(owner, mi.name, mi.desc) != null && mi.getOpcode() != INVOKESTATIC) {
+                Set<String> more = fieldsWritten(owner, mi.name, mi.desc, depth + 1, seen);
+                if (more == null) return null;
+                out.addAll(more);
+            } else if (in instanceof InvokeDynamicInsnNode indy && indy.bsmArgs.length > 1 && indy.bsmArgs[1] instanceof Handle h
+                    && h.getOwner().equals(owner) && h.getName().startsWith("lambda$")) {
+                MethodNode body = resolveOwn(owner, h.getName(), h.getDesc());
+                if (body == null) return null;
+                for (AbstractInsnNode b = body.instructions.getFirst(); b != null; b = b.getNext()) {
+                    if (b.getOpcode() == PUTFIELD) out.add(((FieldInsnNode) b).name);
+                    else if (b instanceof MethodInsnNode bm && bm.owner.equals(owner) && !bm.name.equals("<init>")) return null;
+                }
+            }
+        }
+        return out;
+    }
     private int objectIds;
 
     /**

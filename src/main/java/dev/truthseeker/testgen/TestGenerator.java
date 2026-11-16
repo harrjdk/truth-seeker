@@ -2346,6 +2346,7 @@ public final class TestGenerator {
             collect();
             solve();
             ensureImplicit();
+            preferTellingValues();
             boolean unresolved = !todos.isEmpty(); // precondition TODOs only; assertion TODOs are inline comments
             MethodNode mn = r.method();
             Type[] ats = Type.getArgumentTypes(mn.desc);
@@ -2726,6 +2727,7 @@ public final class TestGenerator {
                     String actual = receiver + "." + g.name + "()";
                     Expr fv = fields.get(field);
                     if (fv == null && lazyGetter(g)) continue; // would create the value on first call
+                    if (fv != null && fv.kind == Expr.Kind.UNKNOWN && "?".equals(fv.text)) continue; // set by a method not followed
                     List<String> lines;
                     if (fv == null) {
                         lines = List.of(switch (t.getSort()) {
@@ -3576,6 +3578,11 @@ public final class TestGenerator {
                 String lit = null;
                 if (v.kind == Expr.Kind.CONST || v.kind == Expr.Kind.NULL || isEnumConst(v)) lit = literalOf(v);
                 else if (v.kind == Expr.Kind.PARAM) lit = paramVars.get(v.index);
+                else if (v.kind == Expr.Kind.BINARY && Set.of("I", "J").contains(e.desc()) && simpleArithmetic(v)) {
+                    // quantity++ / balance = balance + amount: the field gets a known value first, then the sum is expected
+                    lit = renderExpected(v, 0);
+                    if (lit != null && e.desc().equals("J") && !lit.contains("L")) lit = "(long) " + lit;
+                }
                 if (lit == null) continue;
                 needsGetField = true;
                 if (Type.getType(e.desc()).getSort() == Type.LONG && v.kind == Expr.Kind.CONST && !lit.endsWith("L")) lit = lit + "L";
@@ -3618,6 +3625,45 @@ public final class TestGenerator {
             out.addAll(expectOwnLists());
             if (p.outcome().kind() != Path.OutcomeKind.THROW) out.addAll(expectAbsent());
             return out;
+        }
+
+        /**
+         * A primitive parameter no decision constrains but that the method stores (a field, a call argument, a field
+         * of an object it builds) gets a value other than the type's default: with {@code false} or {@code 0}, dropping
+         * the store would go unnoticed.
+         */
+        void preferTellingValues() {
+            List<Expr> stored = new ArrayList<>();
+            for (Effect e : p.effects()) {
+                stored.addAll(e.args());
+                if (e.value() != null) stored.add(e.value());
+            }
+            if (p.returnedFields() != null) stored.addAll(p.returnedFields().values());
+            for (Map<String, Expr> m : p.handedFields().values()) stored.addAll(m.values());
+            for (Expr param : r.params()) {
+                if (paramValues.containsKey(param.index) || paramTypes.containsKey(param.index) || param.desc == null) continue;
+                String sample = switch (param.desc) {
+                    case "Z" -> "true";
+                    case "I" -> "1";
+                    case "J" -> "1L";
+                    case "D" -> "1.0";
+                    default -> null;
+                };
+                if (sample == null) continue;
+                boolean decided = p.conds().stream().anyMatch(c -> c.left().mentions(x -> x.kind == Expr.Kind.PARAM && x.index == param.index)
+                        || (c.right() != null && c.right().mentions(x -> x.kind == Expr.Kind.PARAM && x.index == param.index)));
+                if (decided) continue;
+                if (stored.stream().anyMatch(x -> x.kind == Expr.Kind.PARAM && x.index == param.index)) paramValues.put(param.index, sample);
+            }
+        }
+
+        /** Arithmetic over constants, parameters and the subject's own primitive fields only. */
+        boolean simpleArithmetic(Expr v) {
+            return !v.mentions(x -> !(x.kind == Expr.Kind.BINARY || (x.kind == Expr.Kind.CONST && x.value instanceof Number)
+                    || (x.kind == Expr.Kind.PARAM && paramVars.containsKey(x.index))
+                    || (x.kind == Expr.Kind.FIELD && x.target != null && x.target.kind == Expr.Kind.THIS && x.desc != null
+                        && Set.of("I", "J", "S", "B").contains(x.desc) && !deps.containsKey(x.name))
+                    || x.kind == Expr.Kind.THIS));
         }
 
         /**

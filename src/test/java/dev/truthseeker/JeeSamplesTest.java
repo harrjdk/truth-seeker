@@ -100,4 +100,17 @@ class JeeSamplesTest {
         // a getter that changes nothing does not assert the list
         assertFalse(code.substring(code.indexOf("void size_")).split("@Test")[0].contains("getField(subject, \"dogs\")"), code);
     }
+
+    @Test
+    void fieldArithmeticIsChecked() throws Exception {
+        String code = generate("fixtures.legacy.Ledger");
+        // a running total and a counter: a known value first, then the sum
+        assertTrue(code.contains("setField(subject, \"balance\", 1L);") && code.contains("assertEquals((1L + amount), getField(subject, \"balance\"));"), code);
+        assertTrue(code.contains("assertEquals((1 + 1), getField(subject, \"postings\"));"), code);
+        // the entry built and put in the subject's list: numbered from the list's size; a field its own method sets is left out
+        assertTrue(code.contains("assertEquals((0 + 1), storedEntry.getNumber());"), code);
+        assertFalse(code.contains("storedEntry.getFee()"), code);
+        // values stored as they are get something other than the type's default
+        assertTrue(code.contains("boolean credit = true;") && code.contains("int amount = 1;") && code.contains("boolean frozen = true;"), code);
+    }
 }
