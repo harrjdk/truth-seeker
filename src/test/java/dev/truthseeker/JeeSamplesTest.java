@@ -145,4 +145,27 @@ class JeeSamplesTest {
         // the constructor already set true: the field gets false first
         assertTrue(code.contains("setField(subject, \"insured\", false);") && code.contains("assertEquals(insured, getField(subject, \"insured\"));"), code);
     }
+
+    @Test
+    void xmlWiredEraShapesAreArranged() throws Exception {
+        // a collaborator from a base class's getter: injected through its setter, or its field when it has none
+        String controller = generate("fixtures.legacy.XmlWired$SubmitController");
+        assertTrue((controller.contains("subject.setValidator(validator);") || controller.contains("setField(subject, \"validator\", validator);")) && controller.contains("verify(validator, atLeastOnce()).validate("), controller);
+        String action = generate("fixtures.legacy.XmlWired$ViewOrderAction");
+        assertTrue(action.contains("setField(subject, \"facade\", facade);"), action);
+        // a raw Map read through a cast holds an element of the cast type
+        String basket = generate("fixtures.legacy.XmlWired$Basket");
+        assertTrue(basket.contains("lines.put(id, line);") && basket.contains("verify(line, atLeastOnce()).increment();"), basket);
+        // a lazily created set searched by lower-cased name: one filled set, names equal underneath
+        String customer = generate("fixtures.legacy.XmlWired$Customer");
+        assertFalse(customer.contains("@Disabled("), customer);
+        String code = generate("fixtures.legacy.XmlWired");
+        // a string checked character by character
+        assertTrue(code.contains("String phone = \"1a\";") && code.contains("String phone = \"1\";"), code);
+        assertFalse(code.contains("@Disabled("), code);
+        // one string cannot equal "next" and "nextCart": no test for that path
+        assertFalse(code.contains("\"next\".equals(page) && \"nextCart\".equals(page)"), code);
+        // an advice declaring Throwable
+        assertTrue(code.contains("() throws Throwable {"), code);
+    }
 }

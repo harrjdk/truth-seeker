@@ -192,9 +192,23 @@ public final class Tools {
                     List<TestGenerator.Suite> suites = new ArrayList<>();
                     List<String> written = new ArrayList<>();
                     List<String> files = new ArrayList<>();
+                    boolean batch = names.size() > 1;
+                    List<String> skipped = new ArrayList<>();
                     for (String name : names) {
                         ClassNode cn = repo.require(name);
-                        TestGenerator.Suite suite = TestGenerator.generateSuite(repo, cn, opts);
+                        // in a batch, an interface (a DAO or service contract) is skipped rather than failing the rest
+                        if (batch && (cn.access & org.objectweb.asm.Opcodes.ACC_INTERFACE) != 0) {
+                            skipped.add(Names.simple(cn.name) + " (interface)");
+                            continue;
+                        }
+                        TestGenerator.Suite suite;
+                        try {
+                            suite = TestGenerator.generateSuite(repo, cn, opts);
+                        } catch (RuntimeException ex) {
+                            if (!batch) throw ex;
+                            skipped.add(Names.simple(cn.name) + " (" + ex.getMessage() + ")");
+                            continue;
+                        }
                         suites.add(suite);
                         if (out == null) continue;
                         java.nio.file.Path dir = java.nio.file.Path.of(out).resolve(Names.packageOf(cn.name).replace('.', '/'));
@@ -211,6 +225,7 @@ public final class Tools {
                             written.add("Could not write " + file + ": " + ex.getMessage());
                         }
                     }
+                    if (!skipped.isEmpty()) written.add("Skipped " + skipped.size() + ": " + String.join(", ", skipped));
                     if (!files.isEmpty()) {
                         written.add(0, "Wrote " + files.size() + " file(s) under `" + out + "`: "
                                 + files.stream().map(f -> java.nio.file.Path.of(f).getFileName().toString()).collect(java.util.stream.Collectors.joining(", ")));

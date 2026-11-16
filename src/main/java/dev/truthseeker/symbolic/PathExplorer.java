@@ -785,7 +785,79 @@ public final class PathExplorer {
         for (Cond e : f.conds) {
             if (e.key().equals(c.key())) return e.value().equals(c.value());
         }
+        // hasLength(telephone) and then a loop over telephone.length() that never runs: one string, empty and not
+        Object[] empt = emptiness(c);
+        if (empt != null) {
+            for (Cond e : f.conds) {
+                Object[] other = emptiness(e);
+                if (other != null && other[0].equals(empt[0]) && !other[1].equals(empt[1])) return false;
+            }
+        }
+        // "next".equals(page) and then "nextCart".equals(page): one string cannot equal two different constants
+        String[] mine = equalsConstant(c);
+        if (mine != null) {
+            for (Cond e : f.conds) {
+                String[] theirs = equalsConstant(e);
+                if (theirs != null && theirs[0].equals(mine[0]) && !theirs[1].equals(mine[1])) return false;
+            }
+        }
         return true;
+    }
+
+    /**
+     * {string, Boolean empty} when a decision says whether a string is empty: StringUtils.hasLength/hasText, isEmpty(),
+     * or length() compared with a constant (0 < s.length()); null otherwise.
+     */
+    private static Object[] emptiness(Cond c) {
+        Expr l = c.left();
+        if (l == null) return null;
+        if (c.kind() == Cond.Kind.BOOL && l.kind == Expr.Kind.CALL) {
+            if (l.target == null && l.args.size() == 1 && "org/springframework/util/StringUtils".equals(l.owner)
+                    && ("hasLength".equals(l.name) || "hasText".equals(l.name)) && "Ljava/lang/String;".equals(l.args.get(0).desc)) {
+                if (c.isTrue()) return new Object[]{l.args.get(0).text, Boolean.FALSE};
+                return "hasLength".equals(l.name) ? new Object[]{l.args.get(0).text, Boolean.TRUE} : null;
+            }
+            if ("isEmpty".equals(l.name) && l.args.isEmpty() && l.target != null && "Ljava/lang/String;".equals(l.target.desc)) {
+                return new Object[]{l.target.text, c.isTrue()};
+            }
+            return null;
+        }
+        if (c.kind() != Cond.Kind.CMP || c.right() == null) return null;
+        Expr len = null, k = null;
+        boolean lenLeft;
+        if (isStringLength(l) && c.right().kind == Expr.Kind.CONST) { len = l; k = c.right(); lenLeft = true; }
+        else if (isStringLength(c.right()) && l.kind == Expr.Kind.CONST) { len = c.right(); k = l; lenLeft = false; }
+        else return null;
+        if (!(k.value instanceof Number n)) return null;
+        int kv = n.intValue();
+        boolean at0 = compare(lenLeft ? 0 : kv, c.op(), lenLeft ? kv : 0) == c.isTrue();
+        boolean at1 = compare(lenLeft ? 1 : kv, c.op(), lenLeft ? kv : 1) == c.isTrue();
+        if (at0 && !at1) return new Object[]{len.target.text, Boolean.TRUE};
+        if (!at0 && at1) return new Object[]{len.target.text, Boolean.FALSE};
+        return null;
+    }
+
+    private static boolean isStringLength(Expr e) {
+        return e != null && e.kind == Expr.Kind.CALL && "length".equals(e.name) && e.args.isEmpty() && e.target != null
+                && "Ljava/lang/String;".equals(e.target.desc);
+    }
+
+    private static boolean compare(int a, String op, int b) {
+        return switch (op) {
+            case "<" -> a < b; case "<=" -> a <= b; case ">" -> a > b; case ">=" -> a >= b; case "==" -> a == b; case "!=" -> a != b;
+            default -> false;
+        };
+    }
+
+    /** {subject, literal} for a decision that holds: {@code "X".equals(s)} or {@code s.equals("X")}; null otherwise. */
+    private static String[] equalsConstant(Cond c) {
+        if (c.kind() != Cond.Kind.BOOL || !c.isTrue()) return null;
+        Expr l = c.left();
+        if (l == null || l.kind != Expr.Kind.CALL || !"equals".equals(l.name) || l.target == null || l.args.size() != 1) return null;
+        Expr a = l.target, b = l.args.get(0);
+        if (a.kind == Expr.Kind.CONST && a.value instanceof String lit && b.kind != Expr.Kind.CONST) return new String[]{b.text, lit};
+        if (b.kind == Expr.Kind.CONST && b.value instanceof String lit && a.kind != Expr.Kind.CONST) return new String[]{a.text, lit};
+        return null;
     }
 
     private record Binding(MethodNode method, String expansion) {}
@@ -831,8 +903,9 @@ public final class PathExplorer {
     }
 
     private static void dereferenced(Frame f, Expr e) {
-        if (e.kind != Expr.Kind.THIS && e.kind != Expr.Kind.STATIC && f.nonNull.putIfAbsent(valueKey(e), learnedAt(f)) == null && e.kind == Expr.Kind.CALL
-                && f.derefs.stream().noneMatch(d -> d.text.equals(e.text))) f.derefs.add(e);
+        boolean ownField = e.kind == Expr.Kind.FIELD && e.target != null && e.target.kind == Expr.Kind.THIS;
+        if (e.kind != Expr.Kind.THIS && e.kind != Expr.Kind.STATIC && f.nonNull.putIfAbsent(valueKey(e), learnedAt(f)) == null
+                && (e.kind == Expr.Kind.CALL || ownField) && f.derefs.stream().noneMatch(d -> d.text.equals(e.text))) f.derefs.add(e);
     }
 
     /** Statically known outcome, including null checks on values this path already dereferenced; else null. */
@@ -1698,6 +1771,9 @@ public final class PathExplorer {
         if (coll.kind != Expr.Kind.NEW || !coll.args.isEmpty() || coll.owner == null || !FRESH_COLLECTIONS.contains(coll.owner)) return null;
         String text = coll.text;
         for (Effect e : f.effects) { // added to, or handed somewhere that might add to it: no longer known to be empty
+            // this.pets = new HashSet(): storing it adds nothing (adds through the field name the same object)
+            if (e.kind() == Effect.Kind.FIELD_WRITE && e.value() != null && e.value().text.equals(text)
+                    && e.target() != null && e.target().kind == Expr.Kind.THIS) continue;
             if (e.target() != null && e.target().mentions(x -> x.text.equals(text))) return null;
             if (e.args().stream().anyMatch(a -> a.mentions(x -> x.text.equals(text)))) return null;
             if (e.value() != null && e.value().mentions(x -> x.text.equals(text))) return null;

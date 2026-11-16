@@ -47,7 +47,7 @@ class GeneratedTestsExecutionTest {
                 // try/catch: thenThrow/doThrow on collaborators, parser input, throws inside inlined helpers
                 "fixtures.legacy.AccountService",
                 // constructors of other classes and rules held by enum constants
-                "fixtures.legacy.ShipmentEventFactory", "fixtures.legacy.ShipmentEvent", "fixtures.legacy.Waybill", "fixtures.legacy.CustomerController", "fixtures.legacy.Roster", "fixtures.legacy.BatchJob", "fixtures.legacy.MessageBoard", "fixtures.legacy.OrderDesk", "fixtures.legacy.SignupValidator", "fixtures.legacy.AccountDesk", "fixtures.legacy.Kennel", "fixtures.legacy.Ledger", "fixtures.legacy.Profile", "fixtures.legacy.Shipment",
+                "fixtures.legacy.ShipmentEventFactory", "fixtures.legacy.ShipmentEvent", "fixtures.legacy.Waybill", "fixtures.legacy.CustomerController", "fixtures.legacy.Roster", "fixtures.legacy.BatchJob", "fixtures.legacy.MessageBoard", "fixtures.legacy.OrderDesk", "fixtures.legacy.SignupValidator", "fixtures.legacy.AccountDesk", "fixtures.legacy.Kennel", "fixtures.legacy.Ledger", "fixtures.legacy.Profile", "fixtures.legacy.Shipment", "fixtures.legacy.XmlWired", "fixtures.legacy.XmlWired$SubmitController", "fixtures.legacy.XmlWired$ViewOrderAction", "fixtures.legacy.XmlWired$Basket", "fixtures.legacy.XmlWired$Customer",
                 // typed list elements, null elements, stream pipelines, date ordering, paged results
                 "fixtures.legacy.Schedule", "fixtures.legacy.History", "fixtures.legacy.Deadline", "fixtures.legacy.CustomerSearch",
                 // JPetStore-shaped: iterator loops, map fields, objects built on the path, session attributes
@@ -61,12 +61,14 @@ class GeneratedTestsExecutionTest {
         List<String> testClassNames = new ArrayList<>();
         for (String c : classes) {
             String code = TestGenerator.generate(repo, repo.require(c), new TestGenerator.Options(List.of(), 64, 24, false));
-            String simple = c.substring(c.lastIndexOf('.') + 1);
-            Path file = src.resolve(c.substring(0, c.lastIndexOf('.')).replace('.', '/')).resolve(simple + "GeneratedTest.java");
+            // a nested class (XmlWired$Basket) gets a test named after its simple name, in the same package
+            String simple = c.substring(Math.max(c.lastIndexOf('.'), c.lastIndexOf('$')) + 1);
+            String pkg = c.substring(0, c.lastIndexOf('.'));
+            Path file = src.resolve(pkg.replace('.', '/')).resolve(simple + "GeneratedTest.java");
             Files.createDirectories(file.getParent());
             Files.writeString(file, code);
             files.add(file.toString());
-            testClassNames.add(c + "GeneratedTest");
+            testClassNames.add(pkg + "." + simple + "GeneratedTest");
         }
 
         // compile

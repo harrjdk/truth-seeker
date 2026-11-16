@@ -926,8 +926,9 @@ public final class TestGenerator {
             arrangePeers();
             arrangeLoops();
             Set<Cond> sequenced = arrangeSequences();
+            Set<Cond> charDecided = arrangeCharStrings();
             for (Cond c0 : p.conds()) {
-                if (sequenced.contains(c0)) continue;
+                if (sequenced.contains(c0) || charDecided.contains(c0)) continue;
                 Cond c = c0;
                 if (c0.kind() == Cond.Kind.BOOL && c0.left().kind == Expr.Kind.CALL && "contains".equals(c0.left().name)
                         && c0.left().target != null && arrangedCollections.contains(c0.left().target.text)) continue;
@@ -978,7 +979,8 @@ public final class TestGenerator {
                                 && "Ljava/lang/String;".equals(l.target.desc) && rgt.kind == Expr.Kind.CONST && rgt.value instanceof Number n) {
                             String len = solveNumeric(Type.INT_TYPE, List.of(new Constraint(op, rgt, n)));
                             if (len != null && Integer.parseInt(len) >= 0 && Integer.parseInt(len) <= 10_000) {
-                                constrain(l.target, "==", Expr.constant("a".repeat(Integer.parseInt(len)), "Ljava/lang/String;"));
+                                // value.trim().length(): a string without surrounding spaces trims to itself
+                                constrain(unwrapString(l.target), "==", Expr.constant("a".repeat(Integer.parseInt(len)), "Ljava/lang/String;"));
                                 break;
                             }
                         }
@@ -1089,6 +1091,12 @@ public final class TestGenerator {
 
         /** {@code a.equals(b)} over two arrangeable values: bind both to one sample (true) or two distinct samples (false). */
         boolean sameOrDifferent(Expr a, Expr b, boolean same) {
+            // name.toLowerCase().equals(pet.getName().toLowerCase()): the samples ("value", "other") are already lower-case
+            // and trimmed, so the strings underneath decide it
+            if ("Ljava/lang/String;".equals(a.desc) && "Ljava/lang/String;".equals(b.desc)) {
+                a = unwrapString(a);
+                b = unwrapString(b);
+            }
             String desc = a.desc != null && !a.desc.equals("Ljava/lang/Object;") ? a.desc : b.desc;
             if (desc == null || !arrangeable(a) || !arrangeable(b)) return false;
             // one side already has a value (an earlier decision on it, or a @Mock field of the subject): relate the
@@ -1371,6 +1379,8 @@ public final class TestGenerator {
             }
             // so must everything the path dereferenced, also inside inlined constructors (cartItem.getItem().getItemId())
             for (Expr d : p.dereferenced()) {
+                // a field of the subject no constructor sets (filled by a lifecycle method, e.g. Struts setServlet(..))
+                if (d.kind == Expr.Kind.FIELD && (assignedAtConstruction(d.name) || isStatic)) continue;
                 Loop over = null;
                 for (Loop l : loops) if (d.mentions(l::isElement)) over = l;
                 if (over == null) {
@@ -1422,6 +1432,11 @@ public final class TestGenerator {
                     && a.desc != null && a.desc.startsWith("Ljava/") && subjectFieldValue(a) == null) {
                 String lit = nonNullSample(Type.getType(a.desc), a);
                 if (lit != null && !lit.startsWith("mock(")) bindLiteral(a, lit);
+                return;
+            }
+            // getValidator() inherited from the framework: a mock injected through its setter
+            if (a.kind == Expr.Kind.CALL && a.target != null && a.target.kind == Expr.Kind.THIS && inheritedSetter(a) != null) {
+                ensure(a);
                 return;
             }
             if (a.kind != Expr.Kind.CALL || a.target == null || a.target.kind == Expr.Kind.THIS) return;
@@ -1478,7 +1493,7 @@ public final class TestGenerator {
             for (Expr root : all) {
                 root.mentions(x -> {
                     if (found[0] == null && x.kind == Expr.Kind.CALL && x.target != null && x.target.kind == Expr.Kind.THIS
-                            && !(x.name.equals("getClass") && x.args.isEmpty())) {
+                            && !(x.name.equals("getClass") && x.args.isEmpty()) && !ensured.containsKey(x.text)) {
                         found[0] = x.expansion() != null ? x.expansion() : x.text;
                     }
                     return false;
@@ -1503,6 +1518,113 @@ public final class TestGenerator {
         }
 
         /** Numeric value of an expression whose inputs were all bound to literals, or null. */
+        /**
+         * Strings checked character by character ({@code for (i < telephone.length()) if (!Character.isDigit(telephone.charAt(i)))}):
+         * one string built from what each position must be and how long it must be, e.g. {@code "1a"} for "a digit, then
+         * not". Returns the decisions it settled (they are not arranged again).
+         */
+        Set<Cond> arrangeCharStrings() {
+            Map<String, Expr> strings = new LinkedHashMap<>();
+            Map<String, Map<Integer, List<String[]>>> chars = new HashMap<>(); // string -> index -> {predicate, wanted}
+            Map<String, int[]> bounds = new HashMap<>();                        // string -> {min length, max length}
+            Map<String, List<Cond>> settles = new HashMap<>();
+            for (Cond c : p.conds()) {
+                Expr l = c.left();
+                if (c.kind() == Cond.Kind.BOOL && l.kind == Expr.Kind.CALL && l.target == null && "java/lang/Character".equals(l.owner)
+                        && l.args.size() == 1 && CHAR_PREDICATES.containsKey(l.name)) {
+                    Expr at = l.args.get(0);
+                    if (at.kind != Expr.Kind.CALL || !"charAt".equals(at.name) || at.target == null || at.args.size() != 1) continue;
+                    Integer k = constInt(at.args.get(0));
+                    if (k == null || k < 0 || k > 64 || !arrangeable(at.target)) continue;
+                    String key = at.target.text;
+                    strings.putIfAbsent(key, at.target);
+                    chars.computeIfAbsent(key, x -> new HashMap<>()).computeIfAbsent(k, x -> new ArrayList<>())
+                            .add(new String[]{l.name, String.valueOf(c.isTrue())});
+                    int[] b = bounds.computeIfAbsent(key, x -> new int[]{0, Integer.MAX_VALUE});
+                    b[0] = Math.max(b[0], k + 1);
+                    settles.computeIfAbsent(key, x -> new ArrayList<>()).add(c);
+                }
+            }
+            if (strings.isEmpty()) return Set.of();
+            // length comparisons with a constant (the loop's i < s.length()) bound the length
+            for (Cond c : p.conds()) {
+                if (c.kind() != Cond.Kind.CMP || c.right() == null) continue;
+                Expr len = null, other = null;
+                boolean lenLeft = false;
+                if (isLength(c.left())) { len = c.left(); other = c.right(); lenLeft = true; }
+                else if (isLength(c.right())) { len = c.right(); other = c.left(); }
+                if (len == null || !strings.containsKey(len.target.text)) continue;
+                Integer k = constInt(other);
+                if (k == null) continue;
+                int[] b = bounds.get(len.target.text);
+                int lo = Integer.MAX_VALUE, hi = -1;
+                for (int n = 0; n <= 65; n++) {
+                    boolean holds = cmp(lenLeft ? n : k, c.op(), lenLeft ? k : n) == c.isTrue();
+                    if (holds) { lo = Math.min(lo, n); hi = Math.max(hi, n); }
+                }
+                if (hi < 0) continue;
+                b[0] = Math.max(b[0], lo);
+                if (hi < 65) b[1] = Math.min(b[1], hi);
+                settles.get(len.target.text).add(c);
+            }
+            Set<Cond> out = new HashSet<>();
+            for (var en : strings.entrySet()) {
+                int[] b = bounds.get(en.getKey());
+                if (b[0] > b[1]) continue;
+                StringBuilder sb = new StringBuilder();
+                boolean ok = true;
+                for (int i = 0; i < b[0] && ok; i++) {
+                    List<String[]> need = chars.get(en.getKey()).getOrDefault(i, List.of());
+                    Character pick = null;
+                    for (char cand : "a1A -".toCharArray()) {
+                        boolean all = true;
+                        for (String[] n : need) all &= CHAR_PREDICATES.get(n[0]).test(cand) == Boolean.parseBoolean(n[1]);
+                        if (all) { pick = cand; break; }
+                    }
+                    if (pick == null) ok = false;
+                    else sb.append(pick);
+                }
+                if (!ok || !bindLiteral(en.getValue(), "\"" + sb + "\"")) continue;
+                satisfied.add(canon(en.getValue()));
+                out.addAll(settles.get(en.getKey()));
+                // decisions on the same string elsewhere (hasLength, isEmpty) agree with the literal built
+                for (Cond c : p.conds()) {
+                    Expr l = c.left();
+                    if (c.kind() == Cond.Kind.BOOL && l.kind == Expr.Kind.CALL && l.args.size() == 1 && l.target == null
+                            && Set.of("hasLength", "hasText", "isEmpty", "isNotEmpty", "isBlank", "isNotBlank").contains(l.name)
+                            && l.args.get(0).text.equals(en.getKey())) out.add(c);
+                }
+            }
+            return out;
+        }
+
+        static final Map<String, java.util.function.Predicate<Character>> CHAR_PREDICATES = Map.of(
+                "isDigit", Character::isDigit, "isLetter", Character::isLetter, "isLetterOrDigit", Character::isLetterOrDigit,
+                "isWhitespace", Character::isWhitespace, "isUpperCase", Character::isUpperCase, "isLowerCase", Character::isLowerCase,
+                "isSpaceChar", Character::isSpaceChar);
+
+        static boolean isLength(Expr e) {
+            return e != null && e.kind == Expr.Kind.CALL && "length".equals(e.name) && e.args.isEmpty() && e.target != null
+                    && "Ljava/lang/String;".equals(e.target.desc);
+        }
+
+        static boolean cmp(int a, String op, int b) {
+            return switch (op) {
+                case "<" -> a < b; case "<=" -> a <= b; case ">" -> a > b; case ">=" -> a >= b; case "==" -> a == b; case "!=" -> a != b;
+                default -> false;
+            };
+        }
+
+        /** An int known in the test: a constant or arithmetic over constants (a loop counter's i + 1). */
+        Integer constInt(Expr e) {
+            if (e.kind == Expr.Kind.CONST && e.value instanceof Number n) return n.intValue();
+            if (e.kind == Expr.Kind.BINARY) {
+                Number n = evaluate(e);
+                return n == null ? null : n.intValue();
+            }
+            return null;
+        }
+
         Number evaluate(Expr e) {
             if (e.kind == Expr.Kind.CONST && e.value instanceof Number n) return n;
             String lit = e.kind == Expr.Kind.PARAM ? paramValues.get(e.index) : boundLiteral.get(e.text);
@@ -1611,6 +1733,10 @@ public final class TestGenerator {
             order.sort(Comparator.comparingInt(t -> t.cs.stream().anyMatch(c -> c.op().equals("empty")) ? 0 : 1));
             for (Target t : order) {
                 if (satisfied.contains(canon(t.expr))) continue;
+                // only "not null" asked of something that already has a value (a loop's filled collection): it does
+                String had = boundLiteral.get(t.expr.text);
+                if (had != null && !had.equals("null") && !t.cs.isEmpty() && t.cs.stream()
+                        .allMatch(c -> c.op().equals("!=") && c.other() != null && c.other().kind == Expr.Kind.NULL)) continue;
                 String literal = literalFor(t);
                 if (literal == null) continue;
                 bind(t.expr, literal, t);
@@ -1993,15 +2119,67 @@ public final class TestGenerator {
                     c = node.superName;
                 }
             }
-            if (sig == null) return null;
+            if (sig == null || sig.indexOf('<') < 0) return castElementType(coll); // a raw collection: what its elements are cast to
             int lt = sig.indexOf('<');
-            if (lt < 0) return null;
             int i = lt + 1;
             if (i < sig.length() && (sig.charAt(i) == '+' || sig.charAt(i) == '=')) i++;
             if (i >= sig.length() || sig.charAt(i) != 'L') return null;
             int end = i;
             while (end < sig.length() && sig.charAt(end) != ';' && sig.charAt(end) != '<') end++;
             return Type.getObjectType(sig.substring(i + 1, end));
+        }
+
+        /** A field of the subject or a superclass that a constructor or field initializer assigns. */
+        boolean assignedAtConstruction(String name) {
+            for (String c = cn.name; c != null; ) {
+                ClassNode node = c.equals(cn.name) ? cn : repo.node(c);
+                if (node == null) return !c.startsWith("java/"); // a JDK superclass sets none of ours; anything else: cannot tell
+                for (MethodNode m : node.methods) {
+                    if (!m.name.equals("<init>")) continue;
+                    for (AbstractInsnNode in = m.instructions.getFirst(); in != null; in = in.getNext()) {
+                        if (in instanceof FieldInsnNode fi && fi.getOpcode() == Opcodes.PUTFIELD && fi.name.equals(name)) return true;
+                    }
+                }
+                c = node.superName;
+            }
+            return false;
+        }
+
+        /** The descriptor a field of the subject (or a superclass) is declared with, or null. */
+        String declaredFieldDesc(String name) {
+            for (String c = cn.name; c != null; ) {
+                ClassNode node = c.equals(cn.name) ? cn : repo.node(c);
+                if (node == null) return null;
+                for (FieldNode fn : node.fields) if (fn.name.equals(name)) return fn.desc;
+                c = node.superName;
+            }
+            return null;
+        }
+
+        /**
+         * For a raw (pre-generics) collection: the type its elements are cast to on this path, from
+         * {@code (Pet) pets.get(i)} or {@code (Vet) vets.iterator().next()}. Null when none is seen.
+         */
+        Type castElementType(Expr coll) {
+            List<Expr> roots = new ArrayList<>(p.dereferenced());
+            for (Cond c : p.conds()) { roots.add(c.left()); if (c.right() != null) roots.add(c.right()); }
+            for (Effect ef : p.effects()) { if (ef.target() != null) roots.add(ef.target()); roots.addAll(ef.args()); if (ef.value() != null) roots.add(ef.value()); }
+            if (p.outcome().value() != null) roots.add(p.outcome().value());
+            Type[] found = new Type[1];
+            for (Expr root : roots) {
+                root.mentions(x -> {
+                    if (found[0] != null || x.kind != Expr.Kind.CALL || x.target == null || x.desc == null || !x.desc.startsWith("L")
+                            || x.desc.equals("Ljava/lang/Object;")) return false;
+                    boolean direct = Set.of("get", "remove", "elementAt", "firstElement", "lastElement").contains(x.name)
+                            && x.target.text.equals(coll.text);
+                    boolean viaIterator = Set.of("next", "nextElement").contains(x.name) && x.target.kind == Expr.Kind.CALL
+                            && Set.of("iterator", "listIterator", "elements").contains(x.target.name) && x.target.target != null
+                            && x.target.target.text.equals(coll.text);
+                    if (direct || viaIterator) found[0] = Type.getType(x.desc);
+                    return false;
+                });
+            }
+            return found[0];
         }
 
         String newVarNamed(Type t) {
@@ -2074,6 +2252,19 @@ public final class TestGenerator {
                         stubs.put(stubKey(owner, e.target), "when(" + owner + ".iterator()).thenReturn(List.of(" + v + ").iterator());");
                         break;
                     }
+                    if (e.target != null && e.target.kind == Expr.Kind.THIS) {
+                        // getValidator() inherited from SimpleFormController: injected through its setter, as XML wiring does
+                        String setter = inheritedSetter(e);
+                        if (setter == null || !isMockable(t)) break;
+                        v = newVar(t);
+                        if (setter.startsWith("field:")) {
+                            needsSetField = true;
+                            arrange.add("setField(subject, \"" + setter.substring(6) + "\", " + v + ");");
+                        } else {
+                            arrange.add("subject." + setter + "(" + v + ");");
+                        }
+                        break;
+                    }
                     String tv = ensure(e.target);
                     if (tv == null) break;
                     v = newVar(t);
@@ -2086,6 +2277,44 @@ public final class TestGenerator {
                 ensured.put(canon(e), v);
             }
             return v;
+        }
+
+        /**
+         * For {@code this.getX()} declared in a superclass (Spring's BaseCommandController.getValidator(),
+         * SqlMapClientDaoSupport.getSqlMapClientTemplate()): the name of a public {@code setX(T)} in the hierarchy that
+         * the test can call to put a mock there. Null when the getter is the subject's own or there is no such setter.
+         */
+        String inheritedSetter(Expr call) {
+            if (isStatic || !call.args.isEmpty() || call.name == null || !call.name.startsWith("get") || call.name.length() < 4
+                    || call.memberDesc == null) return null;
+            String ret = Type.getReturnType(call.memberDesc).getDescriptor();
+            boolean ownGetter = cn.methods.stream().anyMatch(m -> m.name.equals(call.name) && m.desc.equals(call.memberDesc));
+            if (ownGetter) return null;
+            String setter = "set" + call.name.substring(3);
+            String fieldBehind = null;
+            for (String c = cn.name; c != null; ) {
+                ClassNode node = c.equals(cn.name) ? cn : repo.node(c);
+                if (node == null) return null;
+                for (MethodNode m : node.methods) {
+                    if (m.name.equals(setter) && m.desc.equals("(" + ret + ")V") && (m.access & Opcodes.ACC_PUBLIC) != 0
+                            && (m.access & Opcodes.ACC_STATIC) == 0) return setter;
+                    if (fieldBehind == null && m.name.equals(call.name) && m.desc.equals(call.memberDesc)) fieldBehind = returnedField(m);
+                }
+                c = node.superName;
+            }
+            // no setter (BaseAction.getPetStore(), filled from the servlet context): set the field the getter returns
+            return fieldBehind == null ? null : "field:" + fieldBehind;
+        }
+
+        /** The field a plain getter returns ({@code return this.petStore;}), or null. */
+        static String returnedField(MethodNode m) {
+            List<AbstractInsnNode> ops = new ArrayList<>();
+            for (AbstractInsnNode in = m.instructions.getFirst(); in != null; in = in.getNext()) if (in.getOpcode() >= 0) ops.add(in);
+            if (ops.size() == 3 && ops.get(0).getOpcode() == Opcodes.ALOAD && ((org.objectweb.asm.tree.VarInsnNode) ops.get(0)).var == 0
+                    && ops.get(1) instanceof FieldInsnNode fi && fi.getOpcode() == Opcodes.GETFIELD && ops.get(2).getOpcode() == Opcodes.ARETURN) {
+                return fi.name;
+            }
+            return null;
         }
 
         void bind(Expr e, String literal, Target t) {
@@ -2175,7 +2404,7 @@ public final class TestGenerator {
                 }
                 case FIELD -> {
                     if (e.target == null) return false;
-                    if (e.target.kind == Expr.Kind.THIS) {
+                    if (e.target != null && e.target.kind == Expr.Kind.THIS) {
                         if (deps.containsKey(e.name) && !literal.equals("null")) {
                             // the @Mock is already non-null: it *is* the value
                             boundLiteral.put(e.text, e.name);
@@ -2259,6 +2488,9 @@ public final class TestGenerator {
             if (key == null) return false;
             List<Type> kv = declaredTypeArguments(e.target);
             Type valueType = kv.size() == 2 ? kv.get(1) : Type.getType(Object.class);
+            // a raw Map read through a cast ((CartItem) itemMap.get(id)): the cast says what the values are
+            if (valueType.getInternalName().equals("java/lang/Object") && e.desc != null && e.desc.startsWith("L")
+                    && !e.desc.equals("Ljava/lang/Object;")) valueType = Type.getType(e.desc);
             String value;
             if (!e.name.equals("containsKey") && !literal.startsWith("mock(")) value = literal;
             else if (isMockable(valueType)) value = newVar(valueType);
@@ -2405,7 +2637,9 @@ public final class TestGenerator {
                 sb.append("    @Disabled(\"truth-seeker: arrange the TODO preconditions, then remove @Disabled\")\n");
             }
             // methods under test may declare checked exceptions (ParseException, SQLException, legacy RemoteException…)
-            sb.append("    void ").append(testName).append("() throws Exception {\n");
+            // an @Around advice's proceed() and other old APIs declare Throwable itself
+            boolean throwsThrowable = mn.exceptions != null && mn.exceptions.contains("java/lang/Throwable");
+            sb.append("    void ").append(testName).append("() throws ").append(throwsThrowable ? "Throwable" : "Exception").append(" {\n");
             if (o.kind() == Path.OutcomeKind.TRUNCATED) sb.append("        // NOTE: analysis of this path was cut short (").append(o.note()).append(")\n");
             sb.append("        // Arrange\n");
             // mock declarations first: parameters may be built from them (a list holding a mock element)
@@ -3484,7 +3718,9 @@ public final class TestGenerator {
                     if (deps.containsKey(e.name)) return e.name;
                     String already = subjectFieldValue(e);
                     if (already != null) return already; // set once already (e.g. as a non-null precondition)
-                    Type t = Type.getType(e.desc);
+                    // the field as declared: an int read into double arithmetic is still set as an int
+                    String declared = declaredFieldDesc(e.name);
+                    Type t = Type.getType(declared != null ? declared : e.desc);
                     String lit;
                     if (t.getSort() == Type.OBJECT && !ClassInspector.isValueType(e.desc) && !isEnum(t.getInternalName())) lit = newVar(t);
                     else if (t.getSort() == Type.OBJECT && mutableCollection(t) != null) lit = mutableCollection(t);
@@ -4051,7 +4287,7 @@ public final class TestGenerator {
         String d = type.getDescriptor();
         switch (d) {
             case "Z", "Ljava/lang/Boolean;": return "true";
-            case "I", "Ljava/lang/Integer;", "S", "B": return "1";
+            case "I", "Ljava/lang/Integer;", "S", "B", "Ljava/lang/Number;": return "1";
             case "J", "Ljava/lang/Long;": return "1L";
             case "D", "Ljava/lang/Double;": return "1.0";
             case "F", "Ljava/lang/Float;": return "1.0f";
