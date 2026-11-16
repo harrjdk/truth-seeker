@@ -476,6 +476,7 @@ public final class TestGenerator {
             final Expr iterator;      // coll.iterator()
             final List<String> elements = new ArrayList<>();
             int current; // element the path is at: hasNext() = true decisions seen so far
+            boolean started; // a first hasNext() was seen: another untagged one is a new pass from the start
 
             Loop(Expr iterator) {
                 this.iterator = iterator;
@@ -636,6 +637,7 @@ public final class TestGenerator {
             Map<String, Expr> iterators = new LinkedHashMap<>(); // collection text → coll.iterator()
             Map<String, Expr> colls = new LinkedHashMap<>();
             Map<String, List<Expr>> contained = new LinkedHashMap<>();
+            Map<String, int[]> passes = new HashMap<>();
             for (Cond c : p.conds()) {
                 Expr l = c.left();
                 if (c.kind() != Cond.Kind.BOOL || l.kind != Expr.Kind.CALL || l.target == null) continue;
@@ -655,7 +657,11 @@ public final class TestGenerator {
                     colls.putIfAbsent(coll.text, coll);
                     iterators.putIfAbsent(coll.text, l.target);
                     int[] n = trues.computeIfAbsent(coll.text, k -> new int[1]);
-                    if (c.isTrue()) n[0]++;
+                    // two loops over one collection (getById called twice): each pass starts at the first element,
+                    // so the collection needs as many elements as the longest pass
+                    int[] pass = passes.computeIfAbsent(coll.text, k -> new int[2]); // {passes started, trues this pass}
+                    if (!l.text.contains(" [iteration ")) { pass[0]++; pass[1] = 0; }
+                    if (c.isTrue()) { pass[1]++; n[0] = Math.max(n[0], pass[1]); }
                 } else if ("contains".equals(l.name) && l.args.size() == 1 && "(Ljava/lang/Object;)Z".equals(l.memberDesc)
                         && !l.text.contains(" [iteration ")) {
                     colls.putIfAbsent(l.target.text, l.target);
@@ -674,6 +680,20 @@ public final class TestGenerator {
                     bindTo = coll.args.get(0);
                     collType = Type.getType("Ljava/util/Enumeration;");
                 }
+                // this.vets.clear(); this.vets.addAll(query(..)); for (Vet vet : this.vets): what is added is what the loop sees
+                Expr refill = null;
+                boolean cleared = false;
+                for (Effect ef : p.effects()) {
+                    if (ef.kind() != Effect.Kind.CALL || ef.target() == null || !ef.target().text.equals(coll.text)) continue;
+                    if (ef.name().equals("clear") && ef.args().isEmpty()) { cleared = true; refill = null; }
+                    else if (cleared && ef.name().equals("addAll") && ef.args().size() == 1 && refill == null) refill = ef.args().get(0);
+                    else if (cleared && (ef.name().startsWith("add") || ef.name().startsWith("remove"))) refill = Expr.nul(); // more than one source
+                }
+                if (cleared) {
+                    if (refill == null || refill.kind == Expr.Kind.NULL || refill.desc == null) continue;
+                    bindTo = refill;
+                    collType = Type.getType(refill.desc);
+                }
                 // for (Iterator it = services.keySet().iterator(); ..) services.get(name): fill the map itself
                 String mapView = null;
                 if (coll.kind == Expr.Kind.CALL && coll.target != null && coll.args.isEmpty()
@@ -683,6 +703,21 @@ public final class TestGenerator {
                     bindTo = coll.target;
                 }
                 if (!(bindTo.kind == Expr.Kind.PARAM || arrangeable(bindTo)) || collType == null) continue;
+                // getById(getPetTypes(), ..) twice on one path: both queries get the one stubbed list, and each walk starts
+                // at its first element, so walks that need different elements cannot both be arranged
+                if (bindTo.kind == Expr.Kind.CALL && trues.get(e.getKey()) != null && trues.get(e.getKey())[0] > 1
+                        && p.outcome().kind() == Path.OutcomeKind.THROW) { // a later walk found nothing: it needed other elements
+                    String callText = bindTo.text;
+                    Expr fetched = bindTo;
+                    long calls = p.effects().stream().filter(ef -> ef.kind() == Effect.Kind.CALL && ef.target() != null
+                            && (ef.target().text + "." + ef.name()).equals(fetched.target == null ? "" : fetched.target.text + "." + fetched.name)
+                            && ef.args().stream().map(a -> a.text).toList().equals(fetched.args.stream().map(a -> a.text).toList())).count();
+                    if (calls > 1) {
+                        todos.add("`" + callText + "` is called " + calls + " times on this path and each loop over its answer starts again: "
+                                + "answer each call with its own list (thenReturn(first, second))");
+                        continue;
+                    }
+                }
                 Expr iterator = iterators.get(e.getKey());
                 Loop loop = iterator == null ? null : new Loop(iterator);
                 List<String> elems = new ArrayList<>();
@@ -704,13 +739,61 @@ public final class TestGenerator {
                     });
                     alias = aliasOf[0];
                     Type elemType = elemDesc[0] == null ? Type.getType(Object.class) : Type.getType(elemDesc[0]);
+                    // for (int id : ids): next() is seen already unboxed; the collection holds Integers
+                    elemType = switch (elemType.getSort()) {
+                        case Type.INT -> Type.getType(Integer.class);
+                        case Type.LONG -> Type.getType(Long.class);
+                        case Type.DOUBLE -> Type.getType(Double.class);
+                        case Type.FLOAT -> Type.getType(Float.class);
+                        case Type.SHORT -> Type.getType(Short.class);
+                        case Type.BYTE -> Type.getType(Byte.class);
+                        case Type.CHAR -> Type.getType(Character.class);
+                        case Type.BOOLEAN -> Type.getType(Boolean.class);
+                        default -> elemType;
+                    };
                     if (elemType.getInternalName().equals("java/lang/Object")) {
                         // the body never inspects the element on this path: type it from List<Stop> in the declaration
                         Type declared = declaredElementType(bindTo);
                         if (declared != null) elemType = declared;
                     }
+                    // EntityUtils.getById(entities, PetType.class, id): entityClass.isInstance(entity) decides what the elements are
+                    // decisions come in path order: the element a decision is about is the count of hasNext() = true so far
+                    Map<Integer, Boolean> instanceAt = new HashMap<>();
+                    Type instanceOf = null;
+                    List<Cond> instanceConds = new ArrayList<>();
+                    boolean mixedClasses = false;
+                    int at = 0;
+                    for (Cond c : p.conds()) {
+                        Expr l = c.left();
+                        if (loop.isHasNext(l)) {
+                            if (!l.text.contains(" [iteration ")) at = 0;
+                            if (c.isTrue()) at++;
+                            continue;
+                        }
+                        if (c.kind() != Cond.Kind.BOOL || l.kind != Expr.Kind.CALL || !"isInstance".equals(l.name) || l.args.size() != 1
+                                || l.target == null || l.target.kind != Expr.Kind.CONST || !(l.target.value instanceof Type ct)
+                                || !l.args.get(0).mentions(loop::isElement)) continue;
+                        if (instanceOf != null && !instanceOf.equals(ct)) mixedClasses = true;
+                        instanceOf = ct;
+                        Boolean before = instanceAt.put(Math.max(at, 1), c.isTrue());
+                        if (before != null && before != c.isTrue()) mixedClasses = true;
+                        instanceConds.add(c);
+                    }
+                    Map<Integer, Type> elementTypeAt = new HashMap<>();
+                    if (instanceOf != null && !mixedClasses) {
+                        boolean ok = true;
+                        for (var ia : instanceAt.entrySet()) {
+                            if (ia.getValue()) {
+                                if (isMockable(instanceOf)) elementTypeAt.put(ia.getKey(), instanceOf); else ok = false;
+                            } else if (isSubclass(elemType.getInternalName(), instanceOf.getInternalName())) ok = false;
+                        }
+                        if (ok) instanceSettled.addAll(instanceConds);
+                        else elementTypeAt.clear();
+                    }
                     if (alias != null) usedNames.add(alias);
+                    Type declaredElem = elemType;
                     for (int k = 0; k < trues.get(e.getKey())[0]; k++) {
+                        elemType = elementTypeAt.getOrDefault(k + 1, declaredElem);
                         String v;
                         if (elemType.getSort() == Type.OBJECT && !elemType.getInternalName().equals("java/lang/Object")
                                 && !ClassInspector.isValueType(elemType.getDescriptor()) && !isEnum(elemType.getInternalName())) {
@@ -801,6 +884,25 @@ public final class TestGenerator {
             return "new HashMap<>(Map.of(" + elem + ", " + value + "))";
         }
 
+        /** {@code C.class.isInstance(element)} decisions settled by the type of the loop's elements. */
+        final Set<Cond> instanceSettled = new HashSet<>();
+
+        /** Whether an application class is {@code sup} or extends / implements it (as far as the archive shows). */
+        boolean isSubclass(String type, String sup) {
+            Deque<String> todo = new ArrayDeque<>(List.of(type));
+            Set<String> seen = new HashSet<>();
+            while (!todo.isEmpty()) {
+                String c = todo.poll();
+                if (c == null || !seen.add(c)) continue;
+                if (c.equals(sup)) return true;
+                ClassNode node = c.equals(cn.name) ? cn : repo.node(c);
+                if (node == null) continue;
+                if (node.superName != null) todo.add(node.superName);
+                if (node.interfaces != null) todo.addAll(node.interfaces);
+            }
+            return false;
+        }
+
         /** Collections (by expression text) this test filled with real elements: their contains(..) is decided. */
         final Set<String> arrangedCollections = new HashSet<>();
 
@@ -847,12 +949,21 @@ public final class TestGenerator {
             // an inner loop's hasNext() may mention the outer element (a list queried by vet.getId()): its own loop decides it
             for (Loop loop : loops) {
                 if (loop.isHasNext(c.left())) {
+                    if (!c.left().text.contains(" [iteration ")) {
+                        if (loop.started) loop.current = 0; // a new pass from the first element
+                        loop.started = true;
+                    }
                     if (c.isTrue()) loop.current++;
                     return c; // consumed: the collection's size decides it
                 }
             }
-            for (Loop loop : loops) {
-                boolean mentions = c.left().mentions(loop::isElement) || (c.right() != null && c.right().mentions(loop::isElement));
+            // every loop whose element the decision mentions, innermost (registered last) first: an inner element
+            // may itself have been looked up with an outer one (specialtyId from vetSpecialtiesIds queried by vet.getId())
+            Expr left = c.left(), right = c.right();
+            boolean any = false;
+            for (int i = loops.size() - 1; i >= 0; i--) {
+                Loop loop = loops.get(i);
+                boolean mentions = left.mentions(loop::isElement) || (right != null && right.mentions(loop::isElement));
                 if (!mentions) continue;
                 int k = Math.max(loop.current, 1);
                 if (k > loop.elements.size()) return null;
@@ -860,12 +971,13 @@ public final class TestGenerator {
                 boolean token = elementDefaults.containsKey(v);
                 if (!ensured.containsKey(v) && !token) return null; // value element: its decisions cannot be stubbed
                 Expr el = Expr.unknown(v, token ? elementTypes.get(v) : null);
-                Expr left = c.left().substitute(loop::isElement, el);
-                Expr right = c.right() == null ? null : c.right().substitute(loop::isElement, el);
-                if (left == c.left() && left.text.contains(" [iteration ")) return null;
-                return new Cond(c.kind(), left, c.op(), right, c.value(), c.valueExpr(), c.otherCases());
+                left = left.substitute(loop::isElement, el);
+                right = right == null ? null : right.substitute(loop::isElement, el);
+                any = true;
             }
-            return null;
+            if (!any) return null;
+            if (left == c.left() && left.text.contains(" [iteration ")) return null;
+            return new Cond(c.kind(), left, c.op(), right, c.value(), c.valueExpr(), c.otherCases());
         }
 
         final Cond SAME_AS_BEFORE = Cond.bool(Expr.constant(1, "Z"), true);
@@ -992,7 +1104,7 @@ public final class TestGenerator {
             Set<Cond> sized = arrangeArrays();
             sized.addAll(arrangeTokenizers());
             for (Cond c0 : p.conds()) {
-                if (sequenced.contains(c0) || charDecided.contains(c0) || sized.contains(c0)) continue;
+                if (sequenced.contains(c0) || charDecided.contains(c0) || sized.contains(c0) || instanceSettled.contains(c0)) continue;
                 Cond c = onArrayElement(c0);
                 if (c0.kind() == Cond.Kind.BOOL && c0.left().kind == Expr.Kind.CALL && "contains".equals(c0.left().name)
                         && c0.left().target != null && arrangedCollections.contains(c0.left().target.text)) continue;
@@ -1589,12 +1701,16 @@ public final class TestGenerator {
         final Map<String, Number> pins = new HashMap<>();
 
         Number pinnedValue(Expr e) {
-            return pins.computeIfAbsent(e.text, k -> "J".equals(e.desc) ? (Number) 10L : (Number) 10);
+            return pins.computeIfAbsent(e.text, k -> "J".equals(e.desc) || "Ljava/lang/Long;".equals(e.desc) ? (Number) 10L : (Number) 10);
         }
 
         boolean isAssignableNumber(Expr e) {
+            // an Integer element of a driven loop (for (int specialtyId : ids)): its value is the test's to choose
+            if (elementDefaults.containsKey(e.text) && Set.of("Ljava/lang/Integer;", "Ljava/lang/Long;", "Ljava/lang/Short;").contains(e.desc)) return true;
             if (e.desc == null || !"IJSB".contains(e.desc) || e.desc.length() != 1) return false;
             if (e.kind == Expr.Kind.PARAM) return true;
+            // a getter on a mock (entity.getId() == pet.getTypeId()): stubbed to the number wanted
+            if (e.kind == Expr.Kind.CALL && e.args.isEmpty() && e.target != null && e.target.kind != Expr.Kind.THIS && arrangeable(e)) return true;
             return e.kind == Expr.Kind.FIELD && e.target != null && e.target.kind == Expr.Kind.THIS && !isStatic;
         }
 
@@ -2932,6 +3048,11 @@ public final class TestGenerator {
                     ms.add("eq(" + lit + ")");
                 } else if (a != null && exactParam(call, a)) {
                     ms.add("eq(" + paramVars.get(a.index) + ")");
+                } else if (i == ats.length - 1 && ats[i].getSort() == Type.ARRAY && call.owner != null
+                        && isVarargs(call.owner, call.name, call.memberDesc)) {
+                    // query(sql, mapper) with no varargs: Mockito 5's any() stands for exactly one vararg, the
+                    // array's class for any number of them
+                    ms.add("any(" + imports.ref(ats[i]) + ".class)");
                 } else ms.add(anyMatcher(ats[i], overloaded));
             }
             return String.join(", ", ms);
@@ -3084,6 +3205,9 @@ public final class TestGenerator {
                 out.add("assertEquals(" + literalOf(v) + ", result);");
             } else if (v.kind == Expr.Kind.PARAM) {
                 out.add((ret.getSort() == Type.OBJECT ? "assertSame(" : "assertEquals(") + paramVars.get(v.index) + ", result);");
+            } else if (refilledField(v)) {
+                // this.vets.clear(); this.vets.addAll(..); return this.vets: not what the test put in the field
+                out.add("assertNotNull(result);");
             } else if (ensured.containsKey(v.text)) {
                 out.add("assertSame(" + ensured.get(v.text) + ", result);");
             } else if (boundLiteral.containsKey(v.text) && boundLiteral.get(v.text).startsWith("mock(")) {
@@ -4074,6 +4198,9 @@ public final class TestGenerator {
                     if (e.target == null || e.target.kind != Expr.Kind.THIS || isStatic || (cn.access & Opcodes.ACC_ENUM) != 0 || e.desc == null) return null;
                     if (deps.containsKey(e.name)) return e.name;
                     String already = subjectFieldValue(e);
+                    // this.vets.clear(); this.vets.addAll(..): the collection the test put there no longer holds what it did
+                    if (already != null && already.startsWith("new ") && p.effects().stream().anyMatch(ef -> ef.kind() == Effect.Kind.CALL
+                            && ef.target() != null && ef.target().text.equals(e.text) && ef.name().equals("clear"))) return null;
                     if (already != null) return already; // set once already (e.g. as a non-null precondition)
                     // the field as declared: an int read into double arithmetic is still set as an int
                     String declared = declaredFieldDesc(e.name);
@@ -4463,6 +4590,13 @@ public final class TestGenerator {
             Type t = paramTypes.containsKey(index) ? paramTypes.get(index)
                     : r.params().stream().filter(q -> q.index == index).map(q -> Type.getType(q.desc)).findFirst().orElse(null);
             return t != null && t.getSort() == Type.OBJECT && defaultFor(t).startsWith("mock(");
+        }
+
+        /** A collection field of the subject the path clears (and refills): no longer what the test put there. */
+        boolean refilledField(Expr v) {
+            return v.kind == Expr.Kind.FIELD && v.target != null && v.target.kind == Expr.Kind.THIS && !deps.containsKey(v.name)
+                    && p.effects().stream().anyMatch(ef -> ef.kind() == Effect.Kind.CALL && ef.target() != null && ef.target().text.equals(v.text)
+                    && ef.name().equals("clear"));
         }
 
         /** Which mock an effect's receiver is, the same way on every path: a @Mock field or a parameter. */

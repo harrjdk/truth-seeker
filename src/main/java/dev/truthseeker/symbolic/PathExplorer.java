@@ -68,6 +68,8 @@ public final class PathExplorer {
     private final Type[] argTypes;
     static final int MAX_INLINE_DEPTH = 2;
     private static final int MAX_INLINE_INSNS = 1500;
+    /** Static helpers of other application classes are followed only when small: utilities, not services. */
+    private static final int MAX_HELPER_INSNS = 200;
     private final Set<String> notes = new LinkedHashSet<>();
     private final Map<String, String> canonicalOps = new HashMap<>();
     private final List<Path> paths = new ArrayList<>();
@@ -131,6 +133,8 @@ public final class PathExplorer {
         /** Loop iterations re-entered on this path, and how many decisions were made before the latest one. */
         int iteration;
         int barrier;
+        /** Calls to other classes' static helpers already followed on this path (method@pc), shared until changed. */
+        Set<String> helperSites = Set.of();
 
         Frame copy() {
             Frame f = new Frame();
@@ -138,6 +142,7 @@ public final class PathExplorer {
             f.caller = caller;
             f.iteration = iteration;
             f.barrier = barrier;
+            f.helperSites = helperSites;
             f.pc = pc;
             f.stack = new ArrayList<>(stack);
             f.locals = locals.clone();
@@ -1657,15 +1662,38 @@ public final class PathExplorer {
     private boolean inline(Frame f, MethodInsnNode m, Expr recv, Expr[] args) {
         boolean selfStatic = m.getOpcode() == INVOKESTATIC && m.owner.equals(cn.name);
         boolean onThis = recv != null && recv.kind == Expr.Kind.THIS && m.getOpcode() != INVOKESTATIC;
-        if (!opt.inlineSelfCalls() || (!selfStatic && !onThis)) return false;
-        if (f.caller != null && f.caller.depth() >= MAX_INLINE_DEPTH) {
+        // EntityUtils.getById(..), DateUtils.isWeekend(..): a small static helper of another application class runs in the
+        // test for real, so its decisions are the caller's too
+        boolean helper = m.getOpcode() == INVOKESTATIC && !selfStatic && repo != null && !isLibrary(m.owner);
+        if (!opt.inlineSelfCalls() || (!selfStatic && !onThis && !helper)) return false;
+        MethodNode target = resolveOwn(m.getOpcode() == INVOKESPECIAL || selfStatic || helper ? m.owner : cn.name, m.name, m.desc);
+        // a small static helper (EntityUtils.getById) or a branch-free one-liner (getPetTypes() { return query(..); }) may go
+        // one level deeper: it is a leaf, not more of the service
+        boolean leaf = target != null && (helper || isLeaf(target));
+        if (f.caller != null && f.caller.depth() >= MAX_INLINE_DEPTH + (leaf ? 1 : 0)) {
             notes.add("Calls on the class's own methods are inlined up to " + MAX_INLINE_DEPTH + " levels deep; deeper ones stay symbolic.");
             return false;
         }
-        MethodNode target = resolveOwn(m.getOpcode() == INVOKESPECIAL || selfStatic ? m.owner : cn.name, m.name, m.desc);
+        if (helper && (target == null || (target.access & ACC_STATIC) == 0 || target.instructions.size() > MAX_HELPER_INSNS)) return false;
+        // getById(this.getPetTypes(), ..) where that call on the subject was not followed: nothing to arrange inside
+        if (helper && java.util.Arrays.stream(args).anyMatch(a -> a != null && a.mentions(x -> x.kind == Expr.Kind.CALL && x.target != null
+                && x.target.kind == Expr.Kind.THIS))) return false;
+        // Delivery.derivedFrom(.., HandlingHistory.EMPTY): a real static object the test cannot arrange either
+        if (helper && java.util.Arrays.stream(args).anyMatch(a -> a != null && a.kind == Expr.Kind.STATIC && a.desc != null
+                && a.desc.startsWith("L") && !a.desc.startsWith("Ljava/lang/String")
+                && !(repo.node(a.desc.substring(1, a.desc.length() - 1)) != null
+                     && (repo.node(a.desc.substring(1, a.desc.length() - 1)).access & ACC_ENUM) != 0))) return false;
         if (target == null || target.instructions.size() == 0 || target.instructions.size() > MAX_INLINE_INSNS
                 || (target.access & (ACC_ABSTRACT | ACC_NATIVE)) != 0) return false;
         if (target == f.method || (f.caller != null && f.caller.contains(target))) return false; // recursion
+        // called again in a later pass of the caller's loop: the helper runs for real over what the first pass arranged
+        if (helper) {
+            String site = System.identityHashCode(f.method) + "@" + f.pc;
+            if (f.helperSites.contains(site)) return false;
+            Set<String> sites = new HashSet<>(f.helperSites);
+            sites.add(site);
+            f.helperSites = sites;
+        }
         f.caller = new Caller(f.method, f.pc, List.copyOf(f.stack), f.locals, f.visits, f.caller, null, -1);
         Expr[] locals = new Expr[Math.max(target.maxLocals, 1 + args.length * 2)];
         int slot = 0;
@@ -1681,6 +1709,16 @@ public final class PathExplorer {
         f.visits = new int[target.instructions.size()];
         f.pc = -1; // step() advances to the callee's first instruction
         notes.add("Calls on the class's own methods are inlined (up to " + MAX_INLINE_DEPTH + " levels); their decisions appear in these paths. Pass inlineSelfCalls=false for the method-local view.");
+        return true;
+    }
+
+    /** A short method with no branches and no further calls on the subject: following it adds no paths. */
+    private boolean isLeaf(MethodNode m) {
+        if (m.instructions.size() > 40) return false;
+        for (AbstractInsnNode in = m.instructions.getFirst(); in != null; in = in.getNext()) {
+            if (in instanceof JumpInsnNode || in instanceof TableSwitchInsnNode || in instanceof LookupSwitchInsnNode) return false;
+            if (in instanceof MethodInsnNode mi && mi.owner.equals(cn.name) && mi.getOpcode() != INVOKESTATIC) return false;
+        }
         return true;
     }
 

@@ -194,4 +194,21 @@ class JeeSamplesTest {
                 && code.contains("when(httpSession.getAttribute(\"userSession\")).thenReturn(userSession);"), code);
         assertTrue(code.contains("when(request.getSession()).thenReturn(httpSession);"), code);
     }
+
+    @Test
+    void staticHelpersOfOtherClassesAreFollowed() throws Exception {
+        String code = generate("fixtures.legacy.Lookups");
+        assertFalse(code.contains("@Disabled("), code);
+        // Entities.byId(getKinds(), Kind.class, id): the query answers a Kind whose id is the one looked up
+        assertTrue(code.contains("thenReturn(new ArrayList<>(List.of(kind)));") && code.contains("when(kind.getId()).thenReturn(10);")
+                && code.contains("when(animal.getKindId()).thenReturn(10);"), code);
+        // the first element is not a Kind, the second is
+        assertTrue(code.contains("thenReturn(new ArrayList<>(List.of(entity1, kind)));"), code);
+        // nothing matches: the helper's exception
+        assertTrue(code.contains("assertThrows(IllegalArgumentException.class, () -> subject.load(animal));"), code);
+        // a query with no varargs is stubbed for any number of them
+        assertTrue(code.contains("when(template.query(eq(\"SELECT id FROM kinds\"), any(Object[].class)))"), code);
+        // a cache cleared and refilled: the loop walks what was added
+        assertTrue(code.contains("when(template.query(eq(\"SELECT id FROM keepers\"), any(Object[].class))).thenReturn(new ArrayList<>(List.of(keeper1)));"), code);
+    }
 }
