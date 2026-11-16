@@ -56,8 +56,12 @@ a time, the kind a refactoring slip makes:
 
 - a negated condition (`==` ↔ `!=`, `== null` ↔ `!= null`, `<` ↔ `>=`) or a moved boundary (`<` ↔ `<=`)
 - swapped arithmetic (`+` ↔ `-`, `*` ↔ `/`)
-- a changed return value (the opposite boolean, a number + 1, `null` for an object)
+- a changed return value (the opposite boolean, a number + 1, `null` for an object, an empty list/set/map, `""` or
+  `Optional.empty()`)
 - a removed call to a collaborator's void method (`repository.save(..)`, `mav.addObject(..)`; not logging or `close()`)
+- a removed field write (`this.status = ..`, `delivery = ..`)
+- a changed constant: a string becomes `""` (a view name, a model attribute, a message), an int `0` ↔ `1` or `+ 1`;
+  not array sizes and indexes, log messages, `hashCode` or `toString`
 
 Only methods some passing test calls are changed, lambda bodies included. Each change runs that class's tests in a
 fresh JVM, several in parallel. A change is *caught* when a test that passed before fails (or the run hangs, e.g. a
@@ -114,14 +118,15 @@ A test whose preconditions can't all be arranged automatically is emitted as `@D
 
 | Application | Archive | Generated tests | Pass | Disabled (TODOs) | Fail | Mutation score |
 |---|---|---|---|---|---|---|
-| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 192 (12 classes) | 192 | 0 | 0 | 98% (141/144) |
-| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 | 100% (209/209) |
-| [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 | 98% (241/247) |
-| [Java EE 7 samples](https://github.com/javaee-samples/javaee7-samples), 10 modules (Batch, JAX-RS, JPA, JMS, Concurrency, WebSocket, Servlet, JACC, JASPIC; Java 8 bytecode) | 10 WARs, 76 app classes | 306 (72 classes) | 251 | 49 | 6 | 90% (239/265) |
+| [Spring PetClinic](https://github.com/spring-projects/spring-petclinic) (Spring Boot 4.1) | 66 MB fat jar, 34k classes | 192 (12 classes) | 192 | 0 | 0 | 97% (283/292) |
+| [Eclipse Cargo Tracker](https://github.com/eclipse-ee4j/cargotracker) (Jakarta EE 10, Java 11 bytecode) | WAR, 112 app classes | 264 (18 classes) | 264 | 0 | 0 | 97% (287/297) |
+| [MyBatis JPetStore 6](https://github.com/mybatis/jpetstore-6) (Spring MVC + MyBatis, Java 11 bytecode) | WAR, 25 app classes | 268 (17 classes) | 268 | 0 | 0 | 97% (290/300) |
+| [Java EE 7 samples](https://github.com/javaee-samples/javaee7-samples), 10 modules (Batch, JAX-RS, JPA, JMS, Concurrency, WebSocket, Servlet, JACC, JASPIC; Java 8 bytecode) | 10 WARs, 76 app classes | 306 (72 classes) | 251 | 49 | 6 | 88% (394/448) |
 
 Mutation score: the share of small bytecode changes in tested methods that some generated test catches (see
-[mutation testing](#do-the-tests-catch-changes-mutation-testing)). What survives is mostly calls on real (unmocked) objects
-and boundaries no decision on the path pins down.
+[mutation testing](#do-the-tests-catch-changes-mutation-testing)). What survives is mostly field writes and calls on real (unmocked) objects,
+lazily created empty collections, and boundaries no decision on the path pins down. Up to `maxMutants` (300 here) changes
+are tried per application, spread across its classes.
 
 The Java EE 7 failures need a running container: static `PolicyContext`/`AuthConfigFactory` lookups and a JSON decoder
 handed `"value"`. Paths that open a real network connection (`new URL(..)`, a JAX-RS `ClientBuilder`) are disabled with
@@ -264,6 +269,7 @@ What the test generator arranges:
 - arithmetic on the subject's own fields (`quantity++`, `balance = balance + amount`): the field gets a known value first and the sum is expected (`setField(subject, "quantity", 1)` … `assertEquals((1 + 1), getField(subject, "quantity"))`); a primitive parameter that is only stored gets a value other than its type's default (`true`, `1`), so dropping the store shows; an object whose constructor calls one of its own methods keeps every field that method cannot write (`new LineItem(lineItems.size() + 1, cartItem)` is still checked for its line number while its computed `total` is left out)
 - `Optional.ofNullable(account.getPassword()).filter(p -> !p.isEmpty()).ifPresent(p -> mapper.updateSignon(account))`: the value is arranged to be present and pass each filter (a `String` predicate such as `isEmpty()` by choosing the string), and the consumer's calls are verified; an argument that is a stubbed answer is matched by that value (`eq("value")`)
 - `equals(Object o)` paths: `!(o instanceof Voyage)` after `o != null` gets an object of another type (`Object o = new Object()`), not `null`, which would return at the earlier check
+- calls on mocks that return their receiver or a value but are there for their effect (`redirectAttributes.addFlashAttribute("message", "New Owner Created")`, `model.addAttribute(..)`, `map.put(..)`) are verified like void ones, and `never()` on paths that do not make them; a collaborator's collection passed straight back is stubbed with one element (`when(types.findPetTypes()).thenReturn(new ArrayList<>(List.of(petType)))`), so an empty answer would show
 - work done inside `forEach` lambdas (`order.getLineItems().forEach(li -> lineItemMapper.insertLineItem(li))`): the collection gets one mock element and the calls in the lambda body are verified on it
 - objects the method builds and hands on instead of returning are checked through their getters: captured from the collaborator they are passed to (`ArgumentCaptor<Visit>` on `visits.save(..)`), or read back from the subject's own list or map they are put into
 - iterators and stream pipelines over the subject's own collections are evaluated on elements the test puts there: `items.iterator()` yields the one arranged mock, `specialties.stream().sorted(..).collect(toList())` returns it as a list, and steps that run a lambda per element apply its body to the arranged element: method references become calls on it, `lambda$..` bodies are explored with their captured values, predicates are arranged to hold (`leg -> leg.getLoadLocation().equals(event.getLocation()) && ..` takes the path returning true, each `equals` satisfied by returning the same mock), and mappings yield the body's value (`assertEquals(BigDecimal.ZERO.add(BigDecimal.ONE.multiply(new BigDecimal(1))), result)` for a cart subtotal)

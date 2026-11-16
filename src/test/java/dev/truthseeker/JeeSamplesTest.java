@@ -122,6 +122,12 @@ class JeeSamplesTest {
         assertTrue(notProfile.substring(0, notProfile.indexOf("@Test")).contains("Object o = new Object();"), code);
         // return login.equals(that.login): a real second Profile with the same login
         assertTrue(code.contains("Profile o = new Profile(") && code.contains("setField(o, \"login\", \"other\");"), code);
+        // calls that return their receiver for chaining (addFlashAttribute) are verified, and their absence elsewhere
+        assertTrue(code.contains("verify(flash, atLeastOnce()).addFlashAttribute(eq(\"message\"), eq(\"Saved\"));"), code);
+        assertTrue(code.contains("verify(flash, never()).addFlashAttribute(eq(\"error\"), eq(\"Could not save\"));"), code);
+        // a collaborator's list passed straight back holds one element, so an empty answer would show
+        assertTrue(code.contains("when(store.recent()).thenReturn(new ArrayList<>(List.of(form)));")
+                && code.contains("assertEquals(new ArrayList<>(List.of(form)), result);"), code);
         // ofNullable(..).filter(..).ifPresent(..): the value passes the filter and the consumer's call is verified
         assertTrue(code.contains("when(form.getPassword()).thenReturn(\"value\");"), code);
         assertTrue(code.contains("verify(store, atLeastOnce()).savePassword(eq(\"value\"));"), code);

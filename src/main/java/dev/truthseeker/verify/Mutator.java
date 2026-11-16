@@ -92,12 +92,40 @@ final class Mutator {
                     });
                 } else if (op == Opcodes.ARETURN && !mn.name.equals("toString")) {
                     if (in.getPrevious() != null && in.getPrevious().getOpcode() == Opcodes.ACONST_NULL) continue;
+                    String[] empty = EMPTY.get(Type.getReturnType(mn.desc).getDescriptor());
+                    if (empty != null) {
+                        add(out, classBytes, m, i, "returns " + empty[3], (node, insn) -> {
+                            InsnList extra = new InsnList();
+                            extra.add(new InsnNode(Opcodes.POP));
+                            if (empty[0].equals("ldc")) extra.add(new LdcInsnNode(""));
+                            else extra.add(new MethodInsnNode(Opcodes.INVOKESTATIC, empty[0], empty[1], empty[2], false));
+                            node.instructions.insertBefore(insn, extra);
+                        });
+                    }
                     add(out, classBytes, m, i, "returns null", (node, insn) -> {
                         InsnList extra = new InsnList();
                         extra.add(new InsnNode(Opcodes.POP));
                         extra.add(new InsnNode(Opcodes.ACONST_NULL));
                         node.instructions.insertBefore(insn, extra);
                     });
+                } else if (op == Opcodes.PUTFIELD) {
+                    FieldInsnNode fi = (FieldInsnNode) in;
+                    add(out, classBytes, m, i, "removed write of field " + fi.name, (node, insn) -> {
+                        InsnList pops = new InsnList();
+                        pops.add(new InsnNode(Type.getType(((FieldInsnNode) insn).desc).getSize() == 2 ? Opcodes.POP2 : Opcodes.POP));
+                        pops.add(new InsnNode(Opcodes.POP));
+                        node.instructions.insertBefore(insn, pops);
+                        node.instructions.remove(insn);
+                    });
+                } else if (in instanceof LdcInsnNode ldc && ldc.cst instanceof String str && constantMatters(mn, in)) {
+                    String other = str.isEmpty() ? "mutated" : "";
+                    add(out, classBytes, m, i, "changed constant " + quote(str) + " to " + quote(other),
+                            (node, insn) -> node.instructions.set(insn, new LdcInsnNode(other)));
+                } else if (intConstant(in) != null && constantMatters(mn, in)) {
+                    int v = intConstant(in);
+                    int other = v == 0 ? 1 : v == 1 ? 0 : v + 1;
+                    add(out, classBytes, m, i, "changed constant " + v + " to " + other,
+                            (node, insn) -> node.instructions.set(insn, new LdcInsnNode(other)));
                 } else if (in instanceof MethodInsnNode call && droppable(probe, call)) {
                     add(out, classBytes, m, i, "removed call to " + simple(call.owner) + "." + call.name + "(..)", (node, insn) -> {
                         MethodInsnNode c = (MethodInsnNode) insn;
@@ -112,6 +140,55 @@ final class Mutator {
             }
         }
         return out;
+    }
+
+    /** Empty values for "returns empty" mutants: {owner, name, desc, description} or {"ldc", .., .., ..} for "". */
+    private static final Map<String, String[]> EMPTY = Map.of(
+            "Ljava/util/List;", new String[]{"java/util/Collections", "emptyList", "()Ljava/util/List;", "an empty list"},
+            "Ljava/util/Collection;", new String[]{"java/util/Collections", "emptyList", "()Ljava/util/List;", "an empty list"},
+            "Ljava/util/Set;", new String[]{"java/util/Collections", "emptySet", "()Ljava/util/Set;", "an empty set"},
+            "Ljava/util/Map;", new String[]{"java/util/Collections", "emptyMap", "()Ljava/util/Map;", "an empty map"},
+            "Ljava/util/Optional;", new String[]{"java/util/Optional", "empty", "()Ljava/util/Optional;", "Optional.empty()"},
+            "Ljava/lang/String;", new String[]{"ldc", "", "", "\"\""});
+
+    /** The value of an int constant instruction (iconst, bipush, sipush, ldc int), or null. */
+    private static Integer intConstant(AbstractInsnNode in) {
+        int op = in.getOpcode();
+        if (op >= Opcodes.ICONST_M1 && op <= Opcodes.ICONST_5) return op - Opcodes.ICONST_0;
+        if ((op == Opcodes.BIPUSH || op == Opcodes.SIPUSH) && in instanceof IntInsnNode ii) return ii.operand;
+        if (in instanceof LdcInsnNode l && l.cst instanceof Integer n) return n;
+        return null;
+    }
+
+    /**
+     * A constant whose value is behaviour: not a varargs array's size or index, not a logged message, not inside
+     * hashCode/toString.
+     */
+    private static boolean constantMatters(MethodNode mn, AbstractInsnNode in) {
+        if (mn.name.equals("hashCode") || mn.name.equals("toString")) return false;
+        AbstractInsnNode prev = in.getPrevious(), next = in.getNext();
+        while (prev != null && prev.getOpcode() < 0) prev = prev.getPrevious();
+        while (next != null && next.getOpcode() < 0) next = next.getNext();
+        if (next != null && (next.getOpcode() == Opcodes.ANEWARRAY || next.getOpcode() == Opcodes.NEWARRAY)) return false;
+        if (prev != null && prev.getOpcode() == Opcodes.DUP && intConstant(in) != null) return false; // arr[i] = .. in an array literal
+        // a message handed to a logger, possibly after its arguments are built (log(Level.INFO, "..", new Object[]{..}))
+        int seen = 0;
+        for (AbstractInsnNode n = next; n != null && seen < 24; n = n.getNext()) {
+            if (n.getOpcode() < 0) continue;
+            seen++;
+            if (n instanceof MethodInsnNode c) {
+                String o = c.owner.toLowerCase();
+                if (o.contains("log") || o.startsWith("java/io/printstream")) return false;
+            }
+            if (n.getOpcode() >= Opcodes.IRETURN && n.getOpcode() <= Opcodes.RETURN || n instanceof JumpInsnNode
+                    || n.getOpcode() == Opcodes.ATHROW || n.getOpcode() == Opcodes.PUTFIELD) break;
+        }
+        return true;
+    }
+
+    private static String quote(String s) {
+        String t = s.length() > 30 ? s.substring(0, 27) + "..." : s;
+        return "\"" + t.replace("\n", "\\n") + "\"";
     }
 
     /** A void call on something other than the object itself (a collaborator, a logger is skipped): its effect can vanish. */

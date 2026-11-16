@@ -66,4 +66,22 @@ class MutatorTest {
         assertFalse(calls.stream().anyMatch(m -> m.description().contains(".close(")), calls.toString());
         for (Mutator.Mutant m : calls) load(m);
     }
+
+    @Test
+    void fieldWritesConstantsAndEmptyReturnsAreMutated() throws Exception {
+        List<Mutator.Mutant> ms = Mutator.mutants(bytesOf("fixtures.legacy.Ledger"));
+        assertTrue(ms.stream().anyMatch(m -> m.method().equals("post") && m.description().equals("removed write of field balance")), ms.toString());
+        assertTrue(ms.stream().anyMatch(m -> m.method().equals("post") && m.description().equals("changed constant 1 to 0")), ms.toString());
+        for (Mutator.Mutant m : ms) load(m);
+        List<Mutator.Mutant> strings = Mutator.mutants(bytesOf("fixtures.legacy.AccountDesk"));
+        assertTrue(strings.stream().anyMatch(m -> m.method().equals("register") && m.description().equals("changed constant \"form\" to \"\"")), strings.toString());
+        for (Mutator.Mutant m : strings) load(m);
+        List<Mutator.Mutant> empties = Mutator.mutants(bytesOf("fixtures.legacy.CustomerController"));
+        assertTrue(empties.stream().anyMatch(m -> m.method().equals("search") && m.description().equals("returns an empty list")), empties.toString());
+        for (Mutator.Mutant m : empties) load(m);
+        // a varargs array literal's size and indexes are not behaviour
+        List<Mutator.Mutant> binder = Mutator.mutants(bytesOf("fixtures.legacy.SignupValidator"));
+        assertFalse(binder.stream().anyMatch(m -> m.method().equals("initBinder") && m.description().startsWith("changed constant 2")), binder.toString());
+        assertTrue(binder.stream().anyMatch(m -> m.method().equals("initBinder") && m.description().equals("changed constant \"*.id\" to \"\"")), binder.toString());
+    }
 }

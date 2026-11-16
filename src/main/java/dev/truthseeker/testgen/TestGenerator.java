@@ -28,7 +28,7 @@ public final class TestGenerator {
 
     public record Options(List<String> methods, int maxPathsPerMethod, int maxTestsPerMethod, boolean includeTruncated) {}
 
-    private static final Pattern MUTATOR = Pattern.compile("(save|persist|merge|delete|remove|update|insert|send|publish|post|put|notify|emit|execute|enqueue|create|write|store|flush|register|schedule|cancel|charge|refund|ship|log).*", Pattern.CASE_INSENSITIVE);
+    private static final Pattern MUTATOR = Pattern.compile("(add|set|append|save|persist|merge|delete|remove|update|insert|send|publish|post|put|notify|emit|execute|enqueue|create|write|store|flush|register|schedule|cancel|charge|refund|ship|log).*", Pattern.CASE_INSENSITIVE);
 
     private final ClassRepository repo;
     private final ClassNode cn;
@@ -2513,6 +2513,10 @@ public final class TestGenerator {
                 Type t = Type.getType(v.desc);
                 boolean mockable = t.getSort() == Type.OBJECT && !ClassInspector.isValueType(v.desc) && !isEnum(t.getInternalName());
                 String lit = mockable ? newVar(t) : nonNullSample(t, v);
+                Type fet = mockable ? null : declaredElementType(v);
+                if (fet != null && isMockable(fet) && iterableLiteral(t, List.of("x")) != null && !t.getInternalName().equals("java/util/Iterator")) {
+                    lit = iterableLiteral(t, List.of(newVar(fet))); // the field's collection holds one element: an empty answer shows
+                }
                 if (lit == null) {
                     out.add("// TODO: assert result equals `" + v.text + "`");
                 } else {
@@ -2545,6 +2549,12 @@ public final class TestGenerator {
                         return out;
                     }
                 } else {
+                    // a collaborator's collection passed straight back: one element in it, so an empty answer shows
+                    List<String> els = collaboratorElements(v);
+                    if (els != null && !els.isEmpty() && boundLiteral.containsKey(v.text)) {
+                        out.add("assertEquals(" + boundLiteral.get(v.text) + ", result);");
+                        return out;
+                    }
                     String lit = nonNullSample(t, v);
                     if (lit != null && lit.startsWith("new ") && !lit.contains("<>") && ret.getSort() == Type.OBJECT) {
                         // an instance compares by identity (new Object(), an exception): name it and expect that very one
@@ -3807,7 +3817,7 @@ public final class TestGenerator {
             for (Path other : r.paths()) {
                 if (other == p) continue;
                 for (Effect e : other.effects()) {
-                    if (e.kind() != Effect.Kind.CALL || e.target() == null || Type.getReturnType(e.desc()).getSort() != Type.VOID) continue;
+                    if (e.kind() != Effect.Kind.CALL || e.target() == null || (Type.getReturnType(e.desc()).getSort() != Type.VOID && !MUTATOR.matcher(e.name()).matches())) continue;
                     String m = stableMock(e.target());
                     if (m == null || here.containsKey(m + "." + e.name() + e.args().stream().map(a -> a.text).toList())) continue;
                     boolean exact = constantArgs(e);

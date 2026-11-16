@@ -15,6 +15,13 @@ public class Profile {
         void saveDetails(Form form);
 
         void savePassword(String password);
+
+        java.util.List<Form> recent();
+    }
+
+    /** Spring's RedirectAttributes, in short: adding returns the attributes for chaining. */
+    public interface Flash {
+        Flash addFlashAttribute(String name, Object value);
     }
 
     private final Store store;
@@ -27,6 +34,19 @@ public class Profile {
     public void update(Form form) {
         store.saveDetails(form);
         Optional.ofNullable(form.getPassword()).filter(p -> !p.isEmpty()).ifPresent(p -> store.savePassword(p));
+    }
+
+    public String confirm(boolean ok, Flash flash) {
+        if (!ok) {
+            flash.addFlashAttribute("error", "Could not save");
+            return "form";
+        }
+        flash.addFlashAttribute("message", "Saved");
+        return "redirect:/profile";
+    }
+
+    public java.util.List<Form> recent() {
+        return store.recent();
     }
 
     @Override
