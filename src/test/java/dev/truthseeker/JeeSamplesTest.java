@@ -211,4 +211,28 @@ class JeeSamplesTest {
         // a cache cleared and refilled: the loop walks what was added
         assertTrue(code.contains("when(template.query(eq(\"SELECT id FROM keepers\"), any(Object[].class))).thenReturn(new ArrayList<>(List.of(keeper1)));"), code);
     }
+
+    @Test
+    void finallyBlocksAndInheritedThrowsAreFollowed() throws Exception {
+        String code = generate("fixtures.legacy.Cleanup");
+        // the save throws: the lock is still released, and the exception goes on
+        String thrown = code.substring(code.indexOf("void write_throwsRuntimeException"));
+        assertTrue(thrown.contains("doThrow(new RuntimeException(\"simulated failure\")).when(store).save(any());")
+                && thrown.contains("assertThrows(RuntimeException.class, () -> subject.write(value));")
+                && thrown.contains("verify(lock, atLeastOnce()).unlock();"), code);
+        // a synchronized method's compiler-made handler adds no paths
+        assertFalse(code.contains("void writeQuietly_throws"), code);
+        // Properties.load(..) inherited and not followed: a spy of the subject makes it throw IOException
+        String settings = generate("fixtures.legacy.Cleanup$Settings");
+        assertFalse(settings.contains("@Disabled("), settings);
+        assertTrue(settings.contains("Settings subject = spy(this.subject);")
+                && settings.contains("doThrow(new IOException(\"simulated failure\")).when(subject).load(ArgumentMatchers.<InputStream>any());"), settings);
+        String failed = settings.substring(settings.indexOf("void reload_returnsFalse"));
+        assertTrue(failed.contains("verify(store, atLeastOnce()).save(eq(\"defaults\"));")
+                && failed.contains("verify(store, atLeastOnce()).save(eq(\"reloaded\"));"), settings);
+        // AbstractList.set(..) always throws UnsupportedOperationException: only the handler's path
+        String rows = generate("fixtures.legacy.Cleanup$Rows");
+        assertTrue(rows.contains("void rename_returnsNull") && rows.contains("verify(store, atLeastOnce()).save(eq(\"read-only\"));"), rows);
+        assertFalse(rows.contains("void rename_returnsPath"), rows);
+    }
 }

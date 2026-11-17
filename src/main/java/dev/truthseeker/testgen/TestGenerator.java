@@ -1364,6 +1364,14 @@ public final class TestGenerator {
          */
         void arrangeThrow(Expr call, String exception) {
             String simple = Names.simple(exception);
+            // load(in) inherited from java.util.Properties, a template method of a framework base: the test runs on a spy
+            // of the subject and makes just that call throw
+            if (call.kind == Expr.Kind.CALL && call.target != null && call.target.kind == Expr.Kind.THIS && !isStatic && selfStubbable(call)) {
+                spied = true;
+                String ex = caughtException(call, exception);
+                stubs.put("\u0000spy:" + call.text, "doThrow(" + ex + ").when(subject)." + call.name + "(" + matchers(call) + ");");
+                return;
+            }
             if (call.kind == Expr.Kind.CALL && call.target != null && call.target.kind != Expr.Kind.THIS && !isObjectMethod(call)) {
                 String tv = ensure(call.target);
                 if (tv != null) {
@@ -1389,6 +1397,46 @@ public final class TestGenerator {
                 return;
             }
             todos.add("make `" + call.text + "` throw " + simple);
+        }
+
+        /** The test runs on {@code spy(subject)} so a call on the subject itself can be made to throw. */
+        boolean spied;
+
+        /**
+         * A method called on the subject that a Mockito spy can stub from the test: declared (by the subject's class or
+         * an inherited one, from the archive or the JDK) not private, static or final, and public or in the test's package;
+         * the subject's class is not final.
+         */
+        boolean selfStubbable(Expr call) {
+            if ((cn.access & Opcodes.ACC_FINAL) != 0 || call.memberDesc == null) return false;
+            String pkg = Names.packageOf(cn.name);
+            for (String c = cn.name; c != null; ) {
+                ClassNode node = c.equals(cn.name) ? cn : repo.node(c);
+                if (node == null) return jdkStubbable(c, call, pkg);
+                for (MethodNode m : node.methods) {
+                    if (!m.name.equals(call.name) || !m.desc.equals(call.memberDesc)) continue;
+                    if ((m.access & (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL)) != 0) return false;
+                    return (m.access & Opcodes.ACC_PUBLIC) != 0 || Names.packageOf(node.name).equals(pkg);
+                }
+                c = node.superName;
+            }
+            return false;
+        }
+
+        static boolean jdkStubbable(String internal, Expr call, String pkg) {
+            try {
+                for (Class<?> k = Class.forName(internal.replace('/', '.'), false, ClassLoader.getPlatformClassLoader()); k != null; k = k.getSuperclass()) {
+                    for (java.lang.reflect.Method m : k.getDeclaredMethods()) {
+                        if (!m.getName().equals(call.name) || !Type.getMethodDescriptor(m).equals(call.memberDesc)) continue;
+                        int mod = m.getModifiers();
+                        if (java.lang.reflect.Modifier.isPrivate(mod) || java.lang.reflect.Modifier.isStatic(mod) || java.lang.reflect.Modifier.isFinal(mod)) return false;
+                        return java.lang.reflect.Modifier.isPublic(mod) || Names.packageOf(Type.getInternalName(k)).equals(pkg);
+                    }
+                }
+            } catch (ReflectiveOperationException | LinkageError e) {
+                return false;
+            }
+            return false;
         }
 
         /** Thread.sleep / TimeUnit.sleep / Thread.join: throw InterruptedException when the thread is interrupted. */
@@ -3128,10 +3176,13 @@ public final class TestGenerator {
                 sb.append("        ").append(imports.ref(declared)).append(" ").append(paramVars.get(param.index)).append(" = ").append(lit).append(";\n");
             }
             for (String a : arrange) if (!isMockDecl.test(a)) sb.append("        ").append(a).append("\n");
+            if (spied) { // after the subject is set up: a spy copies its state
+                sb.append("        ").append(imports.ref(Type.getObjectType(cn.name))).append(" subject = spy(this.subject);\n");
+            }
             for (String s : stubs.values()) sb.append("        ").append(s).append("\n");
             for (String t : todos) sb.append("        // TODO: ").append(t).append("\n");
             String self = selfCall();
-            if (self != null && !isStatic) {
+            if (self != null && !isStatic && !spied) {
                 sb.append("        // NOTE: depends on the real behaviour of `").append(self).append("` (calls on the subject itself are not stubbed)\n");
             }
             sb.append("\n        // Act").append(o.kind() == Path.OutcomeKind.THROW ? " + Assert" : "").append("\n");
@@ -4869,7 +4920,22 @@ public final class TestGenerator {
             String n = todo.poll();
             if (!seen.add(n)) continue;
             ClassNode c = repo.node(n);
-            if (c == null) continue;
+            if (c == null) {
+                // a JDK superclass (java.util.Properties: load(InputStream) and load(Reader)): ask it
+                try {
+                    for (Class<?> k = Class.forName(n.replace('/', '.'), false, ClassLoader.getPlatformClassLoader()); k != null; k = k.getSuperclass()) {
+                        for (java.lang.reflect.Method m : k.getDeclaredMethods()) {
+                            if (m.getName().equals(name) && m.getParameterCount() == arity && !m.isBridge()) {
+                                String d = Type.getMethodDescriptor(m);
+                                descs.add(d.substring(0, d.indexOf(')')));
+                            }
+                        }
+                    }
+                } catch (ReflectiveOperationException | LinkageError e) {
+                    return true; // unknown: count as overloaded
+                }
+                continue;
+            }
             for (MethodNode m : c.methods) {
                 if (m.name.equals(name) && Type.getArgumentTypes(m.desc).length == arity && (m.access & Opcodes.ACC_BRIDGE) == 0) {
                     descs.add(m.desc.substring(0, m.desc.indexOf(')')));

@@ -176,8 +176,8 @@ public final class PathExplorer {
             notes.add("Method has no bytecode (abstract, interface or native).");
             return new Result(cn.name, mn, params, paths, false, List.copyOf(notes));
         }
-        if (mn.tryCatchBlocks.stream().anyMatch(t -> t.type == null)) {
-            notes.add("finally/catch-all handlers are not entered; only typed catch blocks are explored.");
+        if (mn.tryCatchBlocks.stream().anyMatch(t -> t.type == null && !releasesMonitor(mn, t))) {
+            notes.add("finally blocks are entered when a call inside the try throws: the cleanup runs, then the exception goes on.");
         }
         Frame init = new Frame();
         init.method = mn;
@@ -1279,6 +1279,16 @@ public final class PathExplorer {
         if (unwrapped != null) return unwrapped;
         if (enumRule(f, m, recv, args, work)) return true;
         Expr call = Expr.call(recv, m.owner, m.name, m.desc, argList);
+        // render(..) inherited from a library base whose body is `throw new NotImplementedException(..)`: it always
+        // throws, so the path goes to the handler (or out of the method) from here
+        Expr always = recv != null && recv.kind == Expr.Kind.THIS && m.getOpcode() != INVOKESTATIC ? alwaysThrows(m) : null;
+        if (always != null) {
+            f.effects.add(new Effect(Effect.Kind.CALL, recv, m.owner, m.name, m.desc, argList, null));
+            notes.add("Inherited methods whose body only throws (`throw new NotImplementedException()`) are taken to throw.");
+            if (raise(f, always, always.owner, -1)) return true;
+            finish(f, new Path.Outcome(Path.OutcomeKind.THROW, always, always.owner, null));
+            return false;
+        }
         boolean loggerCall = opt.ignoreLogging() && LOGGER_TYPES.contains(m.owner);
         if (!loggerCall && !isPureLibraryCall(m) && !(ret.getSort() != Type.VOID && isQuery(m.name))) {
             f.effects.add(new Effect(Effect.Kind.CALL, recv, m.owner, m.name, m.desc, argList, null));
@@ -1495,8 +1505,10 @@ public final class PathExplorer {
         for (int depth = 0; m != null; depth++) {
             InsnList il = m.instructions;
             for (TryCatchBlockNode t : m.tryCatchBlocks) {
-                if (t.type == null) continue; // finally / catch-all: not entered
-                if (il.indexOf(t.start) <= pc && pc < il.indexOf(t.end)) out.add(new Handler(depth, t.type, il.indexOf(t.handler)));
+                // finally / catch-all: catches anything; the handler javac emits for synchronized blocks only releases the lock
+                if (t.type == null && releasesMonitor(m, t)) continue;
+                String type = t.type == null ? "java/lang/Throwable" : t.type;
+                if (il.indexOf(t.start) <= pc && pc < il.indexOf(t.end)) out.add(new Handler(depth, type, il.indexOf(t.handler)));
             }
             if (c == null) break;
             m = c.method();
@@ -1504,6 +1516,17 @@ public final class PathExplorer {
             c = c.parent();
         }
         return out;
+    }
+
+    /** The catch-all handler javac writes for a {@code synchronized} block: store, monitorexit, rethrow. */
+    private static boolean releasesMonitor(MethodNode m, TryCatchBlockNode t) {
+        int seen = 0;
+        for (AbstractInsnNode in = t.handler; in != null && seen < 5; in = in.getNext()) {
+            if (in.getOpcode() < 0) continue;
+            if (in.getOpcode() == MONITOREXIT) return true;
+            seen++;
+        }
+        return false;
     }
 
     /**
@@ -1588,20 +1611,73 @@ public final class PathExplorer {
         }
     }
 
+    /**
+     * The exception a method called on the subject always throws, when the implementation it resolves to (the subject's
+     * class, then its superclasses: application, library or JDK bytecode) is just {@code throw new X(["message"])}.
+     */
+    private Expr alwaysThrows(MethodInsnNode m) {
+        String start = m.getOpcode() == INVOKESPECIAL ? m.owner : cn.name;
+        MethodNode body = null;
+        for (String c = start; c != null && body == null; ) {
+            ClassNode node = c.equals(cn.name) ? cn : anyNode(c);
+            if (node == null) return null;
+            for (MethodNode mm : node.methods) if (mm.name.equals(m.name) && mm.desc.equals(m.desc)) body = mm;
+            c = node.superName;
+        }
+        if (body == null || (body.access & (ACC_ABSTRACT | ACC_NATIVE | ACC_STATIC)) != 0) return null;
+        List<AbstractInsnNode> ops = new ArrayList<>();
+        for (AbstractInsnNode in = body.instructions.getFirst(); in != null; in = in.getNext()) if (in.getOpcode() >= 0) ops.add(in);
+        if (ops.size() < 4 || ops.size() > 6 || !(ops.get(0) instanceof TypeInsnNode n) || n.getOpcode() != NEW
+                || ops.get(1).getOpcode() != DUP || ops.get(ops.size() - 1).getOpcode() != ATHROW
+                || !(ops.get(ops.size() - 2) instanceof MethodInsnNode init) || !init.name.equals("<init>") || !init.owner.equals(n.desc)) return null;
+        if (ops.size() == 4 && init.desc.equals("()V")) return Expr.newObject(n.desc, "()V", List.of());
+        if (ops.size() == 5 && init.desc.equals("(Ljava/lang/String;)V") && ops.get(2) instanceof LdcInsnNode ldc && ldc.cst instanceof String msg) {
+            return Expr.newObject(n.desc, init.desc, List.of(Expr.constant(msg, "Ljava/lang/String;")));
+        }
+        return null;
+    }
+
+    private static final Map<String, Optional<ClassNode>> JDK_NODES = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** A class from the archive, else the JDK's own bytecode (AbstractList, Properties ..), or null. */
+    private ClassNode anyNode(String internal) {
+        ClassNode node = repo == null ? null : repo.node(internal);
+        if (node != null) return node;
+        if (!internal.startsWith("java/") && !internal.startsWith("javax/")) return null;
+        return JDK_NODES.computeIfAbsent(internal, k -> {
+            try (java.io.InputStream in = Object.class.getResourceAsStream("/" + k + ".class")) {
+                if (in == null) return Optional.empty();
+                ClassNode cnode = new ClassNode();
+                new org.objectweb.asm.ClassReader(in.readAllBytes()).accept(cnode, org.objectweb.asm.ClassReader.SKIP_DEBUG | org.objectweb.asm.ClassReader.SKIP_FRAMES);
+                return Optional.of(cnode);
+            } catch (java.io.IOException | RuntimeException e) {
+                return Optional.empty();
+            }
+        }).orElse(null);
+    }
+
     /** Exceptions the called method declares (application or library bytecode in the archive, else the JDK). */
     private List<String> declaredExceptions(MethodInsnNode m) {
+        String jdkOwner = m.owner;
         if (repo != null) {
             for (String c = m.owner; c != null; ) {
                 ClassNode node = repo.node(c);
-                if (node == null) break;
+                if (node == null) { jdkOwner = c; break; } // load(..) inherited from java.util.Properties: ask the JDK
                 for (MethodNode mm : node.methods) if (mm.name.equals(m.name) && mm.desc.equals(m.desc)) return mm.exceptions;
                 c = node.superName;
             }
         }
-        Class<?> k = jdkClass(m.owner);
+        Class<?> k = jdkClass(jdkOwner);
         if (k != null) {
             try {
-                for (java.lang.reflect.Executable e : m.name.equals("<init>") ? k.getDeclaredConstructors() : k.getMethods()) {
+                List<java.lang.reflect.Executable> candidates = new ArrayList<>();
+                if (m.name.equals("<init>")) candidates.addAll(List.of(k.getDeclaredConstructors()));
+                else {
+                    candidates.addAll(List.of(k.getMethods()));
+                    // protected methods a subclass inherits (a framework base's template methods)
+                    for (Class<?> s = k; s != null; s = s.getSuperclass()) candidates.addAll(List.of(s.getDeclaredMethods()));
+                }
+                for (java.lang.reflect.Executable e : candidates) {
                     boolean ctor = e instanceof java.lang.reflect.Constructor;
                     if (!ctor && !e.getName().equals(m.name)) continue;
                     String desc = ctor ? Type.getConstructorDescriptor((java.lang.reflect.Constructor<?>) e)
