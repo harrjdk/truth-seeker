@@ -1,0 +1,31 @@
+name: Release
+
+# Push a tag such as v0.2.0 to publish a GitHub release with the server jar attached as `truth-seeker.jar`.
+# The README's install one-liners download releases/latest/download/truth-seeker.jar.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build and test
+        run: ./mvnw -B -ntp verify
+      - name: Smoke test the jar
+        run: java -jar target/truth-seeker.jar --help
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" target/truth-seeker.jar \
+            --title "truth-seeker $GITHUB_REF_NAME" --generate-notes

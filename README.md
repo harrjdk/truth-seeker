@@ -12,6 +12,32 @@ An MCP server that lets an LLM client (Claude Code, Claude Desktop, Codex, or a 
 - No source code needed. Debug info (`-g`) improves names but isn't required.
 - The server runs on **Java 17+**. It reads bytecode from Java 1.1 through 25, including javac and Eclipse (ECJ) output.
 
+## Install
+
+You need Java 17+ on your PATH (`java -version`). Each command downloads the latest release jar to `~/.truth-seeker/` and registers it with Claude Code.
+
+macOS / Linux:
+
+```bash
+mkdir -p "$HOME/.truth-seeker" && curl -fsSL -o "$HOME/.truth-seeker/truth-seeker.jar" https://github.com/harrjdk/truth-seeker/releases/latest/download/truth-seeker.jar && claude mcp add --scope user truth-seeker -- java -jar "$HOME/.truth-seeker/truth-seeker.jar"
+```
+
+Windows (PowerShell):
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.truth-seeker" | Out-Null; Invoke-WebRequest https://github.com/harrjdk/truth-seeker/releases/latest/download/truth-seeker.jar -OutFile "$HOME\.truth-seeker\truth-seeker.jar"; claude mcp add --scope user truth-seeker -- java -jar "$HOME\.truth-seeker\truth-seeker.jar"
+```
+
+For Codex, replace the last part with `codex mcp add truth-seeker -- java -jar "$HOME/.truth-seeker/truth-seeker.jar"`. Other clients take the same command and arguments; see [Connect a client](#connect-a-client).
+
+### Or ask your agent to do it
+
+Paste this into Claude Code, Codex or another coding agent:
+
+> Install the truth-seeker MCP server for me. Check that `java -version` is 17 or newer; if it isn't, tell me and stop. Download https://github.com/harrjdk/truth-seeker/releases/latest/download/truth-seeker.jar to `~/.truth-seeker/truth-seeker.jar` (create the folder), and check that it runs with `java -jar ~/.truth-seeker/truth-seeker.jar --help`. Then register it as a stdio MCP server named `truth-seeker` for this client, with command `java` and arguments `-jar` and the jar's absolute path (in Claude Code: `claude mcp add --scope user truth-seeker -- java -jar <path>`; in Codex: `codex mcp add truth-seeker -- java -jar <path>`, or a `[mcp_servers.truth-seeker]` entry in `~/.codex/config.toml`). Tell me when it's done and whether I need to restart the session.
+
+To update, run the same download again. To build from source instead, see [Build](#build).
+
 ## Tools
 
 | Tool | What it gives the model |
@@ -159,6 +185,8 @@ The test suite also generates tests for the fixture classes, compiles them and r
 So every build checks that `generate_unit_tests` output compiles and passes.
 
 Each CI run also uploads the built jar as the `truth-seeker-jar` artifact.
+
+To publish a release, push a version tag such as `git tag v0.2.0 && git push origin v0.2.0`. The release workflow builds and tests the jar, then attaches it to a GitHub release as `truth-seeker.jar`. That is the file the install commands download.
 
 ## Connect a client
 
